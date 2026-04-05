@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/docker-compose-2496ED?logo=docker&logoColor=white" alt="Docker Compose" />
   <img src="https://img.shields.io/badge/Claude-Haiku-blueviolet?logo=anthropic" alt="Claude Haiku" />
   <img src="https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black" alt="React 18" />
-  <a href="https://github.com/aviralverma/bharat-terminal/stargazers"><img src="https://img.shields.io/github/stars/aviralverma/bharat-terminal?style=social" alt="Stars" /></a>
+  <a href="https://github.com/thegeek13242/bharat-terminal/stargazers"><img src="https://img.shields.io/github/stars/thegeek13242/bharat-terminal?style=social" alt="Stars" /></a>
 </p>
 
 <p align="center">
