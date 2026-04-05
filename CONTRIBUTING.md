@@ -5,7 +5,7 @@ Thank you for your interest in contributing! Here's how to get started.
 ## Quick Setup
 
 ```bash
-git clone https://github.com/aviralverma/bharat-terminal.git
+git clone https://github.com/thegeek13242/bharat-terminal.git
 cd bharat-terminal
 cp .env.example .env
 # Set ANTHROPIC_API_KEY in .env
@@ -69,4 +69,4 @@ requirements/       # Per-service Python deps
 
 ## Questions
 
-Open a [Discussion](https://github.com/aviralverma/bharat-terminal/discussions) — happy to help.
+Open a [Discussion](https://github.com/thegeek13242/bharat-terminal/discussions) — happy to help.

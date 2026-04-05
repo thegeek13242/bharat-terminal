@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/aviralverma/bharat-terminal/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" /></a>
+  <a href="https://github.com/thegeek13242/bharat-terminal/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" /></a>
   <img src="https://img.shields.io/badge/python-3.12-blue.svg" alt="Python 3.12" />
   <img src="https://img.shields.io/badge/docker-compose-2496ED?logo=docker&logoColor=white" alt="Docker Compose" />
   <img src="https://img.shields.io/badge/Claude-Haiku-blueviolet?logo=anthropic" alt="Claude Haiku" />
@@ -53,7 +53,7 @@ Bharat Terminal ingests live news from **8 Indian financial sources**, runs it t
 
 ```bash
 # 1. Clone
-git clone https://github.com/aviralverma/bharat-terminal.git
+git clone https://github.com/thegeek13242/bharat-terminal.git
 cd bharat-terminal
 
 # 2. Configure
