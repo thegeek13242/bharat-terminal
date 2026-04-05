@@ -1,4 +1,4 @@
-aiohttp==3.9.3
+aiohttp==3.13.4
 aiokafka==0.10.0
 pydantic==2.6.3
 feedparser==6.0.11
