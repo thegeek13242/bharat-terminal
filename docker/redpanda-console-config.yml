@@ -1,0 +1,16 @@
+kafka:
+  brokers:
+    - redpanda:9092
+  schemaRegistry:
+    enabled: true
+    urls:
+      - http://redpanda:8081
+
+redpanda:
+  adminApi:
+    enabled: true
+    urls:
+      - http://redpanda:9644
+
+server:
+  listenPort: 8080

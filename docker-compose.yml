@@ -1,0 +1,306 @@
+version: "3.9"
+
+# ── Reusable fragments ────────────────────────────────────────────────────────
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+x-common-env: &common-env
+  KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+  DATABASE_URL: postgresql+asyncpg://bharat:bharat@postgres:5432/bharat_terminal
+  REDIS_URL: redis://redis:6379/0
+  KB_SERVICE_URL: http://kb-service:8001
+  PYTHONUNBUFFERED: "1"
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  EXTRACTION_MODEL: ${EXTRACTION_MODEL:-claude-haiku-4-5-20251001}
+  IMPACT_MODEL: ${IMPACT_MODEL:-claude-haiku-4-5-20251001}
+  SIGNALS_MODEL: ${SIGNALS_MODEL:-claude-haiku-4-5-20251001}
+  RELEVANCE_THRESHOLD: ${RELEVANCE_THRESHOLD:-0.35}
+
+services:
+
+  # ── Infrastructure ─────────────────────────────────────────────────────────
+
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: bharat-postgres
+    environment:
+      POSTGRES_USER: bharat
+      POSTGRES_PASSWORD: bharat
+      POSTGRES_DB: bharat_terminal
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bharat -d bharat_terminal"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    container_name: bharat-redis
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    logging: *default-logging
+
+  redpanda:
+    image: redpandadata/redpanda:v23.3.8
+    container_name: bharat-redpanda
+    command:
+      - redpanda
+      - start
+      - --smp 1
+      - --memory 1G
+      - --reserve-memory 0M
+      - --overprovisioned
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:9092
+      - --pandaproxy-addr 0.0.0.0:8082
+      - --advertise-pandaproxy-addr redpanda:8082
+      - --schema-registry-addr 0.0.0.0:8081
+      - --rpc-addr 0.0.0.0:33145
+      - --advertise-rpc-addr redpanda:33145
+    ports:
+      - "9092:9092"
+      - "8081:8081"
+      - "8082:8082"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+    restart: unless-stopped
+    logging: *default-logging
+
+  redpanda-init:
+    image: redpandadata/redpanda:v23.3.8
+    container_name: bharat-redpanda-init
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        rpk topic create raw.news.in \
+          --brokers redpanda:9092 \
+          --partitions 8 \
+          --replicas 1 \
+          --topic-config retention.ms=86400000 \
+          --topic-config cleanup.policy=delete || true
+
+        rpk topic create raw.news.dlq \
+          --brokers redpanda:9092 \
+          --partitions 2 \
+          --replicas 1 \
+          --topic-config retention.ms=604800000 \
+          --topic-config cleanup.policy=delete || true
+
+        rpk topic create analysed.impact.in \
+          --brokers redpanda:9092 \
+          --partitions 8 \
+          --replicas 1 \
+          --topic-config retention.ms=604800000 || true
+
+        echo "Topics ready."
+    restart: "no"
+
+  redpanda-console:
+    image: redpandadata/console:v2.4.3
+    container_name: bharat-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+    volumes:
+      - ./docker/redpanda-console-config.yml:/tmp/config.yml:ro
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ── Database bootstrap (run once) ──────────────────────────────────────────
+
+  kb-migrate:
+    build:
+      context: .
+      dockerfile: docker/kb/Dockerfile
+    container_name: bharat-kb-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    logging: *default-logging
+
+  kb-seed:
+    build:
+      context: .
+      dockerfile: docker/kb/Dockerfile
+    container_name: bharat-kb-seed
+    depends_on:
+      kb-migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *common-env
+    command: ["python", "-m", "bharat_terminal.kb.manage", "seed-reliance"]
+    restart: "no"
+    logging: *default-logging
+
+  # ── Application Services ───────────────────────────────────────────────────
+
+  kb-service:
+    build:
+      context: .
+      dockerfile: docker/kb/Dockerfile
+    container_name: bharat-kb
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kb-migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *common-env
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys,json; d=json.load(urllib.request.urlopen('http://localhost:8001/health')); sys.exit(0 if d.get('status')=='ok' else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    logging: *default-logging
+
+  analysis-worker:
+    build:
+      context: .
+      dockerfile: docker/analysis/Dockerfile
+    container_name: bharat-analysis
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      kb-service:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+    restart: unless-stopped
+    logging: *default-logging
+
+  ingestion-worker:
+    build:
+      context: .
+      dockerfile: docker/ingestion/Dockerfile
+    container_name: bharat-ingestion
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *common-env
+    restart: unless-stopped
+    logging: *default-logging
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+    container_name: bharat-api
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      kb-service:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys,json; d=json.load(urllib.request.urlopen('http://localhost:8000/health')); sys.exit(0 if d.get('status')=='ok' else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    logging: *default-logging
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+    container_name: bharat-frontend
+    depends_on:
+      - api-gateway
+    ports:
+      - "3000:80"
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ── Observability ──────────────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: bharat-prometheus
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    logging: *default-logging
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: bharat-grafana
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: bharat
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_TELEMETRY_REPORTING_ENABLED: "false"
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+    logging: *default-logging
+
+# ── Volumes ────────────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+  redpanda_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
