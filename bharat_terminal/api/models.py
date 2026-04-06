@@ -5,9 +5,9 @@ SQLAlchemy ORM models for API-layer persistence:
 """
 from datetime import datetime
 from sqlalchemy import (
-    Column, String, Float, Boolean, DateTime, Text, Index
+    String, Float, Boolean, DateTime, Text, Index
 )
-from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 import uuid
 
@@ -19,10 +19,8 @@ class Base(DeclarativeBase):
 class NewsItemRecord(Base):
     __tablename__ = "news_items"
 
-    id: Mapped[str] = mapped_column(
-        UUID(as_uuid=False), primary_key=True,
-        default=lambda: str(uuid.uuid4()),
-    )
+    # Text PK — ingestion IDs can be "SOURCE_url" strings, not always UUIDs
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
     source: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     timestamp_utc: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
@@ -41,13 +39,9 @@ class NewsItemRecord(Base):
 class ImpactReportRecord(Base):
     __tablename__ = "impact_reports"
 
-    id: Mapped[str] = mapped_column(
-        UUID(as_uuid=False), primary_key=True,
-        default=lambda: str(uuid.uuid4()),
-    )
-    news_id: Mapped[str] = mapped_column(
-        UUID(as_uuid=False), nullable=False, index=True
-    )
+    id: Mapped[str] = mapped_column(Text, primary_key=True,
+                                    default=lambda: str(uuid.uuid4()))
+    news_id: Mapped[str] = mapped_column(Text, nullable=False, index=True)
     relevant: Mapped[bool] = mapped_column(Boolean, nullable=False, index=True)
     confidence: Mapped[float] = mapped_column(Float, nullable=False)
     macro_theme: Mapped[str | None] = mapped_column(String(100), nullable=True)

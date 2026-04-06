@@ -2,12 +2,13 @@
 Stage 2: Sector/entity extraction using Claude Haiku with function calling.
 SLA: ≤800ms
 """
+import re
 import time
 import logging
 import os
 import json
 import uuid
-from typing import TypedDict, List, Optional
+from typing import TypedDict, List, Optional, Tuple
 import anthropic
 from bharat_terminal.types import NewsItem
 from bharat_terminal.analysis.llm_logger import get_llm_logger, LLMCallRecord, compute_cost
@@ -74,6 +75,94 @@ EXTRACTION_TOOL = {
 }
 
 
+_SECTOR_KEYWORDS: List[Tuple[str, str]] = [
+    # keyword (lower)          → BSE sector code
+    ("bank", "BANKING"), ("hdfc", "BANKING"), ("icici", "BANKING"),
+    ("sbi", "BANKING"), ("kotak", "BANKING"), ("axis bank", "BANKING"),
+    ("nbfc", "NBFC"), ("microfinance", "NBFC"),
+    ("pharma", "PHARMA_HEALTHCARE"), ("drug", "PHARMA_HEALTHCARE"),
+    ("hospital", "PHARMA_HEALTHCARE"), ("healthcare", "PHARMA_HEALTHCARE"),
+    ("medicine", "PHARMA_HEALTHCARE"), ("cipla", "PHARMA_HEALTHCARE"),
+    ("sun pharma", "PHARMA_HEALTHCARE"),
+    ("software", "IT_TECHNOLOGY"), ("infosys", "IT_TECHNOLOGY"),
+    ("tcs", "IT_TECHNOLOGY"), ("wipro", "IT_TECHNOLOGY"),
+    ("hcl tech", "IT_TECHNOLOGY"), ("tech mahindra", "IT_TECHNOLOGY"),
+    ("it sector", "IT_TECHNOLOGY"),
+    ("oil", "OIL_GAS"), ("gas", "OIL_GAS"), ("refin", "OIL_GAS"),
+    ("petroleum", "OIL_GAS"), ("reliance", "OIL_GAS"),
+    ("automobile", "AUTO_ANCILLARIES"), ("vehicle", "AUTO_ANCILLARIES"),
+    ("maruti", "AUTO_ANCILLARIES"), ("tata motor", "AUTO_ANCILLARIES"),
+    ("bajaj auto", "AUTO_ANCILLARIES"),
+    ("fmcg", "FMCG"), ("hindustan unilever", "FMCG"), ("itc", "FMCG"),
+    ("nestle", "FMCG"), ("dabur", "FMCG"),
+    ("telecom", "TELECOM"), ("airtel", "TELECOM"), ("jio", "TELECOM"),
+    ("vodafone", "TELECOM"), ("5g", "TELECOM"),
+    ("metal", "METALS_MINING"), ("steel", "METALS_MINING"),
+    ("mining", "METALS_MINING"), ("tata steel", "METALS_MINING"),
+    ("jsw", "METALS_MINING"),
+    ("power", "POWER_UTILITIES"), ("electricity", "POWER_UTILITIES"),
+    ("renewable", "POWER_UTILITIES"), ("adani green", "POWER_UTILITIES"),
+    ("real estate", "REAL_ESTATE"), ("housing", "REAL_ESTATE"),
+    ("dlf", "REAL_ESTATE"), ("godrej prop", "REAL_ESTATE"),
+    ("cement", "CEMENT"), ("ultratech", "CEMENT"), ("acc cement", "CEMENT"),
+    ("chemical", "CHEMICALS"), ("pidilite", "CHEMICALS"),
+    ("insurance", "INSURANCE"), ("lic", "INSURANCE"), ("hdfc life", "INSURANCE"),
+    ("rbi", "BANKING"), ("repo rate", "BANKING"), ("credit policy", "BANKING"),
+    ("sebi", "MACRO_ECONOMY"), ("gdp", "MACRO_ECONOMY"),
+    ("inflation", "MACRO_ECONOMY"), ("cpi", "MACRO_ECONOMY"),
+    ("budget", "MACRO_ECONOMY"), ("fiscal", "MACRO_ECONOMY"),
+    ("nifty", "MACRO_ECONOMY"), ("sensex", "MACRO_ECONOMY"),
+    ("fed", "GLOBAL_MARKETS"), ("us market", "GLOBAL_MARKETS"),
+    ("crude", "OIL_GAS"), ("brent", "OIL_GAS"),
+]
+
+_SYMBOL_STOPWORDS = {
+    "NSE", "BSE", "IPO", "GDP", "RBI", "SEBI", "FII", "DII", "ETF",
+    "MF", "NPS", "FD", "NFO", "SIP", "NAV", "NIFTY", "Q1", "Q2",
+    "Q3", "Q4", "YOY", "QOQ", "US", "UK", "UN", "UPI", "MCA",
+    "CEO", "CFO", "CTO", "COO", "MD", "AGM", "EGM", "QIP", "OFS",
+    "PAT", "EBITDA", "PBT", "EPS", "PE", "PB", "ROE", "WACC",
+}
+
+_MACRO_FROM_SECTOR = {
+    "BANKING": "MONETARY_POLICY", "NBFC": "MONETARY_POLICY",
+    "IT_TECHNOLOGY": "SECTORAL", "PHARMA_HEALTHCARE": "REGULATORY",
+    "OIL_GAS": "COMMODITY", "AUTO_ANCILLARIES": "SECTORAL",
+    "METALS_MINING": "COMMODITY", "MACRO_ECONOMY": "MONETARY_POLICY",
+    "GLOBAL_MARKETS": "GLOBAL_MACRO",
+}
+
+
+def _heuristic_extract(news_item: NewsItem) -> Tuple[List[str], str, List[str]]:
+    """
+    Keyword-based sector detection + symbol extraction for use when no API key is set.
+    Returns (affected_sectors, macro_theme, resolved_symbols).
+    """
+    text = f"{news_item.headline} {news_item.body or ''}".lower()
+
+    # Sector detection (ordered, deduped)
+    seen_sectors: set = set()
+    sectors: List[str] = []
+    for keyword, sector in _SECTOR_KEYWORDS:
+        if keyword in text and sector not in seen_sectors:
+            sectors.append(sector)
+            seen_sectors.add(sector)
+        if len(sectors) >= 3:
+            break
+
+    # Symbol extraction from headline — find 2-10 char all-caps words
+    potential = re.findall(r'\b[A-Z]{2,10}\b', news_item.headline)
+    extracted = [s for s in potential if s not in _SYMBOL_STOPWORDS][:4]
+    resolved = list(dict.fromkeys(list(news_item.symbols_mentioned) + extracted))
+
+    # Macro theme: derive from leading sector, else SECTORAL
+    macro_theme = "SECTORAL"
+    if sectors:
+        macro_theme = _MACRO_FROM_SECTOR.get(sectors[0], "SECTORAL")
+
+    return sectors, macro_theme, resolved
+
+
 class ExtractionResult(TypedDict):
     macro_theme: str
     affected_sectors: List[str]
@@ -94,16 +183,17 @@ def extract_entities(news_item: NewsItem) -> ExtractionResult:
     llm_logger = get_llm_logger()
 
     if not ANTHROPIC_API_KEY:
-        logger.warning("No ANTHROPIC_API_KEY — returning mock extraction result")
+        logger.warning("No ANTHROPIC_API_KEY — using heuristic extraction")
+        sectors, macro_theme, resolved = _heuristic_extract(news_item)
         return ExtractionResult(
-            macro_theme="SECTORAL",
-            affected_sectors=["BANKING"],
+            macro_theme=macro_theme,
+            affected_sectors=sectors,
             named_companies=[],
             named_regulators=[],
             economic_indicators=[],
             sentiment_direction="neutral",
             latency_ms=(time.time() - start_time) * 1000,
-            resolved_symbols=list(news_item.symbols_mentioned),
+            resolved_symbols=resolved,
         )
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)

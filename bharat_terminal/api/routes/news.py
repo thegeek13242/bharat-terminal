@@ -59,7 +59,7 @@ async def get_news_feed(
         for raw in reversed(raw_items):  # most-recent first
             try:
                 item = json.loads(raw)
-                if sector and sector.upper() not in (item.get("sectors") or []):
+                if sector and sector.upper() not in (item.get("affected_sectors") or item.get("sectors") or []):
                     continue
                 if source and item.get("source", "").upper() != source.upper():
                     continue

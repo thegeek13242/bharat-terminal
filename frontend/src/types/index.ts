@@ -5,6 +5,7 @@ export interface NewsItem {
   headline: string;
   body?: string;
   url: string;
+  raw_html?: string;
   ingest_latency_ms: number;
   category?: string;
   symbols_mentioned: string[];

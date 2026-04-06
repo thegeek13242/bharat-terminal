@@ -17,6 +17,11 @@ export const api = {
       `/news/feed?limit=${limit}${sector ? `&sector=${sector}` : ''}`
     ),
 
+  getImpactFeed: (limit = 50, relevantOnly = true) =>
+    request<{ items: any[]; count: number }>(
+      `/impact/feed?limit=${limit}&relevant_only=${relevantOnly}`
+    ),
+
   getImpact: (newsId: string) =>
     request<any>(`/impact/${newsId}`),
 

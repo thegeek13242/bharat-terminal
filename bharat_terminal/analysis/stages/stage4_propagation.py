@@ -3,6 +3,7 @@ Stage 4: Graph propagation through company relationship graph.
 Traverses up to 2 hops with decay: 0.6x at hop 1, 0.35x at hop 2.
 SLA: ≤500ms
 """
+import os
 import time
 import logging
 import asyncio
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 DECAY_HOP1 = 0.6
 DECAY_HOP2 = 0.35
 MAX_HOPS = 2
-KNOWLEDGE_BASE_URL = "http://kb-service:8001"
+KNOWLEDGE_BASE_URL = os.getenv("KNOWLEDGE_BASE_URL", "http://kb-service:8001")
 
 
 async def fetch_company_relationships(symbol: str) -> List[dict]:
