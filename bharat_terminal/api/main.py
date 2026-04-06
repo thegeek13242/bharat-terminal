@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
 from bharat_terminal.api.kafka_relay import start_kafka_relay, stop_kafka_relay
+from bharat_terminal.api.db import close_engine
 from bharat_terminal.api.routes import news, impact, company, graph, watchlist, websocket
 from bharat_terminal.api.ws_manager import manager
 
@@ -30,6 +31,7 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown
     await stop_kafka_relay()
+    await close_engine()
     logger.info("API shutdown complete")
 
 
