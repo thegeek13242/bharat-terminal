@@ -88,14 +88,14 @@ export default function App() {
         {/* Feed + Drilldown */}
         {activeTab === 'feed' && (
           <div className="h-full grid grid-cols-5 gap-3">
-            <div className="col-span-3">
+            <div className="col-span-3 min-h-0">
               <NewsFeed
                 reports={reports}
                 onSelectReport={(r) => setSelectedReport(r)}
                 selectedId={selectedReport?.id}
               />
             </div>
-            <div className="col-span-2">
+            <div className="col-span-2 min-h-0">
               <CompanyDrilldown selectedReport={selectedReport} />
             </div>
           </div>
@@ -104,14 +104,14 @@ export default function App() {
         {/* Impact Graph */}
         {activeTab === 'graph' && (
           <div className="h-full grid grid-cols-5 gap-3">
-            <div className="col-span-2">
+            <div className="col-span-2 min-h-0">
               <NewsFeed
                 reports={reports}
                 onSelectReport={(r) => setSelectedReport(r)}
                 selectedId={selectedReport?.id}
               />
             </div>
-            <div className="col-span-3">
+            <div className="col-span-3 min-h-0">
               <ImpactGraph symbol={primarySymbol} />
             </div>
           </div>
@@ -120,14 +120,14 @@ export default function App() {
         {/* Trade Signals */}
         {activeTab === 'trade' && (
           <div className="h-full grid grid-cols-5 gap-3">
-            <div className="col-span-2">
+            <div className="col-span-2 min-h-0">
               <NewsFeed
                 reports={reports}
                 onSelectReport={(r) => setSelectedReport(r)}
                 selectedId={selectedReport?.id}
               />
             </div>
-            <div className="col-span-3">
+            <div className="col-span-3 min-h-0">
               <TradeIdeas reports={reports} convictionFilter={convictionFilter} />
             </div>
           </div>
@@ -136,14 +136,14 @@ export default function App() {
         {/* Watchlist */}
         {activeTab === 'watchlist' && (
           <div className="h-full grid grid-cols-5 gap-3">
-            <div className="col-span-2">
+            <div className="col-span-2 min-h-0">
               <NewsFeed
                 reports={reports}
                 onSelectReport={(r) => setSelectedReport(r)}
                 selectedId={selectedReport?.id}
               />
             </div>
-            <div className="col-span-3">
+            <div className="col-span-3 min-h-0">
               <Watchlist />
             </div>
           </div>

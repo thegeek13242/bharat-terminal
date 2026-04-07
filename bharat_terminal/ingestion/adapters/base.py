@@ -2,9 +2,13 @@ import asyncio
 import time
 import logging
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 import aiohttp
 from bharat_terminal.types import NewsItem
+
+# Hard gate: never publish items older than this
+_MAX_ITEM_AGE_HOURS = 48
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +100,14 @@ class BaseAdapter(ABC):
 
             try:
                 async for item in self.fetch():
+                    if item.timestamp_utc:
+                        age_h = (datetime.now(timezone.utc) - item.timestamp_utc).total_seconds() / 3600
+                        if age_h > _MAX_ITEM_AGE_HOURS:
+                            logger.debug(
+                                f"[{self.source_name}] Dropping stale item "
+                                f"({age_h:.0f}h old): {item.headline[:70]}"
+                            )
+                            continue
                     await callback(item)
                 self._record_success()
             except Exception as e:

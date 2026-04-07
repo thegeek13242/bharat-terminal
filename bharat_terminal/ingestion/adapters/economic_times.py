@@ -16,9 +16,9 @@ class EconomicTimesAdapter(BaseAdapter):
     rate_limit_per_minute = 5
 
     RSS_FEEDS = [
-        "https://economictimes.indiatimes.com/markets/rss.cms",
-        "https://economictimes.indiatimes.com/markets/stocks/rss.cms",
-        "https://economictimes.indiatimes.com/markets/expert-views/rss.cms",
+        "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
+        "https://economictimes.indiatimes.com/markets/stocks/news/rssfeeds/2146842.cms",
+        "https://economictimes.indiatimes.com/economy/rssfeeds/1373380680.cms",
     ]
 
     def __init__(self):

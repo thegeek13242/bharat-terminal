@@ -11,14 +11,14 @@ logger = logging.getLogger(__name__)
 
 
 class MoneyControlAdapter(BaseAdapter):
-    source_name = "MONEYCONTROL"
-    poll_interval_seconds = 120.0
+    # Moneycontrol RSS feeds have been dead since 2024; replaced with Investing.com India
+    source_name = "INVESTING_IN"
+    poll_interval_seconds = 180.0
     rate_limit_per_minute = 5
 
     RSS_FEEDS = [
-        "https://www.moneycontrol.com/rss/latestnews.xml",
-        "https://www.moneycontrol.com/rss/marketreports.xml",
-        "https://www.moneycontrol.com/rss/buzzingstocks.xml",
+        "https://in.investing.com/rss/news_14.rss",   # India markets
+        "https://in.investing.com/rss/news_301.rss",  # India economy
     ]
 
     def __init__(self):
@@ -32,7 +32,7 @@ class MoneyControlAdapter(BaseAdapter):
             try:
                 feed = await loop.run_in_executor(None, feedparser.parse, feed_url)
                 for entry in feed.entries[:10]:
-                    uid = f"MC_{entry.get('id', entry.get('link', ''))}"
+                    uid = f"INV_{entry.get('id', entry.get('link', ''))}"
                     if uid in self._seen_ids:
                         continue
                     self._seen_ids.add(uid)

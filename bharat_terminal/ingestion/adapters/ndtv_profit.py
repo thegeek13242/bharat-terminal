@@ -11,13 +11,14 @@ logger = logging.getLogger(__name__)
 
 
 class NDTVProfitAdapter(BaseAdapter):
-    source_name = "NDTV_PROFIT"
-    poll_interval_seconds = 120.0
+    # NDTV Profit RSS returns 403; replaced with India-focused Google News queries
+    source_name = "MARKETS_FEED"
+    poll_interval_seconds = 180.0
     rate_limit_per_minute = 5
 
     RSS_FEEDS = [
-        "https://www.ndtvprofit.com/markets/rss",
-        "https://www.ndtvprofit.com/business/rss",
+        "https://news.google.com/rss/search?q=India+GDP+inflation+RBI+budget+when:1d&hl=en-IN&gl=IN&ceid=IN:en",
+        "https://news.google.com/rss/search?q=India+FII+FDI+SEBI+regulation+when:1d&hl=en-IN&gl=IN&ceid=IN:en",
     ]
 
     def __init__(self):
@@ -31,7 +32,7 @@ class NDTVProfitAdapter(BaseAdapter):
             try:
                 feed = await loop.run_in_executor(None, feedparser.parse, feed_url)
                 for entry in feed.entries[:10]:
-                    uid = f"NDTVP_{entry.get('id', entry.get('link', ''))}"
+                    uid = f"MKT_{entry.get('id', entry.get('link', ''))}"
                     if uid in self._seen_ids:
                         continue
                     self._seen_ids.add(uid)

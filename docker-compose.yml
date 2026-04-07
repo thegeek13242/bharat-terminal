@@ -13,7 +13,6 @@ x-common-env: &common-env
   REDIS_URL: redis://redis:6379/0
   KB_SERVICE_URL: http://kb-service:8001
   PYTHONUNBUFFERED: "1"
-  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   EXTRACTION_MODEL: ${EXTRACTION_MODEL:-claude-haiku-4-5-20251001}
   IMPACT_MODEL: ${IMPACT_MODEL:-claude-haiku-4-5-20251001}
   SIGNALS_MODEL: ${SIGNALS_MODEL:-claude-haiku-4-5-20251001}
@@ -149,6 +148,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    env_file: [".env"]
     environment:
       <<: *common-env
     command: ["alembic", "upgrade", "head"]
@@ -163,6 +163,7 @@ services:
     depends_on:
       kb-migrate:
         condition: service_completed_successfully
+    env_file: [".env"]
     environment:
       <<: *common-env
     command: ["python", "-m", "bharat_terminal.kb.manage", "seed-reliance"]
@@ -183,6 +184,7 @@ services:
         condition: service_healthy
       kb-migrate:
         condition: service_completed_successfully
+    env_file: [".env"]
     environment:
       <<: *common-env
     ports:
@@ -205,6 +207,7 @@ services:
         condition: service_completed_successfully
       kb-service:
         condition: service_healthy
+    env_file: [".env"]
     environment:
       <<: *common-env
     restart: unless-stopped
@@ -218,6 +221,7 @@ services:
     depends_on:
       redpanda-init:
         condition: service_completed_successfully
+    env_file: [".env"]
     environment:
       <<: *common-env
     restart: unless-stopped
@@ -235,6 +239,7 @@ services:
         condition: service_healthy
       kb-service:
         condition: service_healthy
+    env_file: [".env"]
     environment:
       <<: *common-env
     ports:

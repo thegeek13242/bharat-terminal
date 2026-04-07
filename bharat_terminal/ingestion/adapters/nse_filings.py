@@ -1,5 +1,6 @@
 import time
 import logging
+import json
 from datetime import datetime, timezone
 from typing import AsyncIterator
 from bharat_terminal.types import NewsItem
@@ -10,17 +11,19 @@ logger = logging.getLogger(__name__)
 
 class NSEFilingsAdapter(BaseAdapter):
     source_name = "NSE_FILINGS"
-    poll_interval_seconds = 30.0
-    rate_limit_per_minute = 10
+    poll_interval_seconds = 60.0
+    rate_limit_per_minute = 5
 
-    # NSE API endpoints (official, no auth needed for public data)
-    BASE_URL = "https://www.nseindia.com"
-    ANNOUNCEMENTS_URL = f"{BASE_URL}/api/home-corporate-announcements"
-    BOARD_MEETINGS_URL = f"{BASE_URL}/api/home-board-meetings"
+    # ?index=equities is required — without it the API returns an error string, not JSON
+    ANNOUNCEMENTS_URL = "https://www.nseindia.com/api/home-corporate-announcements?index=equities"
+    BOARD_MEETINGS_URL = "https://www.nseindia.com/api/home-board-meetings?index=equities"
 
     HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://www.nseindia.com/",
     }
@@ -28,66 +31,65 @@ class NSEFilingsAdapter(BaseAdapter):
     def __init__(self):
         super().__init__()
         self._seen_ids: set = set()
-        self._cookies: dict = {}
-
-    async def _refresh_cookies(self):
-        """NSE requires session cookies from homepage before API calls."""
-        session = await self.get_session()
-        try:
-            async with session.get(self.BASE_URL, headers=self.HEADERS) as resp:
-                self._cookies = {k: v.value for k, v in resp.cookies.items()}
-                logger.debug(f"[NSE] Refreshed cookies: {list(self._cookies.keys())}")
-        except Exception as e:
-            logger.warning(f"[NSE] Cookie refresh failed: {e}")
 
     async def fetch(self) -> AsyncIterator[NewsItem]:
-        if not self._cookies:
-            await self._refresh_cookies()
-
         session = await self.get_session()
 
-        for url, category in [
-            (self.ANNOUNCEMENTS_URL, "CORPORATE_ANNOUNCEMENT"),
-            (self.BOARD_MEETINGS_URL, "BOARD_MEETING"),
+        for url, category, sym_field, ts_field, ts_fmt in [
+            (
+                self.ANNOUNCEMENTS_URL,
+                "CORPORATE_ANNOUNCEMENT",
+                "symbol",
+                "an_dt",
+                "%d-%b-%Y %H:%M:%S",
+            ),
+            (
+                self.BOARD_MEETINGS_URL,
+                "BOARD_MEETING",
+                "bm_symbol",
+                "bm_date",
+                "%d-%b-%Y",
+            ),
         ]:
             ingest_start = time.time()
             try:
-                async with session.get(
-                    url, headers=self.HEADERS, cookies=self._cookies
-                ) as resp:
-                    if resp.status == 403:
-                        logger.warning(f"[NSE] 403 on {url}, refreshing cookies")
-                        await self._refresh_cookies()
-                        continue
+                async with session.get(url, headers=self.HEADERS) as resp:
                     resp.raise_for_status()
-                    data = await resp.json(content_type=None)
+                    raw = await resp.text()
+                    if not raw or not raw.strip().startswith(("{", "[")):
+                        logger.warning(f"[NSE] Non-JSON response from {url}: {raw[:100]}")
+                        self._record_failure()
+                        continue
 
+                    data = json.loads(raw)
                     items = data if isinstance(data, list) else data.get("data", [])
 
-                    for item in (items or [])[:20]:  # Process latest 20
-                        item_id = item.get("id") or item.get("seqno") or ""
-                        uid = f"NSE_{item_id}"
+                    for item in (items or [])[:20]:
+                        symbol = (
+                            item.get(sym_field)
+                            or item.get("symbol")
+                            or item.get("sm_symbol")
+                            or ""
+                        )
+                        uid = f"NSE_{category}_{symbol}_{item.get(ts_field, '')}"
                         if uid in self._seen_ids:
                             continue
                         self._seen_ids.add(uid)
 
-                        # NSE announcement fields vary; try common field names
                         headline = (
                             item.get("attchmntText")
+                            or item.get("bm_purpose")
                             or item.get("desc")
                             or item.get("subject")
-                            or item.get("purpose")
-                            or "NSE Corporate Announcement"
                         )
-                        symbol = item.get("symbol") or item.get("sm_symbol") or ""
+                        if not headline or not headline.strip():
+                            continue
 
-                        ts_str = item.get("exchdisstime") or item.get("bm_date") or ""
+                        ts_str = item.get(ts_field, "")
                         try:
-                            if ts_str:
-                                ts = datetime.strptime(ts_str[:19], "%d-%b-%Y %H:%M:%S")
-                                ts = ts.replace(tzinfo=timezone.utc)
-                            else:
-                                ts = datetime.now(timezone.utc)
+                            ts = datetime.strptime(ts_str.strip(), ts_fmt).replace(
+                                tzinfo=timezone.utc
+                            )
                         except Exception:
                             ts = datetime.now(timezone.utc)
 
@@ -98,7 +100,7 @@ class NSEFilingsAdapter(BaseAdapter):
                             source=self.source_name,
                             timestamp_utc=ts,
                             headline=headline,
-                            body=item.get("attchmntFile") or item.get("details"),
+                            body=item.get("bm_desc") or item.get("details"),
                             url=(
                                 f"https://www.nseindia.com/company-info/"
                                 f"corporate-announcements?symbol={symbol}"
@@ -112,4 +114,3 @@ class NSEFilingsAdapter(BaseAdapter):
             except Exception as e:
                 logger.error(f"[NSE] Error fetching {url}: {e}")
                 self._record_failure()
-                return

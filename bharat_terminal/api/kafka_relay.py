@@ -75,10 +75,13 @@ async def _relay_loop():
         await consumer.start()
         logger.info(f"Relay consuming from {TOPIC_ANALYSED}")
 
-        async for msg in consumer:
+        while True:
             try:
+                msg = await consumer.getone()
                 report: dict = msg.value
                 await _handle_report(report)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Relay error: {e}", exc_info=True)
 
@@ -152,7 +155,7 @@ async def _persist_to_db(report: dict, news_item: dict, news_id: str):
                          ingest_latency_ms, category, symbols_mentioned)
                     VALUES
                         (:id, :source, :timestamp_utc, :headline, :body, :url,
-                         :ingest_latency_ms, :category, :symbols_mentioned::jsonb)
+                         :ingest_latency_ms, :category, CAST(:symbols_mentioned AS jsonb))
                     ON CONFLICT (id) DO NOTHING
                 """),
                 {
@@ -179,8 +182,8 @@ async def _persist_to_db(report: dict, news_item: dict, news_id: str):
                          processing_latency_ms)
                     VALUES
                         (:id, :news_id, :relevant, :confidence, :macro_theme,
-                         :affected_sectors::jsonb, :company_impacts::jsonb,
-                         :trade_signals::jsonb, :processing_latency_ms)
+                         CAST(:affected_sectors AS jsonb), CAST(:company_impacts AS jsonb),
+                         CAST(:trade_signals AS jsonb), :processing_latency_ms)
                     ON CONFLICT (id) DO NOTHING
                 """),
                 {

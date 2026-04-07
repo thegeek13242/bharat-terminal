@@ -11,13 +11,14 @@ logger = logging.getLogger(__name__)
 
 
 class ReutersIndiaAdapter(BaseAdapter):
+    # Reuters India feeds restructured; replaced with India corporate/M&A Google News
     source_name = "REUTERS_INDIA"
-    poll_interval_seconds = 120.0
+    poll_interval_seconds = 180.0
     rate_limit_per_minute = 5
 
     RSS_FEEDS = [
-        "https://feeds.reuters.com/reuters/INbusinessNews",
-        "https://feeds.reuters.com/reuters/INtopNews",
+        "https://news.google.com/rss/search?q=India+IPO+acquisition+merger+NCLT+when:1d&hl=en-IN&gl=IN&ceid=IN:en",
+        "https://news.google.com/rss/search?q=Nifty+BSE+India+results+quarterly+earnings+when:1d&hl=en-IN&gl=IN&ceid=IN:en",
     ]
 
     def __init__(self):
@@ -31,7 +32,7 @@ class ReutersIndiaAdapter(BaseAdapter):
             try:
                 feed = await loop.run_in_executor(None, feedparser.parse, feed_url)
                 for entry in feed.entries[:10]:
-                    uid = f"REU_{entry.get('id', entry.get('link', ''))}"
+                    uid = f"RI_{entry.get('id', entry.get('link', ''))}"
                     if uid in self._seen_ids:
                         continue
                     self._seen_ids.add(uid)

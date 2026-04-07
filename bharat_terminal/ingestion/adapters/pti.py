@@ -17,10 +17,11 @@ class PTIAdapter(BaseAdapter):
     poll_interval_seconds = 180.0
     rate_limit_per_minute = 3
 
-    # Google News RSS filtered for PTI stories about Indian markets
+    # Google News RSS with when:1d to restrict to last 24 hours only
     RSS_FEEDS = [
-        "https://news.google.com/rss/search?q=PTI+India+stock+market&hl=en-IN&gl=IN&ceid=IN:en",
-        "https://news.google.com/rss/search?q=PTI+NSE+BSE&hl=en-IN&gl=IN&ceid=IN:en",
+        "https://news.google.com/rss/search?q=India+stock+market+Sensex+Nifty+when:1d&hl=en-IN&gl=IN&ceid=IN:en",
+        "https://news.google.com/rss/search?q=NSE+BSE+India+earnings+results+when:1d&hl=en-IN&gl=IN&ceid=IN:en",
+        "https://news.google.com/rss/search?q=RBI+India+economy+inflation+when:1d&hl=en-IN&gl=IN&ceid=IN:en",
     ]
 
     def __init__(self):
