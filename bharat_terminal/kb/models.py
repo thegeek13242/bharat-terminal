@@ -7,7 +7,7 @@ from typing import Optional, List
 import uuid
 
 from sqlalchemy import (
-    Column, String, Integer, Float, Boolean, DateTime, Date, Text, JSON,
+    Column, String, Integer, BigInteger, Float, Boolean, DateTime, Date, Text, JSON,
     ForeignKey, UniqueConstraint, Index, Enum as SAEnum, ARRAY
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
@@ -217,7 +217,7 @@ class PricePoint(Base):
     high: Mapped[Optional[float]] = mapped_column(Float)
     low: Mapped[Optional[float]] = mapped_column(Float)
     close: Mapped[float] = mapped_column(Float, nullable=False)
-    volume: Mapped[Optional[int]] = mapped_column(Integer)
+    volume: Mapped[Optional[int]] = mapped_column(BigInteger)
 
     company: Mapped["Company"] = relationship("Company", back_populates="price_history")
 
@@ -225,3 +225,198 @@ class PricePoint(Base):
         UniqueConstraint("symbol", "date", name="uq_price_point"),
         Index("ix_prices_symbol_date", "symbol", "date"),
     )
+
+
+class NseFiling(Base):
+    """Metadata from NSE's corporates-financial-results API. One row per filing."""
+    __tablename__ = "nse_filings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    isin: Mapped[Optional[str]] = mapped_column(String(12), nullable=True)
+    from_date: Mapped[date] = mapped_column(Date, nullable=False)
+    to_date: Mapped[date] = mapped_column(Date, nullable=False)
+    period: Mapped[str] = mapped_column(String(20), nullable=False)
+    relating_to: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    financial_year: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    consolidated: Mapped[str] = mapped_column(String(30), nullable=False)
+    audited: Mapped[str] = mapped_column(String(20), nullable=False)
+    ind_as: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    format: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    xbrl_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    detail_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    seq_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    filing_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    broadcast_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    xbrl_downloaded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    xbrl_parsed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    financial_results: Mapped[List["FinancialResult"]] = relationship(
+        "FinancialResult", back_populates="nse_filing", lazy="select"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "from_date", "to_date", "consolidated", name="uq_nse_filing"),
+        Index("ix_nse_filings_symbol", "symbol"),
+        Index("ix_nse_filings_to_date", "to_date"),
+        Index("ix_nse_filings_parsed", "xbrl_parsed"),
+    )
+
+
+class FinancialResult(Base):
+    """Quarterly/annual P&L data parsed from XBRL. One row per company per period."""
+    __tablename__ = "financial_results"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(
+        String(20), ForeignKey("companies.symbol", ondelete="CASCADE"), nullable=False
+    )
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    consolidated: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    audited: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # P&L line items (Crores INR)
+    revenue_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    other_income_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    total_income_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    cost_of_materials_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    purchases_stock_in_trade_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    inventory_changes_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    employee_expense_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    finance_costs_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    depreciation_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    other_expenses_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    total_expenses_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    pbt_before_exceptional_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    exceptional_items_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    pbt_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    tax_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    pat_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    pat_attributable_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    other_comprehensive_income_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # EPS
+    eps_basic: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    eps_diluted: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    face_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    paid_up_capital_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Ratios
+    debt_equity_ratio: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    interest_coverage_ratio: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Derived
+    ebitda_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    ebitda_margin_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Segment data
+    segment_data: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    # YTD cumulative
+    ytd_revenue_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    ytd_pat_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    ytd_eps_basic: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Provenance
+    source: Mapped[str] = mapped_column(String(20), default="nse_xbrl", nullable=False)
+    nse_filing_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("nse_filings.id"), nullable=True
+    )
+    raw_xbrl_facts: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    company: Mapped["Company"] = relationship("Company", foreign_keys=[symbol], lazy="select")
+    nse_filing: Mapped[Optional["NseFiling"]] = relationship(
+        "NseFiling", back_populates="financial_results", lazy="select"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "period_end", "period_type", "consolidated", name="uq_financial_result"),
+        Index("ix_financial_results_symbol", "symbol"),
+        Index("ix_financial_results_period", "period_end"),
+        Index("ix_financial_results_symbol_period", "symbol", "period_end"),
+    )
+
+
+class ShareholdingPattern(Base):
+    __tablename__ = "shareholding_patterns"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(
+        String(20), ForeignKey("companies.symbol", ondelete="CASCADE"), nullable=False
+    )
+    quarter_end: Mapped[date] = mapped_column(Date, nullable=False)
+    promoter_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    promoter_pledge_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    fii_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    dii_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    public_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    num_shareholders: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    source: Mapped[str] = mapped_column(String(20), default="nse", nullable=False)
+    raw_data: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "quarter_end", name="uq_shareholding"),
+        Index("ix_shareholding_symbol", "symbol"),
+        Index("ix_shareholding_quarter", "quarter_end"),
+    )
+
+
+class CorporateAction(Base):
+    __tablename__ = "corporate_actions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(
+        String(20), ForeignKey("companies.symbol", ondelete="CASCADE"), nullable=False
+    )
+    ex_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    record_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    action_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    details: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    source: Mapped[str] = mapped_column(String(20), default="nse", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "ex_date", "action_type", name="uq_corporate_action"),
+        Index("ix_corp_actions_symbol", "symbol"),
+        Index("ix_corp_actions_date", "ex_date"),
+    )
+
+
+class ResultEvent(Base):
+    """Tracks scheduled financial result announcements from NSE board meetings calendar."""
+    __tablename__ = "result_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(
+        String(20), ForeignKey("companies.symbol", ondelete="CASCADE"), nullable=False
+    )
+    result_date: Mapped[date] = mapped_column(Date, nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    sync_status: Mapped[str] = mapped_column(
+        String(20), default="pending", nullable=False
+    )  # pending | synced | failed | no_data
+    synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "result_date", name="uq_result_event"),
+        Index("ix_result_events_date", "result_date"),
+        Index("ix_result_events_status", "sync_status"),
+    )
+
+
+class SyncLog(Base):
+    __tablename__ = "sync_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    sync_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    source: Mapped[str] = mapped_column(String(30), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="running", nullable=False)
+    records_processed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    records_failed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)

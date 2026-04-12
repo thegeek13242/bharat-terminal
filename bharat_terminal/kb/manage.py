@@ -508,6 +508,27 @@ def main():
     subparsers.add_parser("sync-nse", help="Fetch all NSE-listed companies from NSE equity master")
     subparsers.add_parser("create-tables", help="Create all database tables")
 
+    # ── New pipeline commands ───────────────────────────────────────────────
+    subparsers.add_parser("sync-companies", help="Fetch all NSE companies and upsert into KB")
+
+    fin_parser = subparsers.add_parser("sync-financials", help="Fetch NSE XBRL filings and parse financial results")
+    fin_parser.add_argument("--tier", choices=["nifty50", "nifty500", "all"], default="nifty50")
+    fin_parser.add_argument("--full-refresh", action="store_true", help="Re-process all companies regardless of data quality")
+    fin_parser.add_argument("--resume", action="store_true", help="Resume from last failed run")
+
+    price_parser = subparsers.add_parser("sync-prices", help="Backfill daily OHLCV from NSE bhavcopy")
+    price_parser.add_argument("--days", type=int, default=30, help="Number of days to backfill")
+
+    all_parser = subparsers.add_parser("sync-all", help="Run full sync pipeline (companies → financials → DCF → prices)")
+    all_parser.add_argument("--tier", choices=["nifty50", "nifty500", "all"], default="nifty50")
+    all_parser.add_argument("--days", type=int, default=30, help="Days of price history to backfill")
+    all_parser.add_argument("--full-refresh", action="store_true")
+
+    sym_parser = subparsers.add_parser("sync-symbol", help="Sync financial data for a single company (event-driven)")
+    sym_parser.add_argument("symbol", type=str, help="NSE symbol (e.g. RELIANCE)")
+
+    subparsers.add_parser("monitor", help="Start continuous KB update monitor (long-running)")
+
     args = parser.parse_args()
 
     if args.command == "refresh-dcf":
@@ -524,6 +545,38 @@ def main():
         asyncio.run(sync_nse_all())
     elif args.command == "create-tables":
         asyncio.run(create_tables())
+    elif args.command == "sync-companies":
+        from bharat_terminal.kb.sync.pipeline import sync_company_master
+        from bharat_terminal.kb.sync.utils import create_async_session
+        async def _run():
+            factory = create_async_session()
+            async with factory() as session:
+                return await sync_company_master(session)
+        asyncio.run(_run())
+    elif args.command == "sync-financials":
+        from bharat_terminal.kb.sync.pipeline import sync_financials
+        asyncio.run(sync_financials(
+            tier=args.tier,
+            full_refresh=args.full_refresh,
+            resume=args.resume,
+        ))
+    elif args.command == "sync-prices":
+        from bharat_terminal.kb.sync.pipeline import sync_prices
+        asyncio.run(sync_prices(days=args.days))
+    elif args.command == "sync-all":
+        from bharat_terminal.kb.sync.pipeline import sync_all
+        asyncio.run(sync_all(
+            tier=args.tier,
+            days=args.days,
+            full_refresh=args.full_refresh,
+        ))
+    elif args.command == "sync-symbol":
+        from bharat_terminal.kb.sync.pipeline import sync_symbol
+        result = asyncio.run(sync_symbol(args.symbol.upper()))
+        print(f"Result: {result}")
+    elif args.command == "monitor":
+        from bharat_terminal.kb.sync.monitor import main as monitor_main
+        asyncio.run(monitor_main())
     else:
         parser.print_help()
         sys.exit(1)

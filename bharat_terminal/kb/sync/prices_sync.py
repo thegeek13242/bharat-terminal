@@ -117,7 +117,7 @@ async def fetch_bhavcopy(for_date: date) -> List[Dict]:
                                         pass
                             return None
 
-                        close = safe_float(["CLOSE", "ClsePric", "LAST"])
+                        close = safe_float(["CLOSE", "ClsPric", "ClsePric", "LastPric", "LAST"])
                         if close is None:
                             continue
 

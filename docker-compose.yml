@@ -166,8 +166,39 @@ services:
     env_file: [".env"]
     environment:
       <<: *common-env
-    command: ["python", "-m", "bharat_terminal.kb.manage", "seed-reliance"]
+    command: ["python", "-m", "bharat_terminal.kb.manage", "sync-all", "--tier", "nifty50", "--days", "30"]
     restart: "no"
+    logging: *default-logging
+
+  kb-backfill:
+    build:
+      context: .
+      dockerfile: docker/kb/Dockerfile
+    container_name: bharat-kb-backfill
+    depends_on:
+      kb-migrate:
+        condition: service_completed_successfully
+    env_file: [".env"]
+    environment:
+      <<: *common-env
+    command: ["python", "-m", "bharat_terminal.kb.manage", "sync-all", "--tier", "all", "--days", "365"]
+    restart: "no"
+    logging: *default-logging
+    profiles: ["backfill"]
+
+  kb-monitor:
+    build:
+      context: .
+      dockerfile: docker/kb/Dockerfile
+    container_name: bharat-kb-monitor
+    depends_on:
+      kb-service:
+        condition: service_healthy
+    env_file: [".env"]
+    environment:
+      <<: *common-env
+    command: ["python", "-m", "bharat_terminal.kb.manage", "monitor"]
+    restart: unless-stopped
     logging: *default-logging
 
   # ── Application Services ───────────────────────────────────────────────────
