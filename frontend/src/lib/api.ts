@@ -36,4 +36,21 @@ export const api = {
 
   saveWatchlist: (items: any[]) =>
     request('/watchlist/', { method: 'POST', body: JSON.stringify(items) }),
+
+  getSentimentLatest: (theme?: string, direction?: string, limit = 100) => {
+    const qs = new URLSearchParams({ limit: String(limit) });
+    if (theme) qs.set('theme', theme);
+    if (direction) qs.set('direction', direction);
+    return request<{ items: any[]; count: number }>(`/sentiment/latest?${qs}`);
+  },
+
+  getSentimentRecent: (limit = 100, sinceMinutes = 720) =>
+    request<{ items: any[]; count: number }>(
+      `/sentiment/recent?limit=${limit}&since_minutes=${sinceMinutes}`
+    ),
+
+  getSentimentThemes: (sinceMinutes = 720) =>
+    request<{ themes: any[]; count: number }>(
+      `/sentiment/themes?since_minutes=${sinceMinutes}`
+    ),
 };

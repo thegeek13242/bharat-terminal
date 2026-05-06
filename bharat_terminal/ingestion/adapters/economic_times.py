@@ -12,7 +12,9 @@ logger = logging.getLogger(__name__)
 
 class EconomicTimesAdapter(BaseAdapter):
     source_name = "ECONOMIC_TIMES"
-    poll_interval_seconds = 120.0
+    poll_interval_seconds = 120.0       # Legacy fallback
+    poll_interval_fast = 45.0           # Market hours
+    poll_interval_slow = 300.0          # Off-hours
     rate_limit_per_minute = 5
 
     RSS_FEEDS = [
@@ -20,10 +22,6 @@ class EconomicTimesAdapter(BaseAdapter):
         "https://economictimes.indiatimes.com/markets/stocks/news/rssfeeds/2146842.cms",
         "https://economictimes.indiatimes.com/economy/rssfeeds/1373380680.cms",
     ]
-
-    def __init__(self):
-        super().__init__()
-        self._seen_ids: set = set()
 
     async def fetch(self) -> AsyncIterator[NewsItem]:
         loop = asyncio.get_event_loop()
@@ -36,9 +34,9 @@ class EconomicTimesAdapter(BaseAdapter):
 
                 for entry in feed.entries[:10]:
                     uid = f"ET_{entry.get('id', entry.get('link', ''))}"
-                    if uid in self._seen_ids:
+                    if self.seen_contains(uid):
                         continue
-                    self._seen_ids.add(uid)
+                    await self.seen_add(uid)
 
                     ts = datetime.now(timezone.utc)
                     if hasattr(entry, "published_parsed") and entry.published_parsed:
@@ -57,6 +55,7 @@ class EconomicTimesAdapter(BaseAdapter):
                         ingest_latency_ms=ingest_latency,
                         category="NEWS",
                         symbols_mentioned=[],
+                        tier="tier2",
                     )
             except Exception as e:
                 logger.error(f"[ET] Error fetching {feed_url}: {e}")

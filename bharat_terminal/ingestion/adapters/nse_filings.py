@@ -12,7 +12,9 @@ logger = logging.getLogger(__name__)
 class NSEFilingsAdapter(BaseAdapter):
     source_name = "NSE_FILINGS"
     poll_interval_seconds = 60.0
-    rate_limit_per_minute = 5
+    poll_interval_fast = 15.0   # Tier 1 — near-real-time during market hours
+    poll_interval_slow = 120.0
+    rate_limit_per_minute = 10
 
     # ?index=equities is required — without it the API returns an error string, not JSON
     ANNOUNCEMENTS_URL = "https://www.nseindia.com/api/home-corporate-announcements?index=equities"
@@ -27,10 +29,6 @@ class NSEFilingsAdapter(BaseAdapter):
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://www.nseindia.com/",
     }
-
-    def __init__(self):
-        super().__init__()
-        self._seen_ids: set = set()
 
     async def fetch(self) -> AsyncIterator[NewsItem]:
         session = await self.get_session()
@@ -72,9 +70,9 @@ class NSEFilingsAdapter(BaseAdapter):
                             or ""
                         )
                         uid = f"NSE_{category}_{symbol}_{item.get(ts_field, '')}"
-                        if uid in self._seen_ids:
+                        if self.seen_contains(uid):
                             continue
-                        self._seen_ids.add(uid)
+                        await self.seen_add(uid)
 
                         headline = (
                             item.get("attchmntText")
@@ -109,6 +107,7 @@ class NSEFilingsAdapter(BaseAdapter):
                             ingest_latency_ms=ingest_latency,
                             category=category,
                             symbols_mentioned=[symbol] if symbol else [],
+                            tier="tier1",
                         )
 
             except Exception as e:

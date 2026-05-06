@@ -4,18 +4,98 @@ from typing import Optional, List, Literal
 import uuid
 
 
+NewsTier = Literal["tier1", "tier2", "tier3", "sentiment"]
+BodyFetchStatus = Literal["pending", "success", "failed", "skipped", "cached"]
+
+
 class NewsItem(BaseModel):
     model_config = {"frozen": True}
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     source: str  # "NSE_FILINGS" | "BSE_FILINGS" | "ECONOMIC_TIMES" | etc
     timestamp_utc: datetime
     headline: str
-    body: Optional[str] = None
+    body: Optional[str] = None          # RSS summary / short description
     url: str
     raw_html: Optional[str] = None
     ingest_latency_ms: float
     category: Optional[str] = None   # "CORPORATE_FILING" | "NEWS" | "ANNOUNCEMENT"
     symbols_mentioned: List[str] = Field(default_factory=list)
+
+    # ── Pillar 2 extensions ───────────────────────────────────────────────
+    full_body: Optional[str] = None                # Full article text (post-fetch)
+    body_word_count: Optional[int] = None
+    body_fetch_status: BodyFetchStatus = "pending"
+    body_extraction_method: Optional[str] = None   # "trafilatura" | "readability" | "rss"
+    dedup_hash: Optional[str] = None               # sha256 of normalized URL
+    tier: NewsTier = "tier2"                       # Latency tier
+
+
+class SentimentItem(BaseModel):
+    """
+    Sentiment/probability signal from prediction markets (e.g. Polymarket).
+
+    Not a news article — a point-in-time probability observation for a binary
+    market, intended for macro-sentiment analysis (rate decisions, geopolitics,
+    commodity prices, elections).
+    """
+    model_config = {"frozen": True}
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    source: str = "POLYMARKET"
+    timestamp_utc: datetime
+    market_id: str
+    question: str
+    category: str = "PREDICTION_MARKET"
+    probability: float                            # 0.0 – 1.0 (YES price)
+    prev_probability: Optional[float] = None      # Last observation before this one
+    delta_1h: Optional[float] = None              # Shift vs ~1h ago
+    volume_24h: Optional[float] = None
+    liquidity: Optional[float] = None
+    end_date: Optional[datetime] = None           # Market resolution deadline
+    tags: List[str] = Field(default_factory=list)
+    market_url: Optional[str] = None
+    ingest_latency_ms: float = 0.0
+    tier: Literal["sentiment"] = "sentiment"
+
+
+class SentimentSnapshot(BaseModel):
+    """
+    Classified prediction-market signal — the output of the sentiment-worker.
+
+    Maps a raw SentimentItem (point-in-time Polymarket probability) onto the
+    Indian-equity worldview: which macro theme does this market track, which
+    NSE sectors / symbols are exposed, and which direction does the latest
+    delta push them.
+
+    A snapshot is produced ONLY when the underlying market is classifiable
+    AND the move is meaningful (|delta_1h| ≥ noise floor configured per theme,
+    OR first-observation of an unseen market).
+    """
+    model_config = {"frozen": True}
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    sentiment_id: str                       # source SentimentItem.id
+    market_id: str                          # source SentimentItem.market_id
+    source: str = "POLYMARKET"
+    timestamp_utc: datetime
+    question: str
+    market_url: Optional[str] = None
+
+    # Classification
+    macro_theme: str                        # e.g. "FED_RATES", "OIL_PRICES"
+    theme_confidence: float = Field(ge=0.0, le=1.0)
+    direction: Literal["bullish_in", "bearish_in", "neutral", "ambiguous"]
+    magnitude: int = Field(ge=1, le=5)      # how big the implied India-equity move is
+    affected_sectors: List[str] = Field(default_factory=list)
+    watchlist_symbols: List[str] = Field(default_factory=list)
+    explanation: str
+
+    # Carry-through observables
+    probability: float                      # latest YES prob (0-1)
+    prev_probability: Optional[float] = None
+    delta_1h: Optional[float] = None
+    volume_24h: Optional[float] = None
+
+    processing_latency_ms: float = 0.0
+    created_at: datetime = Field(default_factory=lambda: datetime.utcnow())
 
 
 class CompanyImpact(BaseModel):

@@ -87,6 +87,43 @@ export interface CompanyProfile {
   };
 }
 
+export type SentimentDirection = 'bullish_in' | 'bearish_in' | 'neutral' | 'ambiguous';
+
+export interface SentimentSnapshot {
+  id: string;
+  sentiment_id: string;
+  market_id: string;
+  source: string;
+  timestamp_utc: string;
+  question: string;
+  market_url?: string;
+  macro_theme: string;
+  theme_confidence: number;
+  direction: SentimentDirection;
+  magnitude: 1 | 2 | 3 | 4 | 5;
+  affected_sectors: string[];
+  watchlist_symbols: string[];
+  explanation: string;
+  probability: number;
+  prev_probability?: number | null;
+  delta_1h?: number | null;
+  volume_24h?: number | null;
+  processing_latency_ms: number;
+  created_at: string;
+}
+
+export interface ThemeAggregate {
+  theme: string;
+  bullish_in: number;
+  bearish_in: number;
+  neutral: number;
+  ambiguous: number;
+  weighted_score: number;
+  events: number;
+  last_question: string;
+  last_delta_1h: number | null;
+}
+
 export interface GraphNode {
   symbol: string;
   name: string;

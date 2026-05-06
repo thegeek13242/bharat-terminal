@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 class MintAdapter(BaseAdapter):
     source_name = "MINT"
     poll_interval_seconds = 120.0
+    poll_interval_fast = 60.0
+    poll_interval_slow = 300.0
     rate_limit_per_minute = 5
 
     RSS_FEEDS = [
@@ -20,10 +22,6 @@ class MintAdapter(BaseAdapter):
         "https://www.livemint.com/rss/companies",
         "https://www.livemint.com/rss/money",
     ]
-
-    def __init__(self):
-        super().__init__()
-        self._seen_ids: set = set()
 
     async def fetch(self) -> AsyncIterator[NewsItem]:
         loop = asyncio.get_event_loop()
@@ -33,9 +31,9 @@ class MintAdapter(BaseAdapter):
                 feed = await loop.run_in_executor(None, feedparser.parse, feed_url)
                 for entry in feed.entries[:10]:
                     uid = f"MINT_{entry.get('id', entry.get('link', ''))}"
-                    if uid in self._seen_ids:
+                    if self.seen_contains(uid):
                         continue
-                    self._seen_ids.add(uid)
+                    await self.seen_add(uid)
                     ts = datetime.now(timezone.utc)
                     if hasattr(entry, "published_parsed") and entry.published_parsed:
                         ts = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
@@ -51,6 +49,7 @@ class MintAdapter(BaseAdapter):
                         ingest_latency_ms=ingest_latency,
                         category="NEWS",
                         symbols_mentioned=[],
+                        tier="tier2",
                     )
             except Exception as e:
                 logger.error(f"[MINT] Error fetching {feed_url}: {e}")

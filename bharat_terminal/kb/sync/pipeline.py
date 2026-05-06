@@ -16,7 +16,7 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
-from sqlalchemy import select, func as sa_func
+from sqlalchemy import select, func as sa_func, or_, exists
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -181,8 +181,18 @@ async def _resolve_symbols(
         query = select(Company.symbol).where(Company.is_active == True)
 
     if not full_refresh and not explicit:
-        # Only process companies with low data quality
-        query = query.where(Company.data_quality_score < 0.5)
+        # Process companies that either have low data quality OR have no financial results yet.
+        # This prevents silently skipping seed companies (e.g. Nifty 50 seeded with
+        # quality_score=0.85-0.92 by seed_nifty50) that have never had XBRL filings fetched.
+        fr_exists = select(FinancialResult.symbol).where(
+            FinancialResult.symbol == Company.symbol
+        ).limit(1)
+        query = query.where(
+            or_(
+                Company.data_quality_score < 0.5,
+                ~exists(fr_exists),
+            )
+        )
 
     result = await session.execute(query)
     symbols = [row[0] for row in result.all()]
