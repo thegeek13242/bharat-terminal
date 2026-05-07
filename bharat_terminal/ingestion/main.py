@@ -19,6 +19,7 @@ from bharat_terminal.ingestion.adapters.moneycontrol import MoneyControlAdapter
 from bharat_terminal.ingestion.adapters.reuters_india import ReutersIndiaAdapter
 from bharat_terminal.ingestion.adapters.pti import PTIAdapter
 from bharat_terminal.ingestion.adapters.polymarket import PolymarketAdapter
+from bharat_terminal.ingestion.adapters.angelone_mcx import AngelOneMCXAdapter
 from bharat_terminal.types import NewsItem
 
 logging.basicConfig(
@@ -96,16 +97,48 @@ async def main():
     # commodity markets). Live Gamma data shows in-universe markets typically
     # cap at ~$300K on quiet days, so on those days we'll emit nothing — that
     # is the intended signal-over-noise tradeoff.
-    poly_min_volume = float(os.getenv("POLYMARKET_MIN_VOLUME_24H", "1000000"))
+    poly_min_volume_24h = float(os.getenv("POLYMARKET_MIN_VOLUME_24H", "1000000"))
+    poly_min_volume_total = float(os.getenv("POLYMARKET_MIN_VOLUME_TOTAL", "5000000"))
     polymarket = PolymarketAdapter(
         publish_callback=producer.publish_sentiment,
         redis_client=redis_client,
-        min_volume_24h=poly_min_volume,
+        min_volume_24h=poly_min_volume_24h,
+        min_volume_total=poly_min_volume_total,
     )
     await polymarket.start()
     logger.info(
-        f"[POLYMARKET] strict-universe filter: Fed + commodities, min_volume_24h=${poly_min_volume:,.0f}"
+        f"[POLYMARKET] strict-universe filter: Fed + commodities, "
+        f"min_volume_24h=${poly_min_volume_24h:,.0f}, "
+        f"min_volume_total=${poly_min_volume_total:,.0f}"
     )
+
+    # Commodity tick layer — Angel One SmartAPI MCX feed → raw.commodity.in
+    # Skipped silently if creds aren't configured, so dev environments without
+    # a broker account still boot cleanly.
+    angelone: Optional[AngelOneMCXAdapter] = None
+    if all(
+        os.getenv(k)
+        for k in (
+            "ANGEL_ONE_API_KEY",
+            "ANGEL_ONE_CLIENT_CODE",
+            "ANGEL_ONE_PASSWORD",
+            "ANGEL_ONE_TOTP_SECRET",
+        )
+    ):
+        try:
+            angelone = AngelOneMCXAdapter(
+                publish_callback=producer.publish_commodity_tick,
+            )
+            await angelone.start()
+        except Exception as e:
+            logger.error(
+                f"[ANGELONE_MCX] failed to start: {e}", exc_info=True
+            )
+            angelone = None
+    else:
+        logger.info(
+            "[ANGELONE_MCX] credentials not set — skipping MCX tick adapter"
+        )
 
     # Ingest pipeline: dedup → publish raw → enqueue for body fetch
     async def handle_item(item: NewsItem) -> None:
@@ -177,6 +210,9 @@ async def main():
     await asyncio.gather(*tasks, return_exceptions=True)
 
     await polymarket.stop()
+
+    if angelone:
+        await angelone.stop()
 
     if fetcher:
         await fetcher.stop()

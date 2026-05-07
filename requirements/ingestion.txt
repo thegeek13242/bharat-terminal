@@ -13,3 +13,7 @@ trafilatura==1.12.2
 readability-lxml==0.8.1
 redis==5.0.8
 simhash==2.1.2
+# Angel One SmartAPI — MCX commodity tick stream
+smartapi-python==1.5.5
+pyotp==2.9.0
+websocket-client==1.8.0

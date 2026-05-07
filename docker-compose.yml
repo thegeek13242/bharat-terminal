@@ -128,6 +128,19 @@ services:
           --topic-config retention.ms=86400000 \
           --topic-config cleanup.policy=delete || true
 
+        rpk topic create raw.commodity.in \
+          --brokers redpanda:9092 \
+          --partitions 6 \
+          --replicas 1 \
+          --topic-config retention.ms=21600000 \
+          --topic-config cleanup.policy=delete || true
+
+        rpk topic create analysed.commodity_shock.in \
+          --brokers redpanda:9092 \
+          --partitions 4 \
+          --replicas 1 \
+          --topic-config retention.ms=604800000 || true
+
         rpk topic create analysed.impact.in \
           --brokers redpanda:9092 \
           --partitions 8 \
@@ -276,6 +289,46 @@ services:
     environment:
       <<: *common-env
     restart: unless-stopped
+    logging: *default-logging
+
+  commodity-engine:
+    build:
+      context: .
+      dockerfile: docker/commodity/Dockerfile
+    container_name: bharat-commodity
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      kb-migrate:
+        condition: service_completed_successfully
+    env_file: [".env"]
+    environment:
+      <<: *common-env
+    restart: unless-stopped
+    logging: *default-logging
+
+  research-runner:
+    # On-demand batch agent that calibrates (symbol × trigger) betas via
+    # BSE XBRL filings + web search and persists into trigger_betas /
+    # fundamental_exposures. Invoke explicitly:
+    #   docker compose run --rm research-runner seed
+    #   docker compose run --rm research-runner run --symbols=RELIANCE --triggers=CRUDEOIL
+    build:
+      context: .
+      dockerfile: docker/research/Dockerfile
+    container_name: bharat-research
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kb-migrate:
+        condition: service_completed_successfully
+    env_file: [".env"]
+    environment:
+      <<: *common-env
+    profiles: ["research"]                    # opt-in; never auto-starts
+    restart: "no"
     logging: *default-logging
 
   ingestion-worker:

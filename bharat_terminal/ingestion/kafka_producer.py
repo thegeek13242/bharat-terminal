@@ -4,7 +4,7 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 from aiokafka import AIOKafkaProducer
-from bharat_terminal.types import NewsItem, SentimentItem
+from bharat_terminal.types import CommodityTick, NewsItem, SentimentItem
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +12,7 @@ KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 TOPIC_RAW_NEWS = "raw.news.in"
 TOPIC_ENRICHED_NEWS = "raw.news.enriched.in"   # Articles with full_body extracted
 TOPIC_SENTIMENT = "raw.sentiment.in"           # Prediction-market probabilities
+TOPIC_COMMODITY = "raw.commodity.in"           # MCX live ticks
 TOPIC_DLQ = "raw.news.dlq"
 
 
@@ -129,6 +130,37 @@ class NewsKafkaProducer:
             return True
         except Exception as e:
             logger.error(f"Failed to publish sentiment {item.market_id}: {e}")
+            return False
+
+    async def publish_commodity_tick(self, tick: CommodityTick) -> bool:
+        """
+        Publish a raw MCX tick to raw.commodity.in.
+
+        Partitioned by commodity name so the downstream detector sees an
+        ordered stream per commodity (avoids reordering the rolling window
+        when consumers parallelise).
+        """
+        if not self._producer:
+            raise RuntimeError("Producer not started")
+
+        data = tick.model_dump()
+        data["timestamp_utc"] = tick.timestamp_utc.isoformat()
+
+        try:
+            await self._producer.send_and_wait(
+                TOPIC_COMMODITY,
+                value=data,
+                key=tick.commodity.encode("utf-8"),
+                headers=[
+                    ("source", tick.source.encode()),
+                    ("commodity", tick.commodity.encode()),
+                    ("token", tick.token.encode()),
+                    ("last_price", f"{tick.last_price:.4f}".encode()),
+                ],
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to publish tick {tick.commodity}/{tick.token}: {e}")
             return False
 
     async def _publish_dlq(self, item: NewsItem, error: str):

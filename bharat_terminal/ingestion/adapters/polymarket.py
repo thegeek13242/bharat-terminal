@@ -111,7 +111,8 @@ class PolymarketAdapter:
         redis_client: Optional["aioredis.Redis"] = None,
         poll_interval_fast: float = 60.0,
         poll_interval_slow: float = 300.0,
-        min_volume_24h: float = 1_000_000.0,           # event-level $1M floor
+        min_volume_24h: float = 1_000_000.0,           # event passes if vol24h ≥ this…
+        min_volume_total: float = 5_000_000.0,         # …OR total volume ≥ this
         min_child_volume_24h: float = 25_000.0,        # per-child secondary floor
         min_probability_delta: float = 0.01,
         max_events_per_cycle: int = 50,
@@ -122,6 +123,7 @@ class PolymarketAdapter:
         self._poll_fast = poll_interval_fast
         self._poll_slow = poll_interval_slow
         self._min_volume = min_volume_24h
+        self._min_volume_total = min_volume_total
         self._min_child_volume = min_child_volume_24h
         self._min_delta = min_probability_delta
         self._max_events = max_events_per_cycle
@@ -142,7 +144,8 @@ class PolymarketAdapter:
         logger.info(
             f"[POLYMARKET] Adapter started "
             f"(fast={self._poll_fast}s, slow={self._poll_slow}s, "
-            f"event_min_vol=${self._min_volume:,.0f}, "
+            f"event_min_vol24h=${self._min_volume:,.0f}, "
+            f"event_min_vol_total=${self._min_volume_total:,.0f}, "
             f"child_min_vol=${self._min_child_volume:,.0f}, "
             f"min_delta={self._min_delta})"
         )
@@ -255,10 +258,15 @@ class PolymarketAdapter:
                 continue
 
             try:
-                vol = float(ev.get("volume24hr") or 0)
+                vol_24h = float(ev.get("volume24hr") or 0)
+                vol_total = float(ev.get("volume") or 0)
             except (TypeError, ValueError):
-                vol = 0.0
-            if vol < self._min_volume:
+                vol_24h = 0.0
+                vol_total = 0.0
+            # Accept if recently active OR historically liquid (price-ladder
+            # markets like "WTI May 2026" accumulate $10M+ total but their
+            # 24h slice drops below the floor on quiet days).
+            if vol_24h < self._min_volume and vol_total < self._min_volume_total:
                 continue
 
             relevant.append(ev)

@@ -407,6 +407,227 @@ class ResultEvent(Base):
     )
 
 
+class Trigger(Base):
+    """A quantitative input variable we calibrate equity betas against."""
+    __tablename__ = "triggers"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    label: Mapped[str] = mapped_column(String(120), nullable=False)
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)         # continuous | discrete
+    unit: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    data_source: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class MacroEvent(Base):
+    """A macro event whose propagation we model across 3 degrees."""
+    __tablename__ = "macro_events"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    label: Mapped[str] = mapped_column(String(160), nullable=False)
+    trigger_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("triggers.id"), nullable=False
+    )
+    trigger_spec: Mapped[str] = mapped_column(Text, nullable=False)
+    propagation_chain: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class EventDegree(Base):
+    __tablename__ = "event_degrees"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("macro_events.id", ondelete="CASCADE"), nullable=False
+    )
+    degree: Mapped[int] = mapped_column(Integer, nullable=False)
+    label: Mapped[str] = mapped_column(String(120), nullable=False)
+    transmission_channel: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("event_id", "degree", name="uq_event_degrees"),
+    )
+
+
+class EventSectorEdge(Base):
+    __tablename__ = "event_sector_edges"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("macro_events.id", ondelete="CASCADE"), nullable=False
+    )
+    degree: Mapped[int] = mapped_column(Integer, nullable=False)
+    sector: Mapped[str] = mapped_column(String(120), nullable=False)
+    direction: Mapped[str] = mapped_column(String(10), nullable=False)
+    magnitude_prior: Mapped[int] = mapped_column(Integer, nullable=False)
+    lag_text: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    lag_min_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    lag_max_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    mechanism: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("event_id", "degree", "sector", name="uq_event_sector_edge"),
+        Index("ix_event_sector_edges_event", "event_id"),
+        Index("ix_event_sector_edges_sector", "sector"),
+    )
+
+
+class EventTransmission(Base):
+    __tablename__ = "event_transmissions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("macro_events.id", ondelete="CASCADE"), nullable=False
+    )
+    from_degree: Mapped[int] = mapped_column(Integer, nullable=False)
+    to_degree: Mapped[int] = mapped_column(Integer, nullable=False)
+    gating_trigger_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("triggers.id"), nullable=False
+    )
+    confirms_threshold: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    refutes_threshold: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "event_id", "from_degree", "to_degree", "gating_trigger_id",
+            name="uq_event_transmission"
+        ),
+    )
+
+
+class TriggerBeta(Base):
+    """
+    Calibrated beta of a stock's return to a 1-unit move in a trigger.
+
+    Multiple rows per (symbol, trigger) are allowed — one per derivation
+    method. The signal layer picks by priority:
+      regression > agent_research > manual
+    so that data-driven calibrations win when they exist.
+    """
+    __tablename__ = "trigger_betas"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(
+        String(20), ForeignKey("companies.symbol", ondelete="CASCADE"), nullable=False
+    )
+    trigger_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("triggers.id"), nullable=False
+    )
+    beta: Mapped[float] = mapped_column(Float, nullable=False)
+    beta_low: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    beta_high: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    std_err: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    t_stat: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    r_squared: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    n_observations: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    sample_start: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    sample_end: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    derivation_method: Mapped[str] = mapped_column(String(40), nullable=False)
+    model_used: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    confidence: Mapped[str] = mapped_column(String(10), nullable=False, default="low")
+    rationale: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    citations: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    calibrated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol", "trigger_id", "derivation_method", name="uq_trigger_beta_method"
+        ),
+        Index("ix_trigger_betas_symbol_trigger", "symbol", "trigger_id"),
+        Index("ix_trigger_betas_trigger", "trigger_id"),
+    )
+
+
+class FundamentalExposure(Base):
+    __tablename__ = "fundamental_exposures"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(
+        String(20), ForeignKey("companies.symbol", ondelete="CASCADE"), nullable=False
+    )
+    trigger_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("triggers.id"), nullable=False
+    )
+    exposure_kind: Mapped[str] = mapped_column(String(20), nullable=False)  # cost | revenue | mixed
+    pct_of_total: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    total_basis: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    mechanism: Mapped[str] = mapped_column(Text, nullable=False)
+    source_doc_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    source_period: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    source_kind: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    citations: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol", "trigger_id", "source_period", name="uq_fundamental_exposure"
+        ),
+        Index("ix_fundamental_exposures_symbol", "symbol"),
+        Index("ix_fundamental_exposures_trigger", "trigger_id"),
+    )
+
+
+class SectorLeader(Base):
+    __tablename__ = "sector_leaders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("macro_events.id", ondelete="CASCADE"), nullable=False
+    )
+    degree: Mapped[int] = mapped_column(Integer, nullable=False)
+    sector: Mapped[str] = mapped_column(String(120), nullable=False)
+    symbol: Mapped[str] = mapped_column(
+        String(20), ForeignKey("companies.symbol", ondelete="CASCADE"), nullable=False
+    )
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    derivation_method: Mapped[str] = mapped_column(String(40), nullable=False)
+    last_calibrated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "event_id", "degree", "sector", "symbol", name="uq_sector_leader"
+        ),
+        Index("ix_sector_leaders_event", "event_id", "degree"),
+    )
+
+
+class UniverseMembership(Base):
+    __tablename__ = "universe_membership"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    universe_name: Mapped[str] = mapped_column(String(40), nullable=False)
+    symbol: Mapped[str] = mapped_column(
+        String(20), ForeignKey("companies.symbol", ondelete="CASCADE"), nullable=False
+    )
+    weight_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    removed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("universe_name", "symbol", name="uq_universe_member"),
+        Index("ix_universe_universe", "universe_name"),
+    )
+
+
 class SyncLog(Base):
     __tablename__ = "sync_log"
 
