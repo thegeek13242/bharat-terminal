@@ -3,7 +3,6 @@ Bharat Terminal API Gateway — FastAPI application.
 Port 8000. Proxies KB service + streams WebSocket events.
 """
 import logging
-import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 

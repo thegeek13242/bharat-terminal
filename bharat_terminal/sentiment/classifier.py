@@ -20,7 +20,6 @@ from typing import Optional
 
 from bharat_terminal.types import SentimentItem, SentimentSnapshot
 from bharat_terminal.sentiment.taxonomy import (
-    Theme,
     find_theme,
     resolve_direction,
     scale_magnitude,

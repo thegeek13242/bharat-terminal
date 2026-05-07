@@ -12,19 +12,17 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Any, AsyncIterator, Dict, List, Optional
 
-from sqlalchemy import select, delete, and_
+from sqlalchemy import select, and_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from bharat_terminal.kb.models import (
-    Base,
     Company,
     EventDegree,
     EventSectorEdge,
     EventTransmission,
     FundamentalExposure,
     MacroEvent,
-    SectorLeader,
     Trigger,
     TriggerBeta,
     UniverseMembership,

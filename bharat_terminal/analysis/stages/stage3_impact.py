@@ -9,7 +9,7 @@ import json
 import uuid
 import asyncio
 import httpx
-from typing import List, TypedDict, Optional
+from typing import List, Optional
 import anthropic
 from bharat_terminal.types import NewsItem, CompanyImpact
 from bharat_terminal.analysis.llm_logger import get_llm_logger, LLMCallRecord, compute_cost
@@ -133,7 +133,7 @@ async def score_impacts(
                 contexts[sym] = ctx
 
     if not ANTHROPIC_API_KEY:
-        latency_ms = (time.time() - start_time) * 1000
+        # latency tracking skipped on degraded path
         return [
             CompanyImpact(
                 symbol=sym,

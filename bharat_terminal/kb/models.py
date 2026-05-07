@@ -4,13 +4,11 @@ Uses PostgreSQL + pgvector extension.
 """
 from datetime import datetime, date
 from typing import Optional, List
-import uuid
 
 from sqlalchemy import (
-    Column, String, Integer, BigInteger, Float, Boolean, DateTime, Date, Text, JSON,
-    ForeignKey, UniqueConstraint, Index, Enum as SAEnum, ARRAY
+    String, Integer, BigInteger, Float, Boolean, DateTime, Date, Text, ForeignKey, UniqueConstraint, Index
 )
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, relationship, Mapped, mapped_column
 from sqlalchemy.sql import func
 from pgvector.sqlalchemy import Vector

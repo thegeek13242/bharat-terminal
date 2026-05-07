@@ -55,7 +55,6 @@ def generate_signals(
     Generate trade signals for high-impact direct companies (hop_distance=0, magnitude≥3).
     Returns list of TradeSignal objects.
     """
-    start_time = time.time()
     llm_logger = get_llm_logger()
 
     # Only generate signals for direct, material impacts

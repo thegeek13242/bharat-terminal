@@ -55,5 +55,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Seed dummy .env for compose interpolation
+        # Compose services declare `env_file: [.env]`. The real .env is
+        # gitignored (it holds secrets); for syntactic validation we just
+        # need the file to exist, so copy from .env.example.
+        run: cp .env.example .env
       - name: Validate compose file
         run: docker compose config --quiet

@@ -7,7 +7,7 @@ Used for verification and fields not available in XBRL (description, P/B, ROE).
 """
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional, Dict, Any, List
 
 import httpx

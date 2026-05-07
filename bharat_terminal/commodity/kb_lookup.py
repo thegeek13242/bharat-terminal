@@ -16,13 +16,12 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from sqlalchemy import select, and_
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from bharat_terminal.kb.models import (
     Company,
     EventSectorEdge,
-    FundamentalExposure,
     TriggerBeta,
 )
 

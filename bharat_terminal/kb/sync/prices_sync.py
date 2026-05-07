@@ -3,10 +3,9 @@ Daily price sync -- fetches end-of-day OHLCV data for NSE-listed equities.
 Uses NSE's bhavcopy (public, no auth required) for bulk daily downloads.
 """
 import csv
-import gzip
 import io
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import List, Dict, Optional
 from zipfile import ZipFile
 

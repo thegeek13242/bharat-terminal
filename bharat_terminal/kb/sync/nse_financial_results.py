@@ -13,7 +13,7 @@ XBRL Context Reference:
 import logging
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timezone
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any
 
 import httpx
 
@@ -234,7 +234,8 @@ def parse_xbrl(xml_bytes: bytes) -> Dict[str, Any]:
 
     one_d = facts_by_context.get("OneD", {})
     four_d = facts_by_context.get("FourD", {})
-    one_i = facts_by_context.get("OneI", {})
+    # OneI (instant) facts retained in original parser; not currently consumed
+    _one_i = facts_by_context.get("OneI", {})  # noqa: F841
 
     # Parse metadata
     metadata = _extract_metadata(one_d)

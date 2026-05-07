@@ -6,9 +6,8 @@ import re
 import time
 import logging
 import os
-import json
 import uuid
-from typing import TypedDict, List, Optional, Tuple
+from typing import TypedDict, List, Tuple
 import anthropic
 from bharat_terminal.types import NewsItem
 from bharat_terminal.analysis.llm_logger import get_llm_logger, LLMCallRecord, compute_cost
