@@ -5,9 +5,10 @@ import { CompanyDrilldown } from '@/components/CompanyDrilldown';
 import { TradeIdeas } from '@/components/TradeIdeas';
 import { ImpactGraph } from '@/components/ImpactGraph';
 import { Watchlist } from '@/components/Watchlist';
+import { SentimentPanel } from '@/components/SentimentPanel';
 import { ImpactReport } from '@/types';
 
-type Tab = 'feed' | 'graph' | 'trade' | 'watchlist';
+type Tab = 'feed' | 'graph' | 'trade' | 'watchlist' | 'sentiment';
 type ConvictionFilter = 'all' | 'high' | 'medium' | 'low';
 
 export default function App() {
@@ -46,6 +47,7 @@ export default function App() {
         {(
           [
             ['feed', 'Live Feed'],
+            ['sentiment', 'Sentiment'],
             ['graph', 'Impact Graph'],
             ['trade', `Signals${signalCount > 0 ? ` (${signalCount})` : ''}`],
             ['watchlist', 'Watchlist'],
@@ -130,6 +132,13 @@ export default function App() {
             <div className="col-span-3 min-h-0">
               <TradeIdeas reports={reports} convictionFilter={convictionFilter} />
             </div>
+          </div>
+        )}
+
+        {/* Sentiment */}
+        {activeTab === 'sentiment' && (
+          <div className="h-full">
+            <SentimentPanel />
           </div>
         )}
 

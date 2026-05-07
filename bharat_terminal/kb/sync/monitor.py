@@ -22,7 +22,6 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from bharat_terminal.kb.models import ResultEvent
 from bharat_terminal.kb.sync.event_calendar import (
     fetch_result_calendar,
-    get_symbols_with_results_on,
 )
 from bharat_terminal.kb.sync.nse_financial_results import create_nse_client
 from bharat_terminal.kb.sync.pipeline import (
@@ -209,8 +208,6 @@ class Monitor:
           3. Retry check at 23:00 IST (late filings)
         """
         while not self._shutdown.is_set():
-            now = datetime.now(IST)
-
             # Morning: refresh the calendar
             morning = self._next_occurrence(hour=9, minute=0)
             logger.info(f"[event_sync] Next calendar refresh at {morning.isoformat()}")

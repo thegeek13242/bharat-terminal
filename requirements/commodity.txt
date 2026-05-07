@@ -1,0 +1,5 @@
+pydantic>=2.6,<3
+aiokafka==0.10.0
+sqlalchemy>=2.0,<3
+asyncpg>=0.29,<1
+pgvector>=0.2,<1

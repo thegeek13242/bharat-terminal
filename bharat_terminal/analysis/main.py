@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import signal
-import os
 
 from bharat_terminal.analysis.kafka_consumer import NewsKafkaConsumer
 from bharat_terminal.analysis.kafka_publisher import ImpactKafkaPublisher

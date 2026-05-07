@@ -7,7 +7,7 @@ GET /health             -> Health check
 import logging
 import os
 import json
-from typing import Optional, List
+from typing import Optional
 from datetime import datetime
 
 import redis.asyncio as aioredis
@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy import select, and_
 
-from bharat_terminal.kb.models import Company, CompanyRelationship, PricePoint
+from bharat_terminal.kb.models import Company, CompanyRelationship
 
 logger = logging.getLogger(__name__)
 

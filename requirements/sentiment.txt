@@ -1,0 +1,2 @@
+pydantic>=2.6,<3
+aiokafka==0.10.0

@@ -3,9 +3,8 @@ DCF (Discounted Cash Flow) calculator with WACC estimation, terminal value,
 and bull/base/bear sensitivity table.
 """
 import logging
-import math
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict
+from dataclasses import dataclass
+from typing import Optional, List
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +179,8 @@ def compute_dcf(inputs: DCFInputs, current_price: Optional[float] = None) -> DCF
     terminal_growth = inputs.terminal_growth_pct
 
     ebitda_margin = inputs.ebitda_margin_pct / 100
-    terminal_margin = (inputs.ebitda_margin_terminal or inputs.ebitda_margin_pct) / 100
+    # terminal margin is computed but unused on this path; keep for clarity
+    _terminal_margin = (inputs.ebitda_margin_terminal or inputs.ebitda_margin_pct) / 100  # noqa: F841
 
     revenue_growths = [
         inputs.revenue_growth_y1,

@@ -69,3 +69,6 @@ Cargo.lock
 *.pid
 *.seed
 *.pid.lock
+# Local sqlite databases
+*.db
+

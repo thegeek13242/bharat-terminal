@@ -11,12 +11,11 @@ Coordinates all sync phases:
 Primary data source: NSE XBRL filings (via corporates-financial-results API).
 Secondary verification: Screener.in (TODO: cross-validation pass).
 """
-import asyncio
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
-from sqlalchemy import select, func as sa_func
+from sqlalchemy import select, func as sa_func, or_, exists
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -181,8 +180,18 @@ async def _resolve_symbols(
         query = select(Company.symbol).where(Company.is_active == True)
 
     if not full_refresh and not explicit:
-        # Only process companies with low data quality
-        query = query.where(Company.data_quality_score < 0.5)
+        # Process companies that either have low data quality OR have no financial results yet.
+        # This prevents silently skipping seed companies (e.g. Nifty 50 seeded with
+        # quality_score=0.85-0.92 by seed_nifty50) that have never had XBRL filings fetched.
+        fr_exists = select(FinancialResult.symbol).where(
+            FinancialResult.symbol == Company.symbol
+        ).limit(1)
+        query = query.where(
+            or_(
+                Company.data_quality_score < 0.5,
+                ~exists(fr_exists),
+            )
+        )
 
     result = await session.execute(query)
     symbols = [row[0] for row in result.all()]
@@ -376,16 +385,6 @@ async def _compute_ttm_and_update_company(
 
     # Compute data quality
     has_quarterly = len(quarters) >= 4
-    has_rels_result = await session.execute(
-        select(sa_func.count()).select_from(Company.__table__)
-        .join(
-            Company.relationships_as_source.property.mapper.class_.__table__,
-            Company.__table__.c.symbol == Company.relationships_as_source.property.mapper.class_.__table__.c.source_symbol,
-            isouter=True,
-        )
-        .where(Company.symbol == symbol)
-    )
-    # Simpler approach: just check if relationships exist
     from bharat_terminal.kb.models import CompanyRelationship
     rel_count_result = await session.execute(
         select(sa_func.count())
@@ -618,7 +617,7 @@ async def sync_symbol(symbol: str) -> Dict:
     Used by the event-driven monitor after a result announcement.
     """
     from bharat_terminal.kb.sync.nse_financial_results import (
-        create_nse_client, refresh_nse_cookies,
+        create_nse_client,
     )
 
     SessionFactory = create_async_session()

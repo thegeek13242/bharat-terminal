@@ -5,8 +5,6 @@ Uses NSE's official equity master CSV (no authentication required).
 import csv
 import io
 import logging
-import os
-from datetime import datetime, timezone
 from typing import List, Dict
 
 import httpx

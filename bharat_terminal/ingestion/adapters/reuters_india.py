@@ -14,16 +14,14 @@ class ReutersIndiaAdapter(BaseAdapter):
     # Reuters India feeds restructured; replaced with India corporate/M&A Google News
     source_name = "REUTERS_INDIA"
     poll_interval_seconds = 180.0
+    poll_interval_fast = 90.0
+    poll_interval_slow = 600.0
     rate_limit_per_minute = 5
 
     RSS_FEEDS = [
         "https://news.google.com/rss/search?q=India+IPO+acquisition+merger+NCLT+when:1d&hl=en-IN&gl=IN&ceid=IN:en",
         "https://news.google.com/rss/search?q=Nifty+BSE+India+results+quarterly+earnings+when:1d&hl=en-IN&gl=IN&ceid=IN:en",
     ]
-
-    def __init__(self):
-        super().__init__()
-        self._seen_ids: set = set()
 
     async def fetch(self) -> AsyncIterator[NewsItem]:
         loop = asyncio.get_event_loop()
@@ -33,9 +31,9 @@ class ReutersIndiaAdapter(BaseAdapter):
                 feed = await loop.run_in_executor(None, feedparser.parse, feed_url)
                 for entry in feed.entries[:10]:
                     uid = f"RI_{entry.get('id', entry.get('link', ''))}"
-                    if uid in self._seen_ids:
+                    if self.seen_contains(uid):
                         continue
-                    self._seen_ids.add(uid)
+                    await self.seen_add(uid)
                     ts = datetime.now(timezone.utc)
                     if hasattr(entry, "published_parsed") and entry.published_parsed:
                         ts = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
@@ -51,6 +49,7 @@ class ReutersIndiaAdapter(BaseAdapter):
                         ingest_latency_ms=ingest_latency,
                         category="NEWS",
                         symbols_mentioned=[],
+                        tier="tier3",
                     )
             except Exception as e:
                 logger.error(f"[REUTERS] Error fetching {feed_url}: {e}")

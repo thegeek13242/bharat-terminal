@@ -313,7 +313,6 @@ async def sync_nse_all():
             )
             if c.get("listing_date"):
                 try:
-                    from datetime import date
                     company.listing_date = datetime.strptime(c["listing_date"], "%d-%b-%Y").date()
                 except (ValueError, TypeError):
                     pass

@@ -10,7 +10,6 @@ used by the frontend to hydrate on page load.
 import json
 import logging
 import os
-from typing import Optional
 
 import redis.asyncio as aioredis
 from fastapi import APIRouter, HTTPException, Query

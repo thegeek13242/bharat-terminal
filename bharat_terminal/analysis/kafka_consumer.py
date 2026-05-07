@@ -1,8 +1,7 @@
-import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Callable, Awaitable
 from aiokafka import AIOKafkaConsumer
 from bharat_terminal.types import NewsItem

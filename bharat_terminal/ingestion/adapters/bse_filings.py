@@ -11,6 +11,8 @@ logger = logging.getLogger(__name__)
 class BSEFilingsAdapter(BaseAdapter):
     source_name = "BSE_FILINGS"
     poll_interval_seconds = 30.0
+    poll_interval_fast = 15.0   # Tier 1 during market hours
+    poll_interval_slow = 120.0
     rate_limit_per_minute = 10
 
     BASE_URL = "https://api.bseindia.com/BseIndiaAPI/api"
@@ -25,10 +27,6 @@ class BSEFilingsAdapter(BaseAdapter):
         "Origin": "https://www.bseindia.com",
         "Referer": "https://www.bseindia.com/",
     }
-
-    def __init__(self):
-        super().__init__()
-        self._seen_ids: set = set()
 
     async def fetch(self) -> AsyncIterator[NewsItem]:
         session = await self.get_session()
@@ -51,9 +49,9 @@ class BSEFilingsAdapter(BaseAdapter):
                     scrip = item.get("SCRIP_CD") or item.get("scrip_cd") or ""
                     uid = f"BSE_{scrip}_{item_id}"
 
-                    if uid in self._seen_ids:
+                    if self.seen_contains(uid):
                         continue
-                    self._seen_ids.add(uid)
+                    await self.seen_add(uid)
 
                     headline = (
                         item.get("HEADLINE")
@@ -90,6 +88,7 @@ class BSEFilingsAdapter(BaseAdapter):
                         ingest_latency_ms=ingest_latency,
                         category="CORPORATE_FILING",
                         symbols_mentioned=[scrip] if scrip else [],
+                        tier="tier1",
                     )
 
         except Exception as e:
