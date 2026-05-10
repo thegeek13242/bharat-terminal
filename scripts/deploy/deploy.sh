@@ -261,10 +261,14 @@ run_remote_docker "set -e
 
 # ── 7/7 App services ─────────────────────────────────────────────────────
 echo "==> [7/7] Start application services"
+# kb-monitor runs the event-driven KB updater: polls NSE board-meetings
+# calendar at 09:00 IST, syncs companies whose results posted at 20:00 +
+# 23:00 IST, refreshes bhavcopy at 16:30 weekdays, weekly Nifty500 sweep
+# Saturday 02:00. Without this the KB goes stale after the initial seed.
 run_remote_docker "set -e
   cd $TARGET_DIR
   docker compose up -d \\
-    kb-service \\
+    kb-service kb-monitor \\
     ingestion-worker analysis-worker sentiment-worker commodity-engine \\
     api-gateway frontend \\
     prometheus grafana
