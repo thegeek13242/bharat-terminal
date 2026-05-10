@@ -1,23 +1,33 @@
 #!/usr/bin/env bash
 #
-# deploy.sh — provision Bharat Terminal on a fresh remote dev server.
+# deploy.sh — provision Bharat Terminal on a GCP Compute Engine instance
+# via `gcloud compute ssh / scp`. No raw SSH; gcloud handles auth, IAP,
+# project context, and key management.
 #
 # Run LOCALLY from the repo root or anywhere:
-#     ./scripts/deploy/deploy.sh <user@host[:port]> [branch]
+#     ./scripts/deploy/deploy.sh [instance-name] [branch]
+#
+# Defaults to the current dev box:
+#     instance: instance-20260508-044518
+#     zone:     asia-south1-c
+#
+# Override per-call:
+#     GCP_INSTANCE=my-vm GCP_ZONE=us-central1-a ./scripts/deploy/deploy.sh
+#     GCP_PROJECT=other-project ./scripts/deploy/deploy.sh
+#     ./scripts/deploy/deploy.sh my-vm feat/some-branch
 #
 # What it does:
-#   1. SSH probe + system info
+#   1. gcloud SSH probe + system info
 #   2. Installs Docker (if missing) + git, joins user to docker group
 #   3. Clones (or fast-forwards) the repo at the requested branch
-#   4. Copies your local .env up to the server (must exist locally; never via git)
+#   4. Copies your local .env up to the instance (must exist locally; never via git)
 #   5. Builds all images
 #   6. Starts infra (postgres, redis, redpanda, redpanda-init), runs migrations
-#   7. Starts application services (kb, ingestion, analysis, sentiment,
-#      commodity, api, frontend, prometheus, grafana)
-#   8. Prints health snapshot + the SSH-tunnel one-liner
+#   7. Starts application services
+#   8. Prints health snapshot + the gcloud-tunnel one-liner
 #
-# Idempotent: re-running on an already-bootstrapped host updates the branch
-# and re-deploys without re-installing Docker.
+# Idempotent: re-running on an already-bootstrapped instance updates the
+# branch and re-deploys without re-installing Docker.
 #
 # Skip Angel One MCX or Anthropic? Just leave those env vars blank in .env;
 # the adapters log "credentials not set" and skip silently.
@@ -25,45 +35,53 @@
 set -euo pipefail
 
 # ── arg parsing ──────────────────────────────────────────────────────────
-if [ $# -lt 1 ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
   cat <<'EOF'
-Usage: deploy.sh <user@host[:port]> [branch]
+Usage: deploy.sh [instance-name] [branch]
+
+Defaults:
+  instance-name  $GCP_INSTANCE  or instance-20260508-044518
+  branch         main
+  zone           $GCP_ZONE      or asia-south1-c
+  project        $GCP_PROJECT   or whatever `gcloud config get-value project` returns
 
 Examples:
-  deploy.sh ubuntu@dev.example.com
-  deploy.sh ubuntu@1.2.3.4:2222 feat/mcx-commodity-research-graph
-  REPO_URL=git@github.com:thegeek13242/bharat-terminal.git deploy.sh ubuntu@host
+  deploy.sh
+  deploy.sh instance-20260508-044518 feat/mcx-commodity-research-graph
+  GCP_ZONE=us-central1-a deploy.sh my-other-vm
+  REPO_URL=git@github.com:thegeek13242/bharat-terminal.git deploy.sh
 
 Environment overrides:
-  REPO_URL      git URL (default: https://github.com/thegeek13242/bharat-terminal.git)
+  GCP_INSTANCE  GCE instance name (default: instance-20260508-044518)
+  GCP_ZONE      GCE zone          (default: asia-south1-c)
+  GCP_PROJECT   GCP project       (default: gcloud's active project)
+  REPO_URL      git URL  (default: https://github.com/thegeek13242/bharat-terminal.git)
   TARGET_DIR    remote install path relative to $HOME (default: bharat-terminal)
   SKIP_BUILD    1 to skip docker compose build (only re-deploy services)
-  SKIP_SEED     1 to skip the optional kb-seed step (default: skipped anyway)
   RUN_SEED      1 to run kb-seed after migrations (NIFTY 50, ~10 min)
 EOF
   exit 1
 fi
 
-REMOTE_RAW="$1"
+GCP_INSTANCE="${1:-${GCP_INSTANCE:-instance-20260508-044518}}"
 BRANCH="${2:-main}"
+GCP_ZONE="${GCP_ZONE:-asia-south1-c}"
+GCP_PROJECT="${GCP_PROJECT:-}"
 REPO_URL="${REPO_URL:-https://github.com/thegeek13242/bharat-terminal.git}"
 TARGET_DIR="${TARGET_DIR:-bharat-terminal}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 RUN_SEED="${RUN_SEED:-0}"
 
-host="${REMOTE_RAW%:*}"
-port="${REMOTE_RAW##*:}"
-[ "$port" = "$REMOTE_RAW" ] && port=22
+# Build a project flag if the user pinned one; otherwise rely on gcloud's
+# active project.
+gcloud_project_args=()
+[ -n "$GCP_PROJECT" ] && gcloud_project_args=(--project "$GCP_PROJECT")
 
-# Force fresh SSH connections per call. Without this, ~/.ssh/config that
-# enables ControlMaster will multiplex everything over one TCP connection
-# authenticated *before* `usermod -aG docker` ran in step 2 — so later
-# steps still see the old group set and fail with "permission denied …
-# /var/run/docker.sock".
-ssh_opts=(-p "$port" -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=60 \
-          -o ControlMaster=no -o ControlPath=none)
-scp_opts=(-P "$port" -o StrictHostKeyChecking=accept-new \
-          -o ControlMaster=no -o ControlPath=none)
+if ! command -v gcloud >/dev/null 2>&1; then
+  echo "✗ gcloud not found. Install Google Cloud SDK first:"
+  echo "    https://cloud.google.com/sdk/docs/install"
+  exit 1
+fi
 
 # ── locate repo root + .env ──────────────────────────────────────────────
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"
@@ -83,7 +101,23 @@ if diff -q "$LOCAL_ENV" "$REPO_ROOT/.env.example" >/dev/null 2>&1; then
   [[ "$ans" =~ ^[Yy]$ ]] || exit 1
 fi
 
-run_remote() { ssh "${ssh_opts[@]}" "$host" "$@"; }
+# ── gcloud wrappers ──────────────────────────────────────────────────────
+# Each invocation is a fresh connection — no ControlMaster multiplexing
+# concerns, so usermod -aG docker takes effect on the very next call.
+run_remote() {
+  gcloud compute ssh "$GCP_INSTANCE" \
+    --zone="$GCP_ZONE" \
+    "${gcloud_project_args[@]}" \
+    --command="$1"
+}
+
+run_remote_scp_to() {
+  # $1 = local path, $2 = remote path (relative to $HOME)
+  gcloud compute scp \
+    --zone="$GCP_ZONE" \
+    "${gcloud_project_args[@]}" \
+    "$1" "$GCP_INSTANCE:$2"
+}
 
 # Run a remote command that uses docker, dispatching through the right
 # privilege wrapper based on DOCKER_MODE (set in the probe below).
@@ -95,13 +129,10 @@ run_remote_docker() {
       run_remote "$cmd"
       ;;
     sg)
-      # sg docker -c needs a single quoted string; escape backslashes and
-      # double quotes so the inner script survives the trip.
       local escaped="${cmd//\\/\\\\}"; escaped="${escaped//\"/\\\"}"
       run_remote "sg docker -c \"$escaped\""
       ;;
     sudo)
-      # Run the script as root via sudo bash -c. Same escaping concerns.
       local escaped="${cmd//\\/\\\\}"; escaped="${escaped//\"/\\\"}"
       run_remote "sudo bash -c \"$escaped\""
       ;;
@@ -112,8 +143,16 @@ run_remote_docker() {
   esac
 }
 
+echo "──────────────────────────────────────────────────────────────────"
+echo " instance: $GCP_INSTANCE"
+echo " zone:     $GCP_ZONE"
+echo " project:  ${GCP_PROJECT:-$(gcloud config get-value project 2>/dev/null || echo '(gcloud default)')}"
+echo " branch:   $BRANCH"
+echo " repo:     $REPO_URL"
+echo "──────────────────────────────────────────────────────────────────"
+
 # ── 1/7 SSH probe ────────────────────────────────────────────────────────
-echo "==> [1/7] SSH probe"
+echo "==> [1/7] gcloud SSH probe"
 run_remote 'echo "  connected as $(whoami) on $(hostname); $(uname -srm)"; \
   awk "/MemTotal/ {printf \"  RAM: %.1f GB\n\", \$2/1024/1024}" /proc/meminfo; \
   df -h / | awk "NR==2 {printf \"  disk: %s free of %s\n\", \$4, \$2}"'
@@ -140,10 +179,8 @@ run_remote 'set -e
 
 # Probe how to reach docker on the remote. Three-tier fallback:
 #   tier 1: direct        — user already in active docker group
-#   tier 2: sg docker -c  — user is a member but the SSH session hasn't
-#                           picked up the group yet (no re-login required)
-#   tier 3: sudo          — last resort; works on fresh cloud images with
-#                           passwordless sudo
+#   tier 2: sg docker -c  — member but session hasn't picked up the group
+#   tier 3: sudo          — last resort; works on fresh images w/ NOPASSWD sudo
 DOCKER_MODE="direct"
 if run_remote 'docker ps >/dev/null 2>&1'; then
   DOCKER_MODE="direct"
@@ -166,9 +203,9 @@ else
     echo "  - docker.sock:   $(ls -la /var/run/docker.sock 2>&1 || echo MISSING)"
   '
   echo
-  echo "  Try one of:"
-  echo "    1) Log out of all SSH sessions and reconnect, then re-run this script."
-  echo "    2) Run 'sudo systemctl start docker' on the remote, then re-run."
+  echo "  Try: gcloud compute instances reset $GCP_INSTANCE --zone=$GCP_ZONE"
+  echo "  …or: gcloud compute ssh $GCP_INSTANCE --zone=$GCP_ZONE --command='sudo systemctl start docker'"
+  echo "  Then re-run this script."
   exit 1
 fi
 
@@ -188,7 +225,7 @@ run_remote "set -e
 
 # ── 4/7 .env ─────────────────────────────────────────────────────────────
 echo "==> [4/7] Copy .env (secrets — never via git)"
-scp "${scp_opts[@]}" "$LOCAL_ENV" "$host:$TARGET_DIR/.env"
+run_remote_scp_to "$LOCAL_ENV" "$TARGET_DIR/.env"
 run_remote "chmod 600 $TARGET_DIR/.env && echo '  ✓ .env mode 600'"
 
 # ── 5/7 Build ────────────────────────────────────────────────────────────
@@ -230,18 +267,19 @@ run_remote_docker "set -e
 cat <<EOF
 
 ────────────────────────────────────────────────────────────────────────
-✓ Bharat Terminal deployed to $host:$port (branch $BRANCH)
+✓ Bharat Terminal deployed to $GCP_INSTANCE (zone $GCP_ZONE, branch $BRANCH)
 
 The services bind to localhost on the remote. Tunnel ports back to your
 laptop with this one-liner (paste into a new terminal):
 
-  ssh -p $port \\
+  gcloud compute ssh $GCP_INSTANCE --zone=$GCP_ZONE \\
+      ${GCP_PROJECT:+--project=$GCP_PROJECT \\
+      }-- \\
       -L 3000:localhost:3000 \\
       -L 8000:localhost:8000 \\
       -L 8080:localhost:8080 \\
       -L 3001:localhost:3001 \\
-      -L 9090:localhost:9090 \\
-      $host
+      -L 9090:localhost:9090
 
 Then open in your browser:
   • Frontend       http://localhost:3000
@@ -251,9 +289,9 @@ Then open in your browser:
   • Prometheus     http://localhost:9090
 
 Useful follow-ups:
-  ssh $host 'cd $TARGET_DIR && docker compose logs -f sentiment-worker'
-  ssh $host 'cd $TARGET_DIR && docker compose ps'
-  ssh $host 'cd $TARGET_DIR && docker compose run --rm kb-seed'   # NIFTY 50 backfill
-  ssh $host 'cd $TARGET_DIR && docker compose --profile research run --rm research-runner seed'
+  gcloud compute ssh $GCP_INSTANCE --zone=$GCP_ZONE --command='cd $TARGET_DIR && docker compose logs -f sentiment-worker'
+  gcloud compute ssh $GCP_INSTANCE --zone=$GCP_ZONE --command='cd $TARGET_DIR && docker compose ps'
+  gcloud compute ssh $GCP_INSTANCE --zone=$GCP_ZONE --command='cd $TARGET_DIR && docker compose run --rm kb-seed'
+  gcloud compute ssh $GCP_INSTANCE --zone=$GCP_ZONE --command='cd $TARGET_DIR && docker compose --profile research run --rm research-runner seed'
 ────────────────────────────────────────────────────────────────────────
 EOF
