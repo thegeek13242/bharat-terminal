@@ -85,20 +85,31 @@ fi
 
 run_remote() { ssh "${ssh_opts[@]}" "$host" "$@"; }
 
-# Run a docker command on the remote, falling back to `sg docker -c` when
-# the user's group membership hasn't taken effect yet (e.g. on the very
-# first deploy, immediately after `usermod -aG docker` joined them in).
-# DOCKER_PREFIX is set after step 2; until then it's empty.
-DOCKER_PREFIX=""
+# Run a remote command that uses docker, dispatching through the right
+# privilege wrapper based on DOCKER_MODE (set in the probe below).
+DOCKER_MODE="direct"
 run_remote_docker() {
   local cmd="$1"
-  if [ -n "$DOCKER_PREFIX" ]; then
-    # sg docker -c expects a single string argument; escape inner quotes
-    local escaped="${cmd//\\/\\\\}"; escaped="${escaped//\"/\\\"}"
-    run_remote "sg docker -c \"$escaped\""
-  else
-    run_remote "$cmd"
-  fi
+  case "$DOCKER_MODE" in
+    direct)
+      run_remote "$cmd"
+      ;;
+    sg)
+      # sg docker -c needs a single quoted string; escape backslashes and
+      # double quotes so the inner script survives the trip.
+      local escaped="${cmd//\\/\\\\}"; escaped="${escaped//\"/\\\"}"
+      run_remote "sg docker -c \"$escaped\""
+      ;;
+    sudo)
+      # Run the script as root via sudo bash -c. Same escaping concerns.
+      local escaped="${cmd//\\/\\\\}"; escaped="${escaped//\"/\\\"}"
+      run_remote "sudo bash -c \"$escaped\""
+      ;;
+    *)
+      echo "✗ unknown DOCKER_MODE=$DOCKER_MODE" >&2
+      return 1
+      ;;
+  esac
 }
 
 # ── 1/7 SSH probe ────────────────────────────────────────────────────────
@@ -113,29 +124,52 @@ run_remote 'set -e
   if ! command -v docker >/dev/null; then
     echo "  installing docker…"
     curl -fsSL https://get.docker.com | sudo sh
-    sudo usermod -aG docker "$(whoami)"
-    echo "  ⚠  re-login may be required for docker group membership to take effect"
   fi
-  command -v git >/dev/null || sudo apt-get update -qq && sudo apt-get install -y -qq git
+  # Always (re-)apply group join — idempotent if already a member, and
+  # critical when docker was installed by a previous deploy run that
+  # never made it past this step.
+  sudo usermod -aG docker "$(whoami)" || true
+  # Ensure sg is available for the group-fallback path (passwd package
+  # provides it on Debian/Ubuntu; on minimal images it may be missing).
+  command -v sg  >/dev/null || sudo apt-get install -y -qq passwd >/dev/null 2>&1 || true
+  command -v git >/dev/null || sudo apt-get install -y -qq git
   echo "  docker:  $(docker --version 2>/dev/null || echo MISSING)"
   echo "  compose: $(docker compose version --short 2>/dev/null || echo MISSING)"
-  echo "  git:     $(git --version)"'
+  echo "  git:     $(git --version)"
+  echo "  sg:      $(command -v sg 2>/dev/null || echo MISSING)"'
 
-# Probe whether the docker group is already active in fresh SSH sessions.
-# If not, all docker calls will route through `sg docker -c` so the deploy
-# can proceed without the user logging out and back in.
+# Probe how to reach docker on the remote. Three-tier fallback:
+#   tier 1: direct        — user already in active docker group
+#   tier 2: sg docker -c  — user is a member but the SSH session hasn't
+#                           picked up the group yet (no re-login required)
+#   tier 3: sudo          — last resort; works on fresh cloud images with
+#                           passwordless sudo
+DOCKER_MODE="direct"
 if run_remote 'docker ps >/dev/null 2>&1'; then
-  echo "  ✓ docker group is active in SSH sessions"
+  DOCKER_MODE="direct"
+  echo "  ✓ docker accessible directly (group active)"
+elif run_remote 'command -v sg >/dev/null && sg docker -c "docker ps" >/dev/null 2>&1'; then
+  DOCKER_MODE="sg"
+  echo "  ⚠  docker group joined but not active; using 'sg docker -c' wrapper"
+elif run_remote 'sudo -n docker ps >/dev/null 2>&1'; then
+  DOCKER_MODE="sudo"
+  echo "  ⚠  using passwordless sudo for docker (group join needs re-login to fully activate)"
 else
-  if run_remote 'getent group docker | grep -qw "$(whoami)" && command -v sg >/dev/null'; then
-    echo "  ⚠  docker group joined but not yet active in this SSH session"
-    echo "     using 'sg docker -c' as a wrapper (no logout needed)"
-    DOCKER_PREFIX="sg "
-  else
-    echo "✗ Docker is not accessible to $(run_remote 'whoami') and group fallback unavailable"
-    echo "  Try logging in fresh (or running 'newgrp docker') and re-running this script."
-    exit 1
-  fi
+  echo "✗ Cannot reach docker on the remote via any of: direct / sg docker / sudo docker"
+  echo "  Diagnostics:"
+  run_remote '
+    echo "  - whoami:        $(whoami)"
+    echo "  - docker bin:    $(command -v docker || echo MISSING)"
+    echo "  - sg bin:        $(command -v sg     || echo MISSING)"
+    echo "  - in docker grp: $(id -nG | tr " " "\n" | grep -c "^docker$") (need 1)"
+    echo "  - sudo:          $(sudo -n true 2>&1 | head -1 || echo NOPASSWD-OK)"
+    echo "  - docker.sock:   $(ls -la /var/run/docker.sock 2>&1 || echo MISSING)"
+  '
+  echo
+  echo "  Try one of:"
+  echo "    1) Log out of all SSH sessions and reconnect, then re-run this script."
+  echo "    2) Run 'sudo systemctl start docker' on the remote, then re-run."
+  exit 1
 fi
 
 # ── 3/7 Repo ─────────────────────────────────────────────────────────────
