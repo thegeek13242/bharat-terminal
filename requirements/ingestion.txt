@@ -17,3 +17,7 @@ simhash==2.1.2
 smartapi-python==1.5.5
 pyotp==2.9.0
 websocket-client==1.8.0
+# logzero is an undeclared transitive of smartapi-python 1.5.5 — without
+# pinning it explicitly here, the runtime `from SmartApi import SmartConnect`
+# crashes with `ModuleNotFoundError: logzero`.
+logzero==1.7.0

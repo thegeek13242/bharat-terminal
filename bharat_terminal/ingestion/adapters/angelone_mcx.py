@@ -46,9 +46,15 @@ except ImportError:  # pragma: no cover
 try:
     from SmartApi import SmartConnect
     from SmartApi.smartWebSocketV2 import SmartWebSocketV2
-except ImportError:  # pragma: no cover
+    _SMARTAPI_IMPORT_ERROR: Optional[BaseException] = None
+except ImportError as _e:  # pragma: no cover
     SmartConnect = None  # type: ignore
     SmartWebSocketV2 = None  # type: ignore
+    # Capture the actual ImportError so start() can show why — usually it's
+    # a missing transitive dep (logzero, requests) rather than the SDK
+    # itself. The previous code swallowed this and reported a misleading
+    # "smartapi-python is not installed".
+    _SMARTAPI_IMPORT_ERROR = _e
 
 from bharat_terminal.types import CommodityTick
 
@@ -135,8 +141,16 @@ class AngelOneMCXAdapter:
 
     async def start(self) -> None:
         if SmartConnect is None or SmartWebSocketV2 is None:
+            cause = (
+                f" (caused by: {type(_SMARTAPI_IMPORT_ERROR).__name__}: "
+                f"{_SMARTAPI_IMPORT_ERROR})"
+                if _SMARTAPI_IMPORT_ERROR is not None
+                else ""
+            )
             raise RuntimeError(
-                "smartapi-python is not installed — add it to requirements/ingestion.txt"
+                "SmartApi import failed — typically a missing transitive "
+                "dep (logzero / requests). Check requirements/ingestion.txt."
+                + cause
             )
         if pyotp is None:
             raise RuntimeError("pyotp is not installed — required for SmartAPI TOTP login")
