@@ -29,11 +29,11 @@ REMOTE_PROJECT="$(basename "$REMOTE_DIR")"
 LOGICAL=(postgres_data redpanda_data prometheus_data grafana_data)
 
 run_remote() {
-  gcloud compute ssh "$GCP_INSTANCE" --zone="$GCP_ZONE" "${gcloud_project_args[@]}" --command="$1"
+  gcloud compute ssh "$GCP_INSTANCE" --zone="$GCP_ZONE" ${gcloud_project_args[@]+"${gcloud_project_args[@]}"} --command="$1"
 }
 
 run_remote_scp_to() {
-  gcloud compute scp --zone="$GCP_ZONE" "${gcloud_project_args[@]}" "$1" "$GCP_INSTANCE:$2"
+  gcloud compute scp --zone="$GCP_ZONE" ${gcloud_project_args[@]+"${gcloud_project_args[@]}"} "$1" "$GCP_INSTANCE:$2"
 }
 
 echo "==> Volume migration"

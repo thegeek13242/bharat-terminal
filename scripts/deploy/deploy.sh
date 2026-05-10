@@ -107,7 +107,7 @@ fi
 run_remote() {
   gcloud compute ssh "$GCP_INSTANCE" \
     --zone="$GCP_ZONE" \
-    "${gcloud_project_args[@]}" \
+    ${gcloud_project_args[@]+"${gcloud_project_args[@]}"} \
     --command="$1"
 }
 
@@ -115,7 +115,7 @@ run_remote_scp_to() {
   # $1 = local path, $2 = remote path (relative to $HOME)
   gcloud compute scp \
     --zone="$GCP_ZONE" \
-    "${gcloud_project_args[@]}" \
+    ${gcloud_project_args[@]+"${gcloud_project_args[@]}"} \
     "$1" "$GCP_INSTANCE:$2"
 }
 
