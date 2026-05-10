@@ -259,8 +259,34 @@ run_remote_docker "set -e
     echo '  skipping kb-seed -- set RUN_SEED=1 to populate NIFTY 50'
   fi"
 
-# ── 7/7 App services ─────────────────────────────────────────────────────
-echo "==> [7/7] Start application services"
+# ── 7a/8 Install systemd auto-start unit ─────────────────────────────────
+# Without this, a VM stop→start cycle leaves the stack down (Docker daemon
+# starts, but `restart: unless-stopped` only restarts containers that were
+# running before the daemon shutdown — not ones explicitly `compose down`d
+# or new services added since last boot). The unit is idempotent: drops the
+# template, substitutes WorkingDirectory + User, enables, kicks the start.
+echo "==> [7a/8] Install systemd auto-start unit"
+SYSTEMD_UNIT_LOCAL="$(dirname "$0")/bharat-terminal.service"
+if [ ! -f "$SYSTEMD_UNIT_LOCAL" ]; then
+  echo "  ✗ unit template missing at $SYSTEMD_UNIT_LOCAL"
+  exit 1
+fi
+gcloud compute scp --zone="$GCP_ZONE" ${gcloud_project_args[@]+"${gcloud_project_args[@]}"} \
+  "$SYSTEMD_UNIT_LOCAL" "$GCP_INSTANCE:/tmp/bharat-terminal.service.tmpl"
+run_remote "set -e
+  REMOTE_USER=\$(whoami)
+  REMOTE_DIR=\$HOME/$TARGET_DIR
+  sed -e \"s|{{TARGET_DIR}}|\$REMOTE_DIR|g\" \
+      -e \"s|{{USER}}|\$REMOTE_USER|g\" \
+      /tmp/bharat-terminal.service.tmpl | sudo tee /etc/systemd/system/bharat-terminal.service >/dev/null
+  rm /tmp/bharat-terminal.service.tmpl
+  sudo systemctl daemon-reload
+  sudo systemctl enable bharat-terminal.service
+  echo '  ✓ systemd unit installed and enabled'
+  sudo systemctl is-enabled bharat-terminal.service"
+
+# ── 7b/8 Start application services ──────────────────────────────────────
+echo "==> [7b/8] Start application services"
 # kb-monitor runs the event-driven KB updater: polls NSE board-meetings
 # calendar at 09:00 IST, syncs companies whose results posted at 20:00 +
 # 23:00 IST, refreshes bhavcopy at 16:30 weekdays, weekly Nifty500 sweep
