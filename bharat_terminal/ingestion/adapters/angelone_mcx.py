@@ -360,10 +360,15 @@ class AngelOneMCXAdapter:
     # ── SmartAPI WS callbacks (run in WS thread!) ────────────────────────
 
     def _on_open(self, wsapp) -> None:  # noqa: ARG002
+        # `wsapp` is the underlying websocket-client WebSocketApp passed by
+        # SmartAPI's callback shim; it does NOT have .subscribe / .close_
+        # connection — those live on the SmartWebSocketV2 wrapper that we
+        # constructed and hold as self._ws.
         if not self._token_metadata:
             logger.warning(f"[{self.source_name}] on_open with no tokens — closing")
             try:
-                wsapp.close_connection()
+                if self._ws is not None:
+                    self._ws.close_connection()
             except Exception:
                 pass
             return
@@ -374,7 +379,8 @@ class AngelOneMCXAdapter:
             }
         ]
         try:
-            wsapp.subscribe(
+            assert self._ws is not None, "ws not constructed before on_open"
+            self._ws.subscribe(
                 "bharat-mcx-1", SUBSCRIPTION_MODE_QUOTE, token_list
             )
             logger.info(
@@ -384,7 +390,7 @@ class AngelOneMCXAdapter:
             if self._loop:
                 self._loop.call_soon_threadsafe(self._connected.set)
         except Exception as e:
-            logger.error(f"[{self.source_name}] subscribe failed: {e}")
+            logger.error(f"[{self.source_name}] subscribe failed: {e}", exc_info=True)
 
     def _on_data(self, wsapp, message) -> None:  # noqa: ARG002
         """
