@@ -238,18 +238,26 @@ fi
 
 # ── 6/7 Infra + migrations ───────────────────────────────────────────────
 echo "==> [6/7] Bring up infra and run migrations"
+# Substitute RUN_SEED locally and evaluate the conditional remote-side.
+# Avoid parens in echoed messages — the wrap → unwrap trip strips quoting
+# and the remote shell would parse '(' as a subshell start.
 run_remote_docker "set -e
   cd $TARGET_DIR
   docker compose up -d postgres redis redpanda
-  echo '  waiting for redpanda to be healthy…'
+  echo '  waiting for redpanda to be healthy...'
   for i in \$(seq 1 30); do
-    if docker compose ps redpanda --format json 2>/dev/null | grep -q '\"Health\":\"healthy\"'; then break; fi
+    if docker compose ps redpanda --format json 2>/dev/null | grep -q 'healthy'; then break; fi
     sleep 2
   done
   docker compose up -d redpanda-init
-  echo '  running migrations…'
+  echo '  running migrations...'
   docker compose run --rm kb-migrate
-  $( [ "$RUN_SEED" = "1" ] && echo 'echo \"  seeding NIFTY 50 (this takes ~10 min)…\"; docker compose run --rm kb-seed' || echo 'echo \"  (skipping kb-seed — pass RUN_SEED=1 to populate NIFTY 50)\"' )"
+  if [ '$RUN_SEED' = '1' ]; then
+    echo '  seeding NIFTY 50 universe -- this takes about 10 minutes...'
+    docker compose run --rm kb-seed
+  else
+    echo '  skipping kb-seed -- set RUN_SEED=1 to populate NIFTY 50'
+  fi"
 
 # ── 7/7 App services ─────────────────────────────────────────────────────
 echo "==> [7/7] Start application services"
