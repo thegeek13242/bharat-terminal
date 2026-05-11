@@ -41,9 +41,9 @@ RELEVANCE_MODEL = os.getenv(
 )
 # Score the top-predicted label must exceed for "relevant" to be true.
 # Higher = stricter. The classifier returns softmax probabilities over the
-# candidate labels, so 0.50 means "must be the plurality winner with >50%
-# confidence" — comfortable default given our highly-distinct label set.
-RELEVANCE_LOCAL_THRESHOLD = float(os.getenv("RELEVANCE_LOCAL_THRESHOLD", "0.50"))
+# candidate labels (4 of them), so 0.40 means "wins as plurality and has
+# noticeable margin over each individual noise bucket".
+RELEVANCE_LOCAL_THRESHOLD = float(os.getenv("RELEVANCE_LOCAL_THRESHOLD", "0.35"))
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 CACHE_TTL_SEC = int(os.getenv("RELEVANCE_CACHE_TTL_SEC", str(7 * 24 * 3600)))
@@ -56,17 +56,30 @@ ANTHROPIC_TIMEOUT_SEC = float(os.getenv("RELEVANCE_TIMEOUT_SEC", "8"))
 
 # ── Candidate labels for the zero-shot classifier ────────────────────────
 # Order matters: the FIRST label is the "relevant" one. Everything else
-# is a noise bucket. The classifier picks whichever has highest entailment
-# probability; we mark relevant=True iff the first label wins and clears
-# the threshold.
-RELEVANT_LABEL = "news about Indian stock markets, NSE BSE listed companies, RBI policy, or commodities"
+# is a noise bucket. Softmax over the label set normalises across them, so
+# fewer, more semantically-distinct labels work better than many overlapping
+# ones (which dilute the winner's probability).
+#
+# Earlier 6-label setup misfired on "RBI MPC keeps repo rate unchanged,
+# inflation forecast cut" — the "generic explainer 5 ways what happens if"
+# label leaked because of the "cut" phrasing. Consolidating noise into 3
+# semantically-clean buckets fixes it.
+RELEVANT_LABEL = (
+    "market-moving news event affecting Indian stock market or NSE BSE "
+    "listed companies, including earnings results, mergers and acquisitions, "
+    "IPOs and listings, RBI repo rate or monetary policy decision, Fed rate "
+    "decision, SEBI regulation, oil and commodity price moves, FII DII flows, "
+    "rupee dollar exchange rate, GDP inflation data, sector-wide developments"
+)
 
 NOISE_LABELS = [
-    "personal finance how-to guide about PPF EPF tax savings or retirement planning",
-    "lifestyle entertainment sports horoscope celebrity food or travel article",
-    "article using ChatGPT Gemini or AI assistant to give advice",
-    "generic explainer listicle 5 ways or what happens if guide",
-    "opinion column or human interest story unrelated to listed companies",
+    "personal finance how-to guide for individuals about saving money, "
+    "tax planning, PPF, EPF, SIP, retirement corpus, or education fund",
+
+    "lifestyle entertainment sports celebrity horoscope astrology zodiac "
+    "food travel or fashion article",
+
+    "article where someone asks ChatGPT, Gemini, or an AI assistant for advice",
 ]
 
 CANDIDATE_LABELS = [RELEVANT_LABEL] + NOISE_LABELS
