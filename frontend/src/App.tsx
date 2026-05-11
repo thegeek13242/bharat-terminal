@@ -6,7 +6,7 @@ import { TradeIdeas } from '@/components/TradeIdeas';
 import { Watchlist } from '@/components/Watchlist';
 import { SentimentPanel } from '@/components/SentimentPanel';
 import { CompaniesBrowser } from '@/components/CompaniesBrowser';
-import { ImpactGraph3D } from '@/components/ImpactGraph3D';
+import { ImpactGraph } from '@/components/ImpactGraph';
 import { DatabaseExplorer } from '@/components/DatabaseExplorer';
 import { ImpactReport } from '@/types';
 
@@ -14,7 +14,7 @@ type Tab =
   | 'feed'
   | 'sentiment'
   | 'companies'
-  | 'graph3d'
+  | 'graph'
   | 'trade'
   | 'watchlist'
   | 'database';
@@ -40,7 +40,7 @@ export default function App() {
     ['feed', 'Live Feed'],
     ['sentiment', 'Sentiment'],
     ['companies', 'Companies'],
-    ['graph3d', 'Impact Graph 3D'],
+    ['graph', 'Impact Graph'],
     ['trade', `Signals${signalCount > 0 ? ` (${signalCount})` : ''}`],
     ['watchlist', 'Watchlist'],
     ['database', 'Database'],
@@ -126,10 +126,10 @@ export default function App() {
           </div>
         )}
 
-        {/* 3D Impact Graph (NEW) */}
-        {activeTab === 'graph3d' && (
+        {/* Impact Graph (NEW: 2D radial) */}
+        {activeTab === 'graph' && (
           <div className="h-full">
-            <ImpactGraph3D />
+            <ImpactGraph />
           </div>
         )}
 
