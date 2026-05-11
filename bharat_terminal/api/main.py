@@ -20,6 +20,9 @@ from bharat_terminal.api.routes import (
     news,
     impact,
     company,
+    companies,
+    db_explorer,
+    dossier,
     graph,
     watchlist,
     websocket,
@@ -68,6 +71,9 @@ app.add_middleware(
 app.include_router(news.router)
 app.include_router(impact.router)
 app.include_router(company.router)
+app.include_router(companies.router)
+app.include_router(dossier.router)
+app.include_router(db_explorer.router)
 app.include_router(graph.router)
 app.include_router(watchlist.router)
 app.include_router(sentiment.router)

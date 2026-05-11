@@ -138,3 +138,204 @@ export interface GraphEdge {
   weight: number;
   hop: number;
 }
+
+// ── Companies browser ──────────────────────────────────────────────────
+
+export interface CompanySummary {
+  symbol: string;
+  company_name: string;
+  sector?: string | null;
+  mcap_cr?: number | null;
+  is_active: boolean;
+  latest_quarter?: string | null;
+  quarters_loaded: number;
+  dossier_at?: string | null;
+  dossier_quality?: number | null;
+}
+
+export interface CompanyDetail {
+  symbol: string;
+  company_name: string;
+  isin?: string;
+  sector?: string | null;
+  industry?: string | null;
+  mcap_cr?: number | null;
+  market_cap_tier?: string | null;
+  exchange?: string | null;
+  is_active: boolean;
+  revenue_ttm_cr?: number | null;
+  pat_ttm_cr?: number | null;
+  ebitda_margin_pct?: number | null;
+  pe_ratio?: number | null;
+  pb_ratio?: number | null;
+  roe_pct?: number | null;
+  roce_pct?: number | null;
+  dividend_yield_pct?: number | null;
+  book_value?: number | null;
+  eps_ttm?: number | null;
+  face_value?: number | null;
+  last_price?: number | null;
+  fifty_two_week_high?: number | null;
+  fifty_two_week_low?: number | null;
+  dcf_fair_value?: number | null;
+  dcf_margin_of_safety_pct?: number | null;
+  created_at?: string;
+  updated_at?: string;
+  latest_quarter?: string | null;
+  quarters_loaded?: number;
+  latest_price_date?: string | null;
+  has_dossier: boolean;
+}
+
+export interface FinancialResult {
+  id: number;
+  symbol: string;
+  period_end: string;
+  period_type: string;
+  consolidated: boolean;
+  revenue_cr?: number | null;
+  other_income_cr?: number | null;
+  cost_of_materials_cr?: number | null;
+  employee_expense_cr?: number | null;
+  finance_costs_cr?: number | null;
+  depreciation_cr?: number | null;
+  other_expenses_cr?: number | null;
+  total_expenses_cr?: number | null;
+  pbt_cr?: number | null;
+  tax_cr?: number | null;
+  pat_cr?: number | null;
+  pat_attributable_cr?: number | null;
+  eps_basic?: number | null;
+  eps_diluted?: number | null;
+  ebitda_cr?: number | null;
+  ebitda_margin_pct?: number | null;
+  segment_data?: unknown;
+  source: string;
+}
+
+export interface PricePoint {
+  date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number | null;
+}
+
+export interface DossierSensitivity {
+  trigger_id: string;
+  beta: number;
+  channel: string;
+  lag_days: number;
+  confidence: 'high' | 'med' | 'low';
+  rationale?: string | null;
+  evidence_url?: string | null;
+}
+
+export interface DossierLinkage {
+  target_symbol: string;
+  kind: 'competitor' | 'customer' | 'supplier' | 'subsidiary' | 'jv' | 'sector_peer';
+  strength: number;
+  direction: 'positive' | 'negative' | 'mixed';
+  propagation_lag_days: number;
+  rationale?: string | null;
+  evidence_url?: string | null;
+}
+
+export interface DossierFull {
+  symbol: string;
+  company_name?: string | null;
+  version: string;
+  source_quarter?: string | null;
+  refresh_kind: string;
+  data_quality?: number | null;
+  model_used?: string | null;
+  tokens_used?: number | null;
+  generated_at: string;
+  business?: unknown;
+  financials?: unknown;
+  risks?: unknown;
+  catalysts?: unknown;
+  mgmt_commentary?: unknown;
+  citations?: unknown;
+  sensitivities: DossierSensitivity[];
+  linkages: DossierLinkage[];
+}
+
+export interface DossierListItem {
+  symbol: string;
+  company_name?: string | null;
+  version: string;
+  source_quarter?: string | null;
+  refresh_kind: string;
+  data_quality?: number | null;
+  model_used?: string | null;
+  tokens_used?: number | null;
+  generated_at: string;
+  sens_count: number;
+  link_count: number;
+}
+
+// ── 3D Impact Graph ────────────────────────────────────────────────────
+
+export interface ImpactGraph3DNode {
+  id: string;
+  type: 'trigger' | 'company';
+  label: string;
+  company_name?: string | null;
+  hop: 0 | 1 | 2;
+  beta?: number;
+  channel?: string;
+  lag_days?: number;
+  confidence?: string;
+}
+
+export interface ImpactGraph3DLink {
+  source: string;
+  target: string;
+  kind: string;
+  channel?: string;
+  beta?: number;
+  strength?: number;
+  direction?: string;
+  lag_days?: number;
+  value: number;
+}
+
+export interface ImpactGraph3DPayload {
+  trigger: string;
+  nodes: ImpactGraph3DNode[];
+  links: ImpactGraph3DLink[];
+  stats: {
+    n_first_degree: number;
+    n_second_degree: number;
+    n_links: number;
+  };
+}
+
+export interface TriggerInfo {
+  id: string;
+  label: string;
+  kind: string;
+  unit?: string | null;
+  data_source?: string | null;
+  coverage_count: number;
+  max_abs_beta?: number | null;
+}
+
+// ── DB Explorer ────────────────────────────────────────────────────────
+
+export interface DbTableInfo {
+  table: string;
+  rows: number | null;
+  columns: string[];
+}
+
+export interface DbTableRows {
+  table: string;
+  total: number;
+  limit: number;
+  offset: number;
+  columns: string[];
+  rows: Record<string, unknown>[];
+}
