@@ -18,6 +18,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from bharat_terminal.kb.models import (
     Company,
+    CompanyDossier,
+    DossierLinkage,
+    DossierSensitivity,
     EventDegree,
     EventSectorEdge,
     EventTransmission,
@@ -315,3 +318,202 @@ async def get_best_trigger_beta(symbol: str, trigger_id: str) -> Optional[Dict[s
         "model_used": r.model_used,
         "calibrated_at": r.calibrated_at,
     }
+
+
+# ── Dossier-agent helpers ────────────────────────────────────────────────
+
+
+async def get_company_name(symbol: str) -> Optional[str]:
+    """Return the human-readable company name for context in the prompt."""
+    async with session_scope() as s:
+        row = (
+            await s.execute(select(Company.company_name).where(Company.symbol == symbol))
+        ).scalar_one_or_none()
+    return row
+
+
+async def list_triggers() -> List[Dict[str, Any]]:
+    """Return all trigger rows for the dossier agent to enumerate against."""
+    async with session_scope() as s:
+        rows = (await s.execute(select(Trigger))).scalars().all()
+    return [
+        {
+            "id": r.id,
+            "label": r.label,
+            "kind": r.kind,
+            "unit": r.unit,
+            "data_source": r.data_source,
+        }
+        for r in rows
+    ]
+
+
+async def upsert_company_dossier(
+    *,
+    symbol: str,
+    source_quarter: Optional[str],
+    refresh_kind: str,
+    model_used: str,
+    tokens_used: int,
+    data_quality: Optional[float],
+    business: Optional[dict],
+    financials: Optional[dict],
+    sensitivities: Optional[list],
+    linkages: Optional[list],
+    risks: Optional[list],
+    catalysts: Optional[list],
+    mgmt_commentary: Optional[dict],
+    citations: Optional[list],
+) -> None:
+    """
+    Insert-or-update the rich JSONB dossier row. The two flat tables
+    (`dossier_sensitivities`, `dossier_linkages`) are populated separately
+    by `replace_dossier_*` below, so this only owns `company_dossiers`.
+    """
+    # Coerce source_quarter ISO string → date
+    sq = None
+    if source_quarter:
+        try:
+            sq = datetime.fromisoformat(source_quarter).date()
+        except (ValueError, TypeError):
+            sq = None
+
+    async with session_scope() as s:
+        stmt = pg_insert(CompanyDossier.__table__).values(
+            symbol=symbol,
+            version="1.0.0",
+            source_quarter=sq,
+            refresh_kind=refresh_kind,
+            model_used=model_used,
+            tokens_used=tokens_used,
+            data_quality=data_quality,
+            business=business,
+            financials=financials,
+            sensitivities=sensitivities,   # full JSONB blob for traceability
+            linkages=linkages,
+            risks=risks,
+            catalysts=catalysts,
+            mgmt_commentary=mgmt_commentary,
+            citations=citations,
+            generated_at=datetime.now(timezone.utc),
+        ).on_conflict_do_update(
+            index_elements=["symbol"],
+            set_={
+                "version": "1.0.0",
+                "source_quarter": sq,
+                "refresh_kind": refresh_kind,
+                "model_used": model_used,
+                "tokens_used": tokens_used,
+                "data_quality": data_quality,
+                "business": business,
+                "financials": financials,
+                "sensitivities": sensitivities,
+                "linkages": linkages,
+                "risks": risks,
+                "catalysts": catalysts,
+                "mgmt_commentary": mgmt_commentary,
+                "citations": citations,
+                "generated_at": datetime.now(timezone.utc),
+            },
+        )
+        await s.execute(stmt)
+
+
+async def replace_dossier_sensitivities(symbol: str, rows: List[Dict[str, Any]]) -> None:
+    """
+    Replace all sensitivity rows for a symbol atomically (delete + bulk insert).
+    Skips rows whose trigger_id is unknown so a stale trigger reference doesn't
+    abort the whole save.
+    """
+    if not rows:
+        return
+    async with session_scope() as s:
+        # Find which trigger_ids are valid
+        valid_triggers = set(
+            (await s.execute(select(Trigger.id))).scalars().all()
+        )
+        rows_valid = []
+        for r in rows:
+            if r["trigger_id"] not in valid_triggers:
+                logger.warning(
+                    f"[DOSSIER] {symbol}: skipping sensitivity for unknown "
+                    f"trigger_id={r['trigger_id']!r} (not in triggers table)"
+                )
+                continue
+            rows_valid.append(r)
+
+        await s.execute(
+            DossierSensitivity.__table__.delete().where(
+                DossierSensitivity.symbol == symbol
+            )
+        )
+        if rows_valid:
+            await s.execute(
+                DossierSensitivity.__table__.insert(),
+                [
+                    {
+                        "symbol": symbol,
+                        "trigger_id": r["trigger_id"],
+                        "beta": r["beta"],
+                        "channel": r["channel"],
+                        "lag_days": r["lag_days"],
+                        "confidence": r["confidence"],
+                        "rationale": r.get("rationale"),
+                        "evidence_url": r.get("evidence_url"),
+                    }
+                    for r in rows_valid
+                ],
+            )
+
+
+async def replace_dossier_linkages(symbol: str, rows: List[Dict[str, Any]]) -> None:
+    """
+    Replace all linkage rows for a symbol atomically. Skips rows whose
+    target_symbol doesn't exist in companies — but only with a warning;
+    we DO keep them by default since the target may be tracked outside our
+    universe (or about to be added).
+    """
+    if not rows:
+        return
+    async with session_scope() as s:
+        # Probe which target_symbols are known; we keep all but tag unknowns.
+        known = set(
+            (
+                await s.execute(
+                    select(Company.symbol).where(
+                        Company.symbol.in_({r["target_symbol"] for r in rows})
+                    )
+                )
+            ).scalars().all()
+        )
+        for r in rows:
+            if r["target_symbol"] not in known:
+                logger.info(
+                    f"[DOSSIER] {symbol}: linkage target {r['target_symbol']!r} "
+                    f"not in companies table — keeping anyway"
+                )
+
+        await s.execute(
+            DossierLinkage.__table__.delete().where(
+                DossierLinkage.source_symbol == symbol
+            )
+        )
+        # Insert only rows where the target IS known (FK constraint requires it)
+        rows_with_fk = [r for r in rows if r["target_symbol"] in known]
+        if rows_with_fk:
+            await s.execute(
+                DossierLinkage.__table__.insert(),
+                [
+                    {
+                        "source_symbol": symbol,
+                        "target_symbol": r["target_symbol"],
+                        "kind": r["kind"],
+                        "strength": r["strength"],
+                        "direction": r["direction"],
+                        "propagation_lag_days": r["propagation_lag_days"],
+                        "rationale": r.get("rationale"),
+                        "evidence_url": r.get("evidence_url"),
+                    }
+                    for r in rows_with_fk
+                ],
+            )

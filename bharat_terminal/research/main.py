@@ -33,7 +33,7 @@ from typing import List, Tuple
 
 import anthropic
 
-from bharat_terminal.research import db, agent
+from bharat_terminal.research import db, agent, dossier_agent
 from bharat_terminal.research.events_seed import (
     EVENT_DEGREES,
     EVENT_SECTOR_EDGES,
@@ -199,6 +199,98 @@ async def _run(
     logger.info(f"Research complete: {successes} ok, {failures} failed of {len(pairs)} pairs")
 
 
+# ── Dossier orchestrator ────────────────────────────────────────────────
+
+
+async def _dossier_targets(
+    symbols: List[str],
+    *,
+    force: bool,
+    freshness_days: int,
+) -> List[str]:
+    """Filter symbols by freshness — skip ones with a recent dossier unless --force."""
+    if force:
+        return symbols
+
+    from bharat_terminal.kb.models import CompanyDossier
+    from sqlalchemy import select
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=freshness_days)
+    async with db.session_scope() as s:
+        fresh = set(
+            (
+                await s.execute(
+                    select(CompanyDossier.symbol).where(
+                        CompanyDossier.symbol.in_(symbols),
+                        CompanyDossier.generated_at >= cutoff,
+                    )
+                )
+            ).scalars().all()
+        )
+
+    to_run = [sym for sym in symbols if sym not in fresh]
+    if fresh:
+        logger.info(
+            f"Skipping {len(fresh)} symbols with fresh dossier (<{freshness_days}d): "
+            f"{sorted(fresh)[:8]}{'…' if len(fresh) > 8 else ''}"
+        )
+    return to_run
+
+
+async def _run_dossiers(
+    symbols: List[str],
+    *,
+    refresh_kind: str = "initial",
+    concurrency: int = 2,
+    force: bool = False,
+    freshness_days: int = 90,
+) -> None:
+    targets = await _dossier_targets(symbols, force=force, freshness_days=freshness_days)
+    if not targets:
+        logger.info("No dossiers to generate — all targets are fresh.")
+        return
+
+    logger.info(
+        f"Generating {len(targets)} dossiers "
+        f"(refresh_kind={refresh_kind}, concurrency={concurrency})"
+    )
+
+    client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
+    sem = asyncio.Semaphore(concurrency)
+    successes = 0
+    failures = 0
+
+    async def one(symbol: str) -> None:
+        nonlocal successes, failures
+        async with sem:
+            logger.info(f"[DOSSIER] starting {symbol}")
+            try:
+                result = await dossier_agent.research_company(
+                    symbol,
+                    refresh_kind=refresh_kind,
+                    client=client,
+                )
+                if result:
+                    successes += 1
+                    logger.info(
+                        f"[DOSSIER] {symbol}: ok "
+                        f"(quality={result.get('data_quality')}, "
+                        f"sens={len(result.get('sensitivities') or [])}, "
+                        f"links={len(result.get('linkages') or [])})"
+                    )
+                else:
+                    failures += 1
+            except Exception as e:
+                failures += 1
+                logger.error(f"[DOSSIER] {symbol}: {e}", exc_info=True)
+
+    await asyncio.gather(*(one(sym) for sym in targets))
+    logger.info(
+        f"Dossier generation complete: {successes} ok, {failures} failed "
+        f"of {len(targets)} targets"
+    )
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────
 
 def _parse_csv(s: str | None, default: List[str]) -> List[str]:
@@ -222,6 +314,32 @@ async def _amain(argv: List[str]) -> int:
     p_run.add_argument("--freshness-days", type=int, default=90,
                        help="Skip pairs newer than this many days (unless --force).")
 
+    # ── New: full dossier generation ──────────────────────────────────
+    p_dos = sub.add_parser(
+        "dossier",
+        help="Generate full CFA-level dossier per company (heavy: ~$0.30-0.50 each)",
+    )
+    p_dos.add_argument(
+        "--symbols",
+        help="Comma-separated symbols, e.g. RELIANCE,TCS. Required unless --tier given.",
+    )
+    p_dos.add_argument(
+        "--tier", choices=["nifty50", "all"],
+        help="Run for an entire tier instead of explicit symbols.",
+    )
+    p_dos.add_argument(
+        "--refresh-kind", choices=["initial", "incremental_quarter", "full_annual"],
+        default="initial",
+        help="initial = full new dossier. incremental_quarter = update post-results. "
+             "full_annual = re-research after annual report.",
+    )
+    p_dos.add_argument("--concurrency", type=int, default=2,
+                       help="Parallel dossier generations (each is ~$0.30-0.50)")
+    p_dos.add_argument("--force", action="store_true",
+                       help="Re-research even if a fresh dossier exists.")
+    p_dos.add_argument("--freshness-days", type=int, default=90,
+                       help="Skip symbols whose dossier is newer than this (unless --force).")
+
     args = ap.parse_args(argv)
 
     if args.cmd == "seed":
@@ -233,6 +351,24 @@ async def _amain(argv: List[str]) -> int:
         triggers = _parse_csv(args.triggers, list(DEFAULT_TRIGGERS_TO_RESEARCH))
         await _run(
             symbols, triggers,
+            concurrency=args.concurrency,
+            force=args.force,
+            freshness_days=args.freshness_days,
+        )
+        return 0
+
+    if args.cmd == "dossier":
+        if not args.symbols and not args.tier:
+            ap.error("dossier: pass either --symbols or --tier")
+        if args.tier == "nifty50":
+            symbols = list(NIFTY50)
+        elif args.tier == "all":
+            symbols = list(RESEARCH_UNIVERSE)
+        else:
+            symbols = _parse_csv(args.symbols, [])
+        await _run_dossiers(
+            symbols,
+            refresh_kind=args.refresh_kind,
             concurrency=args.concurrency,
             force=args.force,
             freshness_days=args.freshness_days,
