@@ -160,7 +160,9 @@ async def get_impact_graph(
 
         first_symbols = list(first_by_symbol.keys())
 
-        # 2nd-degree: linkages outbound from any 1st-degree node, top N per source
+        # 2nd-degree: linkages outbound from any 1st-degree node, top N per source.
+        # asyncpg + SQLAlchemy `text()` doesn't auto-expand tuple params for IN/NOT IN,
+        # so we use `= ANY(:list)` / `NOT = ANY(:list)` which DOES work with native lists.
         second_raw = []
         if max_hops >= 2 and first_symbols:
             second_raw = (await s.execute(text("""
@@ -169,12 +171,9 @@ async def get_impact_graph(
                        l.strength, l.direction, l.propagation_lag_days
                 FROM dossier_linkages l
                 WHERE l.source_symbol = ANY(:symbols)
-                  AND l.target_symbol NOT IN :first_symbols
+                  AND NOT (l.target_symbol = ANY(:symbols))
                 ORDER BY l.source_symbol, l.target_symbol, l.kind, l.strength DESC
-            """), {
-                "symbols": first_symbols,
-                "first_symbols": tuple(first_symbols),
-            })).mappings().all()
+            """), {"symbols": first_symbols})).mappings().all()
             second_raw = [dict(r) for r in second_raw]
 
         # Cap per source to avoid hairballs
