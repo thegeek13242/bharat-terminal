@@ -8,3 +8,9 @@ httpx>=0.27,<1
 numpy>=1.26,<2
 # Used by Stage 1 relevance for headline-result caching (sync client).
 redis==5.0.8
+# Local zero-shot classifier for Stage 1 relevance (default backend).
+# sentence-transformers already pulls transformers as a dep; pinning here
+# defensively so it doesn't drift.
+transformers>=4.40,<5
+# DeBERTa-v3 tokenizer needs sentencepiece.
+sentencepiece>=0.2.0
