@@ -165,6 +165,10 @@ class FnoPersister:
         """Bulk insert via UNNEST — faster than executemany for 100+ rows."""
         if not self._pool:
             return
+        # The unique natural index `uq_dt_natural` uses COALESCE(strike, -1)
+        # to make NULL-strike (futures) rows comparable. We must spell the
+        # ON CONFLICT target identically — Postgres matches the index
+        # signature, not column names alone.
         sql = """
             INSERT INTO derivative_ticks (
                 timestamp_utc, symbol, instrument_type, expiry, strike, token,
@@ -176,7 +180,7 @@ class FnoPersister:
                 $7, $8, $9, $10, $11,
                 $12, $13, $14
             )
-            ON CONFLICT (timestamp_utc, symbol, instrument_type, expiry, strike) DO NOTHING
+            ON CONFLICT (timestamp_utc, symbol, instrument_type, expiry, COALESCE(strike, -1)) DO NOTHING
         """
         rows = []
         for tick, expiry_d, reason in batch:
