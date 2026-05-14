@@ -295,7 +295,7 @@ run_remote_docker "set -e
   cd $TARGET_DIR
   docker compose up -d \\
     kb-service kb-monitor \\
-    ingestion-worker analysis-worker sentiment-worker commodity-engine \\
+    ingestion-worker analysis-worker sentiment-worker commodity-engine fno-engine \\
     api-gateway frontend \\
     prometheus grafana
   sleep 10

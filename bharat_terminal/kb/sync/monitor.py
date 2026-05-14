@@ -286,6 +286,26 @@ class Monitor:
             except Exception as e:
                 logger.error(f"[weekly_sweep] Failed: {e}")
 
+    # ── Daily participant-OI sync ─────────────────────────────────────────
+
+    async def daily_participant_oi(self):
+        """Download the previous day's NSE FII/DII/Pro/Client F&O CSV at 19:00 IST."""
+        from bharat_terminal.kb.sync.participant_oi_sync import sync_participant_oi
+        while not self._shutdown.is_set():
+            target = self._next_occurrence(hour=19, minute=0)
+            # Skip Sat/Sun — NSE doesn't publish on non-trading days
+            while target.weekday() >= 5:
+                target += timedelta(days=1)
+
+            logger.info(f"[participant_oi] Next run at {target.isoformat()}")
+            if not await self._sleep_until(target):
+                break
+            try:
+                result = await sync_participant_oi()
+                logger.info(f"[participant_oi] Complete: {result}")
+            except Exception as e:
+                logger.error(f"[participant_oi] Failed: {e}")
+
     # ── Main ───────────────────────────────────────────────────────────────
 
     async def run(self):
@@ -296,7 +316,7 @@ class Monitor:
 
         logger.info(
             "KB Monitor started — event-driven financial sync, "
-            "daily prices, weekly safety-net sweep"
+            "daily prices, participant OI, weekly safety-net sweep"
         )
 
         # Run initial calendar refresh on startup
@@ -306,10 +326,18 @@ class Monitor:
         except Exception as e:
             logger.error(f"Initial sync failed: {e}")
 
+        # Try to pull yesterday's participant OI on boot — idempotent
+        try:
+            from bharat_terminal.kb.sync.participant_oi_sync import sync_participant_oi
+            await sync_participant_oi()
+        except Exception as e:
+            logger.warning(f"Initial participant_oi sync failed: {e}")
+
         tasks = [
-            asyncio.create_task(self.event_driven_sync(), name="event_sync"),
-            asyncio.create_task(self.daily_price_sync(), name="price_sync"),
-            asyncio.create_task(self.weekly_sweep(), name="weekly_sweep"),
+            asyncio.create_task(self.event_driven_sync(),      name="event_sync"),
+            asyncio.create_task(self.daily_price_sync(),       name="price_sync"),
+            asyncio.create_task(self.daily_participant_oi(),   name="participant_oi"),
+            asyncio.create_task(self.weekly_sweep(),           name="weekly_sweep"),
         ]
 
         await self._shutdown.wait()

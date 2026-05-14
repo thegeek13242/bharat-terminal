@@ -135,6 +135,13 @@ services:
           --topic-config retention.ms=21600000 \
           --topic-config cleanup.policy=delete || true
 
+        rpk topic create raw.fno.in \
+          --brokers redpanda:9092 \
+          --partitions 8 \
+          --replicas 1 \
+          --topic-config retention.ms=43200000 \
+          --topic-config cleanup.policy=delete || true
+
         rpk topic create analysed.commodity_shock.in \
           --brokers redpanda:9092 \
           --partitions 4 \
@@ -296,6 +303,27 @@ services:
       context: .
       dockerfile: docker/commodity/Dockerfile
     container_name: bharat-commodity
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      kb-migrate:
+        condition: service_completed_successfully
+    env_file: [".env"]
+    environment:
+      <<: *common-env
+    restart: unless-stopped
+    logging: *default-logging
+
+  fno-engine:
+    # OI-aware persister for raw.fno.in. Filters ~5M ticks/day down to
+    # ~50k OI-significant + heartbeat rows per day, written to the
+    # derivative_ticks table.
+    build:
+      context: .
+      dockerfile: docker/fno_engine/Dockerfile
+    container_name: bharat-fno-engine
     depends_on:
       redpanda-init:
         condition: service_completed_successfully

@@ -4,7 +4,7 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 from aiokafka import AIOKafkaProducer
-from bharat_terminal.types import CommodityTick, NewsItem, SentimentItem
+from bharat_terminal.types import CommodityTick, DerivativeTick, NewsItem, SentimentItem
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +13,7 @@ TOPIC_RAW_NEWS = "raw.news.in"
 TOPIC_ENRICHED_NEWS = "raw.news.enriched.in"   # Articles with full_body extracted
 TOPIC_SENTIMENT = "raw.sentiment.in"           # Prediction-market probabilities
 TOPIC_COMMODITY = "raw.commodity.in"           # MCX live ticks
+TOPIC_FNO = "raw.fno.in"                       # NSE F&O live ticks (SnapQuote w/ OI)
 TOPIC_DLQ = "raw.news.dlq"
 
 
@@ -161,6 +162,39 @@ class NewsKafkaProducer:
             return True
         except Exception as e:
             logger.error(f"Failed to publish tick {tick.commodity}/{tick.token}: {e}")
+            return False
+
+    async def publish_derivative_tick(self, tick: DerivativeTick) -> bool:
+        """
+        Publish a raw F&O (NFO) tick to raw.fno.in.
+
+        Partitioned by underlying symbol so all RELIANCE futures + options
+        land on the same partition — downstream fno-engine can compute
+        per-symbol OI aggregations without cross-partition state.
+        """
+        if not self._producer:
+            raise RuntimeError("Producer not started")
+
+        data = tick.model_dump()
+        data["timestamp_utc"] = tick.timestamp_utc.isoformat()
+
+        try:
+            await self._producer.send_and_wait(
+                TOPIC_FNO,
+                value=data,
+                key=tick.symbol.encode("utf-8"),
+                headers=[
+                    ("source", tick.source.encode()),
+                    ("symbol", tick.symbol.encode()),
+                    ("instrument", tick.instrument_type.encode()),
+                    ("token", tick.token.encode()),
+                ],
+            )
+            return True
+        except Exception as e:
+            logger.error(
+                f"Failed to publish FNO tick {tick.symbol}/{tick.contract_symbol}: {e}"
+            )
             return False
 
     async def _publish_dlq(self, item: NewsItem, error: str):

@@ -30,7 +30,7 @@ Group=docker
 # one-shot batch jobs invoked manually with --profile, not boot services.
 ExecStart=/usr/bin/docker compose up -d \
     kb-service kb-monitor \
-    ingestion-worker analysis-worker sentiment-worker commodity-engine \
+    ingestion-worker analysis-worker sentiment-worker commodity-engine fno-engine \
     api-gateway frontend \
     prometheus grafana
 
