@@ -126,18 +126,25 @@ async def main():
         )
     ):
         try:
+            # Single adapter, dual subscription: MCX commodities (existing)
+            # plus NSE F&O stock + index futures with SnapQuote mode for OI.
+            # If you want to disable F&O ingestion, set ANGEL_ONE_ENABLE_FNO=0.
+            enable_fno = os.getenv("ANGEL_ONE_ENABLE_FNO", "1") == "1"
             angelone = AngelOneMCXAdapter(
                 publish_callback=producer.publish_commodity_tick,
+                publish_derivative_callback=(
+                    producer.publish_derivative_tick if enable_fno else None
+                ),
             )
             await angelone.start()
         except Exception as e:
             logger.error(
-                f"[ANGELONE_MCX] failed to start: {e}", exc_info=True
+                f"[ANGELONE] failed to start: {e}", exc_info=True
             )
             angelone = None
     else:
         logger.info(
-            "[ANGELONE_MCX] credentials not set — skipping MCX tick adapter"
+            "[ANGELONE] credentials not set — skipping MCX/NFO tick adapter"
         )
 
     # Ingest pipeline: dedup → publish raw → enqueue for body fetch

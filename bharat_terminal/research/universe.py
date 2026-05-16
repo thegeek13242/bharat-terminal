@@ -70,4 +70,32 @@ TRIGGERS: tuple[dict, ...] = (
     {"id": "INDIA_CPI",   "label": "India CPI Print",                "kind": "discrete",   "unit": "%-pt surprise","data_source": "MOSPI"},
     {"id": "US_CPI",      "label": "US CPI Print",                   "kind": "discrete",   "unit": "%-pt surprise","data_source": "BLS"},
     {"id": "FII_FLOW",    "label": "FII Net Equity Flow",            "kind": "continuous", "unit": "INR Cr",       "data_source": "NSE:FII_DII"},
+
+    # ── Industrial metals (steel cycle, EV demand, infra capex) ────────
+    {"id": "STEEL_HRC",   "label": "Steel HRC Index (China/India)",  "kind": "continuous", "unit": "USD/t",         "data_source": "Platts:HRC"},
+    {"id": "IRON_ORE",    "label": "Iron Ore (62% Fe, CFR China)",   "kind": "continuous", "unit": "USD/t",         "data_source": "Platts:IODBZ00"},
+    {"id": "COKING_COAL", "label": "Premium Hard Coking Coal (FOB)", "kind": "continuous", "unit": "USD/t",         "data_source": "Platts:PHCC"},
+    {"id": "ZINC",        "label": "LME Zinc",                        "kind": "continuous", "unit": "USD/t",         "data_source": "LME:ZN"},
+    {"id": "LEAD",        "label": "LME Lead",                        "kind": "continuous", "unit": "USD/t",         "data_source": "LME:PB"},
+
+    # ── Soft commodities / FMCG inputs ─────────────────────────────────
+    {"id": "PALM_OIL",    "label": "Crude Palm Oil (MYR/t)",          "kind": "continuous", "unit": "MYR/t",         "data_source": "BMD:FCPO"},
+    {"id": "SUGAR",       "label": "Sugar No. 11 (ICE)",              "kind": "continuous", "unit": "USc/lb",        "data_source": "ICE:SB"},
+    {"id": "WHEAT",       "label": "CBOT Wheat",                       "kind": "continuous", "unit": "USc/bu",        "data_source": "CBOT:ZW"},
+    {"id": "RUBBER",      "label": "TOCOM Natural Rubber",            "kind": "continuous", "unit": "JPY/kg",        "data_source": "TOCOM:RU"},
+
+    # ── Indian-specific rates (continuous — separate from MPC event) ───
+    {"id": "INDIA_REPO",  "label": "RBI Repo Rate",                   "kind": "continuous", "unit": "%",             "data_source": "RBI:REPO"},
+    {"id": "INDIA_10Y",   "label": "India 10-Year G-Sec Yield",       "kind": "continuous", "unit": "%",             "data_source": "FBIL:G-Sec10Y"},
+
+    # ── Equity benchmarks (broad-market / sector beta proxies) ─────────
+    {"id": "NIFTY50",     "label": "Nifty 50 Index",                  "kind": "continuous", "unit": "index",         "data_source": "NSE:NIFTY"},
+    {"id": "NIFTY_BANK",  "label": "Nifty Bank Index",                "kind": "continuous", "unit": "index",         "data_source": "NSE:BANKNIFTY"},
+    {"id": "SP500",       "label": "S&P 500 Index",                   "kind": "continuous", "unit": "index",         "data_source": "Yahoo:^GSPC"},
+    {"id": "NASDAQ_IT",   "label": "Nasdaq IT / Software ETF",         "kind": "continuous", "unit": "index",         "data_source": "Yahoo:IGV"},
+
+    # ── Demand / activity proxies ──────────────────────────────────────
+    {"id": "CHINA_PMI",   "label": "China Manufacturing PMI",          "kind": "discrete",   "unit": "index",         "data_source": "Caixin:PMI"},
+    {"id": "BDI",         "label": "Baltic Dry Index",                 "kind": "continuous", "unit": "index",         "data_source": "Baltic:BDI"},
+    {"id": "SEMI_INDEX",  "label": "Philadelphia Semiconductor Index", "kind": "continuous", "unit": "index",         "data_source": "Yahoo:^SOX"},
 )

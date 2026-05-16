@@ -16,7 +16,8 @@
     "graphology-layout-forceatlas2": "^0.10.1",
     "recharts": "^2.12.5",
     "date-fns": "^3.6.0",
-    "clsx": "^2.1.1"
+    "clsx": "^2.1.1",
+    "react-force-graph-2d": "^1.25.5"
   },
   "devDependencies": {
     "@types/react": "^18.3.1",

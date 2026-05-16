@@ -3,12 +3,22 @@ import { useImpactFeed } from '@/hooks/useImpactFeed';
 import { NewsFeed } from '@/components/NewsFeed';
 import { CompanyDrilldown } from '@/components/CompanyDrilldown';
 import { TradeIdeas } from '@/components/TradeIdeas';
-import { ImpactGraph } from '@/components/ImpactGraph';
 import { Watchlist } from '@/components/Watchlist';
 import { SentimentPanel } from '@/components/SentimentPanel';
+import { CompaniesBrowser } from '@/components/CompaniesBrowser';
+import { ImpactGraph } from '@/components/ImpactGraph';
+import { DatabaseExplorer } from '@/components/DatabaseExplorer';
 import { ImpactReport } from '@/types';
 
-type Tab = 'feed' | 'graph' | 'trade' | 'watchlist' | 'sentiment';
+type Tab =
+  | 'feed'
+  | 'sentiment'
+  | 'companies'
+  | 'graph'
+  | 'trade'
+  | 'watchlist'
+  | 'database';
+
 type ConvictionFilter = 'all' | 'high' | 'medium' | 'low';
 
 export default function App() {
@@ -24,10 +34,17 @@ export default function App() {
     error: 'bg-red-500',
   };
 
-  const primarySymbol =
-    selectedReport?.company_impacts.find((i) => i.hop_distance === 0)?.symbol ?? null;
-
   const signalCount = reports.reduce((n, r) => n + r.trade_signals.length, 0);
+
+  const tabs: ReadonlyArray<readonly [Tab, string]> = [
+    ['feed', 'Live Feed'],
+    ['sentiment', 'Sentiment'],
+    ['companies', 'Companies'],
+    ['graph', 'Impact Graph'],
+    ['trade', `Signals${signalCount > 0 ? ` (${signalCount})` : ''}`],
+    ['watchlist', 'Watchlist'],
+    ['database', 'Database'],
+  ] as const;
 
   return (
     <div className="h-screen bg-gray-950 text-gray-100 flex flex-col font-mono text-sm overflow-hidden">
@@ -44,15 +61,7 @@ export default function App() {
 
       {/* ── Tab Bar ── */}
       <nav className="flex border-b border-gray-800 bg-gray-900 flex-shrink-0 overflow-x-auto">
-        {(
-          [
-            ['feed', 'Live Feed'],
-            ['sentiment', 'Sentiment'],
-            ['graph', 'Impact Graph'],
-            ['trade', `Signals${signalCount > 0 ? ` (${signalCount})` : ''}`],
-            ['watchlist', 'Watchlist'],
-          ] as const
-        ).map(([tab, label]) => (
+        {tabs.map(([tab, label]) => (
           <button
             key={tab}
             onClick={() => setActiveTab(tab)}
@@ -86,10 +95,10 @@ export default function App() {
       </nav>
 
       {/* ── Main Content ── */}
-      <main className="flex-1 overflow-hidden p-2 sm:p-3">
+      <main className="flex-1 overflow-hidden">
         {/* Feed + Drilldown */}
         {activeTab === 'feed' && (
-          <div className="h-full grid grid-cols-5 gap-3">
+          <div className="h-full grid grid-cols-5 gap-3 p-2 sm:p-3">
             <div className="col-span-3 min-h-0">
               <NewsFeed
                 reports={reports}
@@ -103,25 +112,30 @@ export default function App() {
           </div>
         )}
 
-        {/* Impact Graph */}
+        {/* Sentiment */}
+        {activeTab === 'sentiment' && (
+          <div className="h-full">
+            <SentimentPanel />
+          </div>
+        )}
+
+        {/* Companies (NEW) */}
+        {activeTab === 'companies' && (
+          <div className="h-full">
+            <CompaniesBrowser />
+          </div>
+        )}
+
+        {/* Impact Graph (NEW: 2D radial) */}
         {activeTab === 'graph' && (
-          <div className="h-full grid grid-cols-5 gap-3">
-            <div className="col-span-2 min-h-0">
-              <NewsFeed
-                reports={reports}
-                onSelectReport={(r) => setSelectedReport(r)}
-                selectedId={selectedReport?.id}
-              />
-            </div>
-            <div className="col-span-3 min-h-0">
-              <ImpactGraph symbol={primarySymbol} />
-            </div>
+          <div className="h-full">
+            <ImpactGraph />
           </div>
         )}
 
         {/* Trade Signals */}
         {activeTab === 'trade' && (
-          <div className="h-full grid grid-cols-5 gap-3">
+          <div className="h-full grid grid-cols-5 gap-3 p-2 sm:p-3">
             <div className="col-span-2 min-h-0">
               <NewsFeed
                 reports={reports}
@@ -135,16 +149,9 @@ export default function App() {
           </div>
         )}
 
-        {/* Sentiment */}
-        {activeTab === 'sentiment' && (
-          <div className="h-full">
-            <SentimentPanel />
-          </div>
-        )}
-
         {/* Watchlist */}
         {activeTab === 'watchlist' && (
-          <div className="h-full grid grid-cols-5 gap-3">
+          <div className="h-full grid grid-cols-5 gap-3 p-2 sm:p-3">
             <div className="col-span-2 min-h-0">
               <NewsFeed
                 reports={reports}
@@ -155,6 +162,13 @@ export default function App() {
             <div className="col-span-3 min-h-0">
               <Watchlist />
             </div>
+          </div>
+        )}
+
+        {/* Database Explorer (NEW) */}
+        {activeTab === 'database' && (
+          <div className="h-full">
+            <DatabaseExplorer />
           </div>
         )}
       </main>

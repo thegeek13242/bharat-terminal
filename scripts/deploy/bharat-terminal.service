@@ -1,0 +1,52 @@
+[Unit]
+Description=Bharat Terminal — auto-start docker compose stack on VM boot
+Documentation=https://github.com/thegeek13242/bharat-terminal
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Will be templated by deploy.sh — these placeholders get replaced before
+# the file is dropped into /etc/systemd/system/.
+WorkingDirectory={{TARGET_DIR}}
+User={{USER}}
+Group=docker
+
+# `up -d` of the long-running services. Compose's `depends_on` graph
+# transitively starts postgres/redis/redpanda first AND triggers the
+# init containers (redpanda-init, kb-migrate) on a cold boot — but on
+# a warm idempotent re-run, NOT listing them here avoids the
+# `condition: service_completed_successfully` re-evaluation that would
+# otherwise recreate every app-tier container unnecessarily.
+#
+# All idempotent: already-running containers are no-ops; alembic
+# upgrade head is a no-op at HEAD; rpk topic create says "already exists".
+#
+# kb-backfill / research-runner are intentionally excluded — they are
+# one-shot batch jobs invoked manually with --profile, not boot services.
+ExecStart=/usr/bin/docker compose up -d \
+    kb-service kb-monitor \
+    ingestion-worker analysis-worker sentiment-worker commodity-engine fno-engine \
+    api-gateway frontend \
+    prometheus grafana
+
+# Graceful stop: `systemctl stop bharat-terminal` cleanly stops the stack.
+# We don't `down` (which removes containers) — `stop` keeps them around so
+# their state and volumes are preserved for the next boot.
+ExecStop=/usr/bin/docker compose stop
+
+# Best-effort log of the boot to systemd journal for post-mortem.
+StandardOutput=journal
+StandardError=journal
+
+# Restart on failure with backoff. Mostly defensive — `up -d` is the kind
+# of command that either succeeds quickly or genuinely needs intervention.
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

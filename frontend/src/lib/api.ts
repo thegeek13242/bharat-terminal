@@ -53,4 +53,84 @@ export const api = {
     request<{ themes: any[]; count: number }>(
       `/sentiment/themes?since_minutes=${sinceMinutes}`
     ),
+
+  // ── Companies browser ────────────────────────────────────────────────
+  listCompanies: (params: {
+    q?: string;
+    sector?: string;
+    has_dossier?: boolean;
+    has_financials?: boolean;
+    limit?: number;
+    offset?: number;
+  } = {}) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '') qs.set(k, String(v));
+    });
+    return request<{ total: number; limit: number; offset: number; items: any[] }>(
+      `/companies?${qs.toString()}`,
+    );
+  },
+
+  getCompanyDetail: (symbol: string) =>
+    request<any>(`/companies/${encodeURIComponent(symbol)}`),
+
+  getCompanyFinancials: (symbol: string, period: 'quarterly' | 'annual' | 'all' = 'quarterly', limit = 40) =>
+    request<{ symbol: string; count: number; items: any[] }>(
+      `/companies/${encodeURIComponent(symbol)}/financials?period=${period}&limit=${limit}`,
+    ),
+
+  getCompanyPrices: (symbol: string, days = 365) =>
+    request<{ symbol: string; count: number; items: any[] }>(
+      `/companies/${encodeURIComponent(symbol)}/prices?days=${days}`,
+    ),
+
+  getCompanyLinkages: (symbol: string) =>
+    request<{ symbol: string; outbound: any[]; inbound: any[] }>(
+      `/companies/${encodeURIComponent(symbol)}/linkages`,
+    ),
+
+  // ── Dossier ──────────────────────────────────────────────────────────
+  listDossiers: (params: { min_quality?: number; limit?: number; offset?: number } = {}) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null) qs.set(k, String(v));
+    });
+    return request<{ total: number; limit: number; offset: number; items: any[] }>(
+      `/dossier/list?${qs.toString()}`,
+    );
+  },
+
+  getDossier: (symbol: string) =>
+    request<any>(`/dossier/${encodeURIComponent(symbol)}`),
+
+  getDossierExposed: (trigger: string, minAbsBeta = 0.05, limit = 50) =>
+    request<{ trigger: string; count: number; items: any[] }>(
+      `/dossier/exposed/?trigger=${encodeURIComponent(trigger)}&min_abs_beta=${minAbsBeta}&limit=${limit}`,
+    ),
+
+  getDossierImpactGraph: (
+    trigger: string,
+    opts: { max_hops?: number; min_abs_beta?: number; limit_first_degree?: number; limit_per_node?: number } = {},
+  ) => {
+    const qs = new URLSearchParams({ trigger });
+    Object.entries(opts).forEach(([k, v]) => {
+      if (v !== undefined) qs.set(k, String(v));
+    });
+    return request<any>(`/dossier/impact-graph/?${qs.toString()}`);
+  },
+
+  getDossierTriggers: () =>
+    request<{ count: number; items: any[] }>(`/dossier/triggers/`),
+
+  // ── DB Explorer ──────────────────────────────────────────────────────
+  listDbTables: () => request<{ tables: any[] }>(`/db/tables`),
+
+  getDbTable: (table: string, params: { q?: string; limit?: number; offset?: number } = {}) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '') qs.set(k, String(v));
+    });
+    return request<any>(`/db/${encodeURIComponent(table)}?${qs.toString()}`);
+  },
 };
