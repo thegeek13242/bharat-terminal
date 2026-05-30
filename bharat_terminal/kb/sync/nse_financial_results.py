@@ -324,11 +324,11 @@ def parse_xbrl(xml_bytes: bytes) -> Dict[str, Any]:
     # Parse segment data
     segment_data = _extract_segments(facts_by_context)
 
-    # Units sanity: monetary facts are absolute INR (÷1e7 = crores), regardless of the
-    # taxonomy's display `LevelOfRounding` (e.g. "Lakhs"), which we intentionally ignore.
-    # Cross-check scale independently via implied EPS = PAT / (paid-up capital / face value).
-    scale_ok = _check_monetary_scale(one_d, quarter, metadata)
-    metadata["scale_ok"] = scale_ok
+    # Monetary facts are absolute INR (÷1e7 = crores), regardless of the taxonomy's
+    # display `LevelOfRounding` (e.g. "Lakhs"), which we intentionally ignore. The XBRL
+    # is the source of truth — every parsed filing is persisted as-is, with no scale
+    # filtering. (Some filings carry garbage in secondary fields such as FaceValue or
+    # PaidUpValue, but that must never cause us to drop the P&L the filing reports.)
 
     return {
         "quarter": quarter,
@@ -337,57 +337,6 @@ def parse_xbrl(xml_bytes: bytes) -> Dict[str, Any]:
         "segment_data": segment_data,
         "raw_facts": raw_facts,
     }
-
-
-def _check_monetary_scale(
-    raw_one_d: Dict[str, str],
-    quarter: Dict[str, Optional[float]],
-    metadata: Dict[str, Any],
-) -> bool:
-    """
-    Best-effort order-of-magnitude check on monetary scaling.
-
-    Compares the PAT-implied EPS (PAT ÷ shares) against the reported EPS and flags a
-    >100x divergence — the signature of a per-field scale corruption (e.g. a garbage
-    PAT). Returns True (no objection) by default; only returns False when ALL inputs
-    are themselves plausible AND still disagree wildly.
-
-    Why the strict input gating: some filings carry garbage in the very fields this
-    check relies on — e.g. FaceValueOfEquityShareCapital = 5441.16, or
-    PaidUpValueOfEquityShareCapital = 2.09e13 — which would make the derived share
-    count meaningless and produce false positives on rows whose P&L is actually fine.
-    Indian face values are ₹1/2/5/10 (rarely up to ₹100), and no listed company has
-    more than ~1.5e10 shares, so we only trust the check inside those bounds.
-    A True result is NOT a precision guarantee; it means "no gross scale error seen."
-    """
-    try:
-        pat_cr = quarter.get("pat_cr")
-        eps_reported = quarter.get("eps_basic")
-        paid_up = raw_one_d.get("PaidUpValueOfEquityShareCapital")
-        face_value = raw_one_d.get("FaceValueOfEquityShareCapital")
-        if pat_cr is None or not eps_reported or not paid_up or not face_value:
-            return True  # not enough data to check — don't block
-        fv = float(face_value)
-        shares = float(paid_up) / fv
-        # Gate on plausibility of the share-count inputs; if implausible, we can't judge.
-        if not (1.0 <= fv <= 1000.0):
-            return True
-        if not (1e3 <= shares <= 2e10):
-            return True
-        eps_implied = (pat_cr * INR_TO_CRORES) / shares
-        ratio = abs(eps_implied / eps_reported)
-        if ratio > 100 or ratio < (1 / 100):
-            logger.error(
-                "XBRL scale check FAILED for %s %s: implied EPS %.4f vs reported %.4f "
-                "(ratio %.1fx, sane inputs) — possible units regression; "
-                "row flagged scale_ok=False",
-                metadata.get("symbol"), metadata.get("period_end"),
-                eps_implied, eps_reported, ratio,
-            )
-            return False
-        return True
-    except (ValueError, TypeError, ZeroDivisionError):
-        return True  # don't block on a malformed check
 
 
 def _extract_metadata(facts: Dict[str, str]) -> Dict[str, Any]:
