@@ -22,12 +22,21 @@ from bharat_terminal.kb.sync.rate_limiter import RateLimiter
 logger = logging.getLogger(__name__)
 
 NSE_BASE = "https://www.nseindia.com"
-NSE_API = f"{NSE_BASE}/api/corporates-financial-results"
+# Legacy endpoint (frozen at the Dec-2024 quarter since NSE migrated to Integrated Filing).
+NSE_API_LEGACY = f"{NSE_BASE}/api/corporates-financial-results"
+# Current endpoint: SEBI "Integrated Filing - Financials" (iXBRL/XBRL, taxonomy in-capmkt 2026-01-31).
+NSE_API = f"{NSE_BASE}/api/integrated-filing-results"
+# Exact `type` string the endpoint expects (note the space after the hyphen).
+NSE_INTEGRATED_TYPE = "Integrated Filing- Financials"
+NSE_INTEGRATED_REFERER = (
+    f"{NSE_BASE}/companies-listing/corporate-integrated-filing"
+    "?integratedType=integratedfilingfinancials"
+)
 NSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
     "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/",
+    "Referer": NSE_INTEGRATED_REFERER,
 }
 
 # XBRL tag → our field mapping (values are in absolute INR, we convert to Crores)
@@ -79,32 +88,55 @@ async def fetch_filing_index(
     symbol: str,
     client: httpx.AsyncClient,
     limiter: RateLimiter,
-    period: str = "Quarterly",
+    period: str = "Quarterly",  # retained for signature compatibility; unused by the new endpoint
 ) -> List[Dict[str, Any]]:
     """
-    Fetch the list of financial result filings from NSE for a symbol.
-    Returns raw JSON list from NSE API.
+    Fetch the list of Integrated-Filing (Financials) records from NSE for a symbol.
+
+    The endpoint is paginated ({"data": [...], "size": N, "page": P, "totalCount": T}).
+    A single symbol typically returns < 20 records (a handful of recent quarters,
+    Consolidated + Standalone), so one page is usually enough; we page through
+    defensively in case a symbol has more.
     """
-    async with limiter:
-        params = {"index": "equities", "symbol": symbol}
-        if period:
-            params["period"] = period
-        try:
+    async def _get_page(page: int) -> Optional[Dict[str, Any]]:
+        params = {
+            "index": "equities",
+            "type": NSE_INTEGRATED_TYPE,
+            "symbol": symbol,
+            "page": page,
+        }
+        resp = await client.get(NSE_API, params=params)
+        resp.raise_for_status()
+        content_type = resp.headers.get("content-type", "")
+        if "json" not in content_type and "html" in content_type:
+            # NSE returned HTML instead of JSON — cookie expired. Refresh + retry once.
+            logger.warning(f"NSE returned HTML for {symbol} (cookie expired?)")
+            await refresh_nse_cookies(client)
             resp = await client.get(NSE_API, params=params)
             resp.raise_for_status()
-            content_type = resp.headers.get("content-type", "")
-            if "json" not in content_type and "html" in content_type:
-                # NSE returned HTML instead of JSON — cookie expired
-                logger.warning(f"NSE returned HTML for {symbol} (cookie expired?)")
-                # Refresh cookies and retry once
-                await refresh_nse_cookies(client)
-                resp = await client.get(NSE_API, params=params)
-                resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, list):
-                return data
-            logger.warning(f"Unexpected response type for {symbol}: {type(data)}")
-            return []
+        body = resp.json()
+        if not isinstance(body, dict):
+            logger.warning(f"Unexpected response type for {symbol}: {type(body)}")
+            return None
+        return body
+
+    async with limiter:
+        try:
+            records: List[Dict[str, Any]] = []
+            page = 1
+            first = await _get_page(page)
+            if first is None:
+                return []
+            total = int(first.get("totalCount") or 0)
+            records.extend(first.get("data", []) or [])
+            # Page through any remainder (rare for a single symbol).
+            while len(records) < total and (first.get("data")):
+                page += 1
+                nxt = await _get_page(page)
+                if not nxt or not nxt.get("data"):
+                    break
+                records.extend(nxt["data"])
+            return records
         except httpx.HTTPStatusError as e:
             logger.warning(f"NSE filing index failed for {symbol}: HTTP {e.response.status_code}")
             return []
@@ -114,17 +146,28 @@ async def fetch_filing_index(
 
 
 def parse_filing_metadata(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Parse a single filing record from the NSE API into our schema."""
-    xbrl_url = raw.get("xbrl", "")
-    # NSE returns "https://nsearchives.nseindia.com/corporate/xbrl/-" for no XBRL
-    has_xbrl = xbrl_url and not xbrl_url.endswith("/-")
+    """
+    Parse a single Integrated-Filing record from the NSE API into our schema.
+
+    The Integrated-Filing feed only reports the quarter-end (`qe_Date`); the period
+    *start* is not provided, so we derive it from the quarter-end (Indian quarters end
+    Mar/Jun/Sep/Dec). The XBRL itself carries the authoritative period_start, and
+    `_upsert_financial_result` prefers that — this derived value only seeds the
+    nse_filings row and its uniqueness key (symbol, from_date, to_date, consolidated).
+    """
+    # Prefer the plain XBRL XML; fall back to nothing (we don't parse iXBRL HTML here).
+    xbrl_url = (raw.get("xbrl") or "").strip()
+    has_xbrl = bool(xbrl_url) and not xbrl_url.endswith("/-") and xbrl_url.lower().endswith(".xml")
+    ixbrl_url = (raw.get("ixbrl") or "").strip() or None
 
     def parse_nse_date(date_str: str) -> Optional[date]:
         if not date_str:
             return None
-        for fmt in ("%d-%b-%Y", "%d-%m-%Y"):
+        # qe_Date arrives uppercase ("31-MAR-2026"); .title() → "31-Mar-2026" for %b.
+        s = date_str.strip().title()
+        for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%d-%B-%Y"):
             try:
-                return datetime.strptime(date_str, fmt).date()
+                return datetime.strptime(s, fmt).date()
             except ValueError:
                 continue
         return None
@@ -132,57 +175,89 @@ def parse_filing_metadata(raw: Dict[str, Any]) -> Dict[str, Any]:
     def parse_nse_datetime(dt_str: str) -> Optional[datetime]:
         if not dt_str:
             return None
-        for fmt in ("%d-%b-%Y %H:%M", "%d-%b-%Y %H:%M:%S", "%d-%m-%Y %H:%M"):
+        s = dt_str.strip().title()
+        for fmt in ("%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M", "%d-%m-%Y %H:%M"):
             try:
-                return datetime.strptime(dt_str, fmt).replace(tzinfo=timezone.utc)
+                return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
             except ValueError:
                 continue
         return None
 
+    def derive_quarter_start(qe: Optional[date]) -> Optional[date]:
+        """First day of the quarter whose last day is `qe` (Mar/Jun/Sep/Dec ends)."""
+        if not qe:
+            return None
+        if qe.month in (3, 6, 9, 12):
+            return date(qe.year, qe.month - 2, 1)
+        # Non-standard quarter-end: fall back to ~3 months back, day 1.
+        m = qe.month - 2
+        y = qe.year
+        if m <= 0:
+            m += 12
+            y -= 1
+        return date(y, m, 1)
+
+    def derive_financial_year(qe: Optional[date]) -> Optional[str]:
+        if not qe:
+            return None
+        fy_start = qe.year if qe.month > 3 else qe.year - 1
+        return f"01-Apr-{fy_start} To 31-Mar-{fy_start + 1}"
+
+    to_date = parse_nse_date(raw.get("qe_Date", ""))
+    broadcast = parse_nse_datetime(raw.get("broadcast_Date", ""))
+    creation = parse_nse_datetime(raw.get("creation_Date", ""))
+
     return {
-        "symbol": raw.get("symbol", ""),
-        "isin": raw.get("isin"),
-        "from_date": parse_nse_date(raw.get("fromDate", "")),
-        "to_date": parse_nse_date(raw.get("toDate", "")),
-        "period": raw.get("period", ""),
-        "relating_to": raw.get("relatingTo"),
-        "financial_year": raw.get("financialYear"),
-        "consolidated": raw.get("consolidated", ""),
-        "audited": raw.get("audited", ""),
-        "ind_as": raw.get("indAs"),
-        "format": raw.get("format"),
+        "symbol": (raw.get("symbol") or "").strip(),
+        "isin": raw.get("isin"),  # not present at index level; XBRL carries ISIN
+        "from_date": derive_quarter_start(to_date),
+        "to_date": to_date,
+        "period": "Quarterly",
+        "relating_to": raw.get("type_Sub"),  # "Original" / revision marker
+        "financial_year": derive_financial_year(to_date),
+        "consolidated": (raw.get("consolidated") or "").strip(),  # "Consolidated"/"Standalone"
+        "audited": (raw.get("audited") or "").strip(),            # "Audited"/"Un-Audited"
+        "ind_as": "Ind-AS Integrated",
+        "format": "Integrated",
         "xbrl_url": xbrl_url if has_xbrl else None,
-        "detail_url": raw.get("resultDetailedDataLink") or None,
-        "seq_number": raw.get("seqNumber"),
-        "filing_date": parse_nse_datetime(raw.get("filingDate", "")),
-        "broadcast_date": parse_nse_datetime(raw.get("broadCastDate", "")),
+        "ixbrl_url": ixbrl_url,
+        "detail_url": ixbrl_url,
+        "seq_number": raw.get("seq_Id"),
+        "filing_date": broadcast or creation,
+        "broadcast_date": broadcast,
     }
 
 
 def filter_consolidated_quarterly(filings: List[Dict]) -> List[Dict]:
     """
-    Filter to keep only consolidated quarterly filings with XBRL.
-    Prefers consolidated; falls back to non-consolidated if no consolidated exists.
+    Keep one filing per quarter: prefer Consolidated over Standalone, and within the
+    chosen nature prefer the latest revision (the filing with the most recent
+    broadcast date — revisions are re-broadcast after the Original). Only filings
+    that carry a parseable XBRL XML are considered.
     """
-    quarterly = [f for f in filings if f["period"] == "Quarterly"]
+    quarterly = [
+        f for f in filings
+        if f.get("period") == "Quarterly" and f.get("to_date") and f.get("xbrl_url")
+    ]
 
-    # Group by period
-    by_period = {}
+    def latest(group: List[Dict]) -> Dict:
+        # Most recent broadcast wins (Original < Revised). None dates sort last.
+        return max(
+            group,
+            key=lambda f: f.get("broadcast_date") or datetime.min.replace(tzinfo=timezone.utc),
+        )
+
+    by_period: Dict[Any, List[Dict]] = {}
     for f in quarterly:
-        key = (f["from_date"], f["to_date"])
-        by_period.setdefault(key, []).append(f)
+        by_period.setdefault(f["to_date"], []).append(f)
 
     result = []
-    for key, group in sorted(by_period.items(), reverse=True):
-        # Prefer consolidated with XBRL
-        consolidated_xbrl = [f for f in group if f["consolidated"] == "Consolidated" and f["xbrl_url"]]
-        if consolidated_xbrl:
-            result.append(consolidated_xbrl[0])
-            continue
-        # Fallback: non-consolidated with XBRL
-        any_xbrl = [f for f in group if f["xbrl_url"]]
-        if any_xbrl:
-            result.append(any_xbrl[0])
+    for _, group in sorted(by_period.items(), reverse=True):
+        consolidated = [f for f in group if f["consolidated"] == "Consolidated"]
+        if consolidated:
+            result.append(latest(consolidated))
+        else:
+            result.append(latest(group))  # fall back to Standalone (latest revision)
 
     return result
 
@@ -249,6 +324,12 @@ def parse_xbrl(xml_bytes: bytes) -> Dict[str, Any]:
     # Parse segment data
     segment_data = _extract_segments(facts_by_context)
 
+    # Units sanity: monetary facts are absolute INR (÷1e7 = crores), regardless of the
+    # taxonomy's display `LevelOfRounding` (e.g. "Lakhs"), which we intentionally ignore.
+    # Cross-check scale independently via implied EPS = PAT / (paid-up capital / face value).
+    scale_ok = _check_monetary_scale(one_d, quarter, metadata)
+    metadata["scale_ok"] = scale_ok
+
     return {
         "quarter": quarter,
         "ytd": ytd,
@@ -256,6 +337,57 @@ def parse_xbrl(xml_bytes: bytes) -> Dict[str, Any]:
         "segment_data": segment_data,
         "raw_facts": raw_facts,
     }
+
+
+def _check_monetary_scale(
+    raw_one_d: Dict[str, str],
+    quarter: Dict[str, Optional[float]],
+    metadata: Dict[str, Any],
+) -> bool:
+    """
+    Best-effort order-of-magnitude check on monetary scaling.
+
+    Compares the PAT-implied EPS (PAT ÷ shares) against the reported EPS and flags a
+    >100x divergence — the signature of a per-field scale corruption (e.g. a garbage
+    PAT). Returns True (no objection) by default; only returns False when ALL inputs
+    are themselves plausible AND still disagree wildly.
+
+    Why the strict input gating: some filings carry garbage in the very fields this
+    check relies on — e.g. FaceValueOfEquityShareCapital = 5441.16, or
+    PaidUpValueOfEquityShareCapital = 2.09e13 — which would make the derived share
+    count meaningless and produce false positives on rows whose P&L is actually fine.
+    Indian face values are ₹1/2/5/10 (rarely up to ₹100), and no listed company has
+    more than ~1.5e10 shares, so we only trust the check inside those bounds.
+    A True result is NOT a precision guarantee; it means "no gross scale error seen."
+    """
+    try:
+        pat_cr = quarter.get("pat_cr")
+        eps_reported = quarter.get("eps_basic")
+        paid_up = raw_one_d.get("PaidUpValueOfEquityShareCapital")
+        face_value = raw_one_d.get("FaceValueOfEquityShareCapital")
+        if pat_cr is None or not eps_reported or not paid_up or not face_value:
+            return True  # not enough data to check — don't block
+        fv = float(face_value)
+        shares = float(paid_up) / fv
+        # Gate on plausibility of the share-count inputs; if implausible, we can't judge.
+        if not (1.0 <= fv <= 1000.0):
+            return True
+        if not (1e3 <= shares <= 2e10):
+            return True
+        eps_implied = (pat_cr * INR_TO_CRORES) / shares
+        ratio = abs(eps_implied / eps_reported)
+        if ratio > 100 or ratio < (1 / 100):
+            logger.error(
+                "XBRL scale check FAILED for %s %s: implied EPS %.4f vs reported %.4f "
+                "(ratio %.1fx, sane inputs) — possible units regression; "
+                "row flagged scale_ok=False",
+                metadata.get("symbol"), metadata.get("period_end"),
+                eps_implied, eps_reported, ratio,
+            )
+            return False
+        return True
+    except (ValueError, TypeError, ZeroDivisionError):
+        return True  # don't block on a malformed check
 
 
 def _extract_metadata(facts: Dict[str, str]) -> Dict[str, Any]:
@@ -361,35 +493,47 @@ def _extract_financials(facts: Dict[str, str], metadata: Dict[str, Any]) -> Dict
 
 
 def _extract_segments(facts_by_context: Dict[str, Dict[str, str]]) -> List[Dict[str, Any]]:
-    """Extract segment-wise revenue and profit data."""
-    segments = []
+    """
+    Extract current-quarter segment revenue and profit.
 
-    # Segment contexts follow pattern: OneReportableSegmentRevenue{NN}D
+    In the Integrated-Filing taxonomy, segment facts are spread across paired
+    duration contexts linked by `DescriptionOfReportableSegment`:
+      - OneReportable{N}D         → SegmentRevenue (+ SegmentRevenueFromOperations)
+      - OneReportableFinance{N}D  → SegmentProfitLossBeforeTaxAndFinanceCosts
+    (Instant contexts OneReportable3*/4* carry segment assets/liabilities — ignored.)
+    We merge revenue and profit by segment name. Only current-quarter ("One*")
+    duration contexts are used; YTD ("Four*") segments are skipped to match the
+    quarterly P&L row.
+    """
+    def to_cr(v: Optional[str]) -> Optional[float]:
+        if not v:
+            return None
+        try:
+            return round(float(v) / INR_TO_CRORES, 2)
+        except (ValueError, TypeError):
+            return None
+
+    merged: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
     for ctx_id, facts in facts_by_context.items():
-        if not ctx_id.startswith("OneReportableSegment"):
+        if not (ctx_id.startswith("OneReportable") and ctx_id.endswith("D")):
             continue
+        name = facts.get("DescriptionOfReportableSegment")
+        if not name:
+            continue
+        revenue = to_cr(facts.get("SegmentRevenue") or facts.get("SegmentRevenueFromOperations"))
+        profit = to_cr(facts.get("SegmentProfitLossBeforeTaxAndFinanceCosts"))
+        if revenue is None and profit is None:
+            continue
+        if name not in merged:
+            merged[name] = {"name": name}
+            order.append(name)
+        if revenue is not None:
+            merged[name]["revenue_cr"] = revenue
+        if profit is not None:
+            merged[name]["profit_cr"] = profit
 
-        desc = facts.get("DescriptionOfReportableSegment")
-        revenue = facts.get("SegmentRevenue")
-        profit = facts.get("SegmentProfitLossBeforeTaxAndFinanceCosts")
-
-        if desc:
-            seg = {"name": desc}
-            if revenue:
-                try:
-                    seg["revenue_cr"] = round(float(revenue) / INR_TO_CRORES, 2)
-                except (ValueError, TypeError):
-                    pass
-            if profit:
-                try:
-                    seg["profit_cr"] = round(float(profit) / INR_TO_CRORES, 2)
-                except (ValueError, TypeError):
-                    pass
-            # Only add if we have at least a name
-            if seg.get("revenue_cr") or seg.get("profit_cr"):
-                segments.append(seg)
-
-    return segments
+    return [merged[n] for n in order]
 
 
 # ── High-level orchestration helpers ─────────────────────────────────────────
@@ -408,9 +552,9 @@ async def create_nse_client() -> httpx.AsyncClient:
 
 
 async def refresh_nse_cookies(client: httpx.AsyncClient) -> None:
-    """Hit NSE homepage to get fresh session cookies."""
+    """Hit the Integrated-Filing listing page to get fresh session cookies."""
     try:
-        resp = await client.get(NSE_BASE)
+        resp = await client.get(NSE_INTEGRATED_REFERER)
         logger.debug(f"NSE cookie refresh: HTTP {resp.status_code}")
     except Exception as e:
         logger.debug(f"NSE cookie refresh failed: {e}")

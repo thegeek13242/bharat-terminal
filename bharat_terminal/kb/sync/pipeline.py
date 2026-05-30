@@ -261,6 +261,14 @@ async def _upsert_financial_result(
     if not period_end or not period_start:
         return False
 
+    # Refuse rows that fail the monetary scale cross-check — a wrong-by-100x figure is
+    # worse than a missing quarter (prefer parse-failure over silently wrong data).
+    if xbrl_meta.get("scale_ok") is False:
+        logger.error(
+            f"Skipping {symbol} {period_end}: failed XBRL scale check (scale_ok=False)"
+        )
+        return False
+
     is_consolidated = (
         filing_meta.get("consolidated", "") == "Consolidated"
         or "consolidated" in xbrl_meta.get("consolidated", "").lower()
