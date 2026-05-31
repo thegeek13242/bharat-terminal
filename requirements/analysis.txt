@@ -1,5 +1,8 @@
 pydantic>=2.6,<3
-anthropic>=0.25,<1
+# [vertex] pulls google-auth for Vertex AI (AnthropicVertex) ADC auth
+anthropic[vertex]>=0.40,<1
+# Gemini on Vertex AI
+google-genai>=0.3,<2
 langgraph>=0.1,<0.2
 langchain-core>=0.2,<0.3
 sentence-transformers>=2.7,<4

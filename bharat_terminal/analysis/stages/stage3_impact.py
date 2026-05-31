@@ -10,7 +10,8 @@ import uuid
 import asyncio
 import httpx
 from typing import List, Optional
-import anthropic
+from bharat_terminal import llm
+from bharat_terminal.llm import provider_for_model
 from bharat_terminal.types import NewsItem, CompanyImpact
 from bharat_terminal.analysis.llm_logger import get_llm_logger, LLMCallRecord, compute_cost
 
@@ -132,7 +133,7 @@ async def score_impacts(
             if isinstance(ctx, dict):
                 contexts[sym] = ctx
 
-    if not ANTHROPIC_API_KEY:
+    if provider_for_model(LLM_MODEL) == "anthropic" and not ANTHROPIC_API_KEY:
         # latency tracking skipped on degraded path
         return [
             CompanyImpact(
@@ -149,12 +150,11 @@ async def score_impacts(
             for sym in symbols_to_score
         ]
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     prompt = build_impact_prompt(news_item, symbols_to_score, contexts)
 
     llm_start = time.time()
     try:
-        response = client.messages.create(
+        response = llm.complete(
             model=LLM_MODEL,
             max_tokens=2048,
             tools=[IMPACT_TOOL],

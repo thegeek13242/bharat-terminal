@@ -8,7 +8,8 @@ import logging
 import os
 import uuid
 from typing import TypedDict, List, Tuple
-import anthropic
+from bharat_terminal import llm
+from bharat_terminal.llm import provider_for_model
 from bharat_terminal.types import NewsItem
 from bharat_terminal.analysis.llm_logger import get_llm_logger, LLMCallRecord, compute_cost
 
@@ -181,7 +182,7 @@ def extract_entities(news_item: NewsItem) -> ExtractionResult:
     start_time = time.time()
     llm_logger = get_llm_logger()
 
-    if not ANTHROPIC_API_KEY:
+    if provider_for_model(LLM_MODEL) == "anthropic" and not ANTHROPIC_API_KEY:
         logger.warning("No ANTHROPIC_API_KEY — using heuristic extraction")
         sectors, macro_theme, resolved = _heuristic_extract(news_item)
         return ExtractionResult(
@@ -195,8 +196,6 @@ def extract_entities(news_item: NewsItem) -> ExtractionResult:
             resolved_symbols=resolved,
         )
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
     prompt = f"""Analyze this Indian financial news and extract structured market intelligence.
 
 Headline: {news_item.headline}
@@ -207,7 +206,7 @@ Extract all relevant market entities, sectors, and the macro theme."""
 
     llm_start = time.time()
     try:
-        response = client.messages.create(
+        response = llm.complete(
             model=LLM_MODEL,
             max_tokens=1024,
             tools=[EXTRACTION_TOOL],

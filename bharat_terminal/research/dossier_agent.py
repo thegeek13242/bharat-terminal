@@ -32,8 +32,9 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-import anthropic
 import httpx
+from bharat_terminal import llm
+from bharat_terminal.llm import provider_for_model
 
 from bharat_terminal.research import bse_xbrl, db
 
@@ -581,20 +582,20 @@ async def research_company(
     symbol: str,
     *,
     refresh_kind: str = "initial",
-    client: Optional[anthropic.AsyncAnthropic] = None,
+    client: Optional[Any] = None,  # deprecated/unused: provider now chosen by the llm wrapper
 ) -> Optional[Dict[str, Any]]:
     """
     Run the dossier agent for one company. Returns the submitted payload
     on success, None on failure. Persists to all 3 tables atomically.
     """
-    if not ANTHROPIC_API_KEY:
+    if provider_for_model(DOSSIER_MODEL) == "anthropic" and not ANTHROPIC_API_KEY:
         logger.error("ANTHROPIC_API_KEY not set — cannot run dossier agent")
         return None
 
-    client = client or anthropic.AsyncAnthropic(
-        api_key=ANTHROPIC_API_KEY,
-        timeout=httpx.Timeout(120.0, connect=10.0),
-    )
+    # The LLM wrapper selects the provider from DOSSIER_MODEL and handles auth
+    # (Vertex ADC for claude-*/gemini-*; console key for the legacy path). The
+    # multi-turn tool loop below requires Claude (Anthropic block round-trips);
+    # DOSSIER_MODEL should be a claude-* id.
     tools = _build_tools()
     system = _build_system_prompt(refresh_kind)
 
@@ -608,7 +609,7 @@ async def research_company(
 
     for turn in range(DOSSIER_MAX_TURNS):
         try:
-            resp = await client.messages.create(
+            resp = await llm.acomplete(
                 model=DOSSIER_MODEL,
                 max_tokens=8192,
                 system=system,
@@ -653,7 +654,9 @@ async def research_company(
                 "content": json.dumps(result)[:50000],  # cap per-result size
             })
 
-        messages.append({"role": "assistant", "content": resp.content})
+        # Re-submit the assistant turn using the provider-native content blocks
+        # (resp.raw is the underlying Anthropic response) so tool_use ids line up.
+        messages.append({"role": "assistant", "content": resp.raw.content})
         messages.append({"role": "user", "content": tool_results})
 
     if not submitted:

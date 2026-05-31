@@ -7,8 +7,9 @@ import time
 import logging
 import os
 import uuid
-import anthropic
 from typing import List
+from bharat_terminal import llm
+from bharat_terminal.llm import provider_for_model
 from bharat_terminal.types import CompanyImpact, TradeSignal, NewsItem
 from bharat_terminal.analysis.llm_logger import get_llm_logger, LLMCallRecord, compute_cost
 
@@ -66,7 +67,9 @@ def generate_signals(
     if not signal_candidates:
         return []
 
-    if not ANTHROPIC_API_KEY:
+    # Mock only when the console-Anthropic backend is selected but has no key.
+    # Vertex/Gemini backends authenticate via GCP ADC, not ANTHROPIC_API_KEY.
+    if provider_for_model(LLM_MODEL) == "anthropic" and not ANTHROPIC_API_KEY:
         return [
             TradeSignal(
                 symbol=imp.symbol,
@@ -79,8 +82,6 @@ def generate_signals(
             )
             for imp in signal_candidates[:3]
         ]
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     impact_summaries = "\n".join([
         f"- {imp.symbol}: {imp.sentiment.upper()}, magnitude={imp.magnitude}/5, "
@@ -111,7 +112,7 @@ INSTRUCTIONS:
 
     llm_start = time.time()
     try:
-        response = client.messages.create(
+        response = llm.complete(
             model=LLM_MODEL,
             max_tokens=2048,
             tools=[SIGNAL_TOOL],

@@ -15,8 +15,15 @@ x-common-env: &common-env
   PYTHONUNBUFFERED: "1"
   EXTRACTION_MODEL: ${EXTRACTION_MODEL:-claude-haiku-4-5-20251001}
   IMPACT_MODEL: ${IMPACT_MODEL:-claude-haiku-4-5-20251001}
-  SIGNALS_MODEL: ${SIGNALS_MODEL:-claude-haiku-4-5-20251001}
+  SIGNALS_MODEL: ${SIGNALS_MODEL:-gemini-3.5-flash}
+  DOSSIER_MODEL: ${DOSSIER_MODEL:-claude-opus-4-8}
   RELEVANCE_THRESHOLD: ${RELEVANCE_THRESHOLD:-0.35}
+  # LLM routing: claude-* -> Vertex (AnthropicVertex) unless LLM_PROVIDER=anthropic;
+  # gemini-* -> Vertex (google-genai). Auth via the VM service-account ADC.
+  LLM_PROVIDER: ${LLM_PROVIDER:-vertex}
+  VERTEX_PROJECT: ${VERTEX_PROJECT:-bharat-terminal}
+  VERTEX_CLAUDE_REGION: ${VERTEX_CLAUDE_REGION:-us-east5}
+  VERTEX_GEMINI_REGION: ${VERTEX_GEMINI_REGION:-us-central1}
 
 services:
 

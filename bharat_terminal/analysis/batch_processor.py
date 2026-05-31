@@ -16,7 +16,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import List
 
-import anthropic
+from bharat_terminal import llm
+from bharat_terminal.llm import provider_for_model
 
 from bharat_terminal.types import NewsItem, ImpactReport, CompanyImpact, TradeSignal
 from bharat_terminal.analysis.stages.stage1_relevance import classify_relevance
@@ -126,13 +127,12 @@ def _build_prompt(items: List[NewsItem]) -> str:
 
 
 async def _call_batch_llm(items: List[NewsItem]) -> list:
-    """Single Claude call for N articles. Returns raw 'results' list or []."""
-    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    """Single LLM call for N articles. Returns raw 'results' list or []."""
     llm_logger = get_llm_logger()
     t0 = time.time()
 
     try:
-        response = await client.messages.create(
+        response = await llm.acomplete(
             model=LLM_MODEL,
             max_tokens=4096,
             tools=[_BATCH_TOOL],
