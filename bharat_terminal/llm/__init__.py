@@ -21,6 +21,8 @@ from bharat_terminal.llm.wrapper import (
     complete,
     acomplete,
     provider_for_model,
+    assistant_content,
+    grounded_search,
 )
 
 __all__ = [
@@ -30,4 +32,6 @@ __all__ = [
     "complete",
     "acomplete",
     "provider_for_model",
+    "assistant_content",
+    "grounded_search",
 ]

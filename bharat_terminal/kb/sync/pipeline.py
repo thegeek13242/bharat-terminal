@@ -492,6 +492,15 @@ async def sync_financials(
         log_id = await start_sync_log(session, "financials", "nse_xbrl")
         await session.commit()
 
+        # Initialise progress counters BEFORE the try so the except handler can
+        # always close the sync_log row. If a failure happens early (e.g.
+        # _resolve_symbols or create_nse_client raising on an NSE 403), these
+        # would otherwise be unbound and the handler would itself raise
+        # UnboundLocalError — leaving the row stuck in 'running' forever.
+        total_parsed = 0
+        total_failed = 0
+        last_symbol = None
+
         try:
             # Resolve resume point
             resume_after = None

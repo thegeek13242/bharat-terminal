@@ -16,14 +16,14 @@ x-common-env: &common-env
   EXTRACTION_MODEL: ${EXTRACTION_MODEL:-claude-haiku-4-5-20251001}
   IMPACT_MODEL: ${IMPACT_MODEL:-claude-haiku-4-5-20251001}
   SIGNALS_MODEL: ${SIGNALS_MODEL:-gemini-3.5-flash}
-  DOSSIER_MODEL: ${DOSSIER_MODEL:-claude-opus-4-8}
+  DOSSIER_MODEL: ${DOSSIER_MODEL:-gemini-3.1-pro-preview}
   RELEVANCE_THRESHOLD: ${RELEVANCE_THRESHOLD:-0.35}
   # LLM routing: claude-* -> Vertex (AnthropicVertex) unless LLM_PROVIDER=anthropic;
   # gemini-* -> Vertex (google-genai). Auth via the VM service-account ADC.
   LLM_PROVIDER: ${LLM_PROVIDER:-vertex}
   VERTEX_PROJECT: ${VERTEX_PROJECT:-bharat-terminal}
-  VERTEX_CLAUDE_REGION: ${VERTEX_CLAUDE_REGION:-us-east5}
-  VERTEX_GEMINI_REGION: ${VERTEX_GEMINI_REGION:-us-central1}
+  VERTEX_CLAUDE_REGION: ${VERTEX_CLAUDE_REGION:-global}
+  VERTEX_GEMINI_REGION: ${VERTEX_GEMINI_REGION:-global}
 
 services:
 
@@ -364,6 +364,27 @@ services:
       <<: *common-env
     profiles: ["research"]                    # opt-in; never auto-starts
     restart: "no"
+    logging: *default-logging
+
+  mcp-server:
+    # Streamable-HTTP MCP server exposing NSE-sourced grounding data
+    # (get_financials, get_price_returns) to any MCP-capable agent. Shares the
+    # bharat_terminal.grounding query layer with the in-process dossier tools.
+    #   docker compose --profile mcp up -d mcp-server
+    build:
+      context: .
+      dockerfile: docker/mcp/Dockerfile
+    container_name: bharat-mcp
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: [".env"]
+    environment:
+      <<: *common-env
+    ports:
+      - "8002:8002"
+    profiles: ["mcp"]                          # opt-in; new prod network surface
+    restart: unless-stopped
     logging: *default-logging
 
   ingestion-worker:

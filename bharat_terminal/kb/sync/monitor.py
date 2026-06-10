@@ -306,6 +306,36 @@ class Monitor:
             except Exception as e:
                 logger.error(f"[participant_oi] Failed: {e}")
 
+    # ── Weekly shareholding / corporate-actions / ownership sweep ──────────
+
+    async def weekly_shareholding_sweep(self):
+        """Refresh NSE shareholding patterns, corporate actions and ownership
+        edges for the research universe (Saturday 3:00 AM IST, after the
+        financials sweep). Shareholding is quarterly and corp-actions change
+        slowly, so weekly cadence is ample."""
+        from bharat_terminal.kb.sync import (
+            nse_shareholding_sync,
+            nse_corporate_actions_sync,
+            nse_ownership_sync,
+        )
+        from bharat_terminal.research.universe import RESEARCH_UNIVERSE
+
+        while not self._shutdown.is_set():
+            target = self._next_occurrence(hour=3, minute=0, weekday=5)  # Saturday
+            logger.info(f"[shp_sweep] Next run at {target.isoformat()}")
+            if not await self._sleep_until(target):
+                break
+
+            symbols = sorted(RESEARCH_UNIVERSE)
+            try:
+                logger.info(f"[shp_sweep] Starting NSE shareholding/CA/ownership "
+                            f"sweep ({len(symbols)} symbols)")
+                logger.info(f"[shp_sweep] shareholding: {await nse_shareholding_sync.run(symbols)}")
+                logger.info(f"[shp_sweep] corporate_actions: {await nse_corporate_actions_sync.run(symbols)}")
+                logger.info(f"[shp_sweep] ownership: {await nse_ownership_sync.run(symbols)}")
+            except Exception as e:
+                logger.error(f"[shp_sweep] Failed: {e}")
+
     # ── Main ───────────────────────────────────────────────────────────────
 
     async def run(self):
@@ -338,6 +368,7 @@ class Monitor:
             asyncio.create_task(self.daily_price_sync(),       name="price_sync"),
             asyncio.create_task(self.daily_participant_oi(),   name="participant_oi"),
             asyncio.create_task(self.weekly_sweep(),           name="weekly_sweep"),
+            asyncio.create_task(self.weekly_shareholding_sweep(), name="shp_sweep"),
         ]
 
         await self._shutdown.wait()

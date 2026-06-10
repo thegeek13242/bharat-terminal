@@ -181,8 +181,15 @@ async def _call_batch_llm(items: List[NewsItem]) -> list:
         )
         llm_logger.log(record)
         logger.error(f"Batch LLM call failed: {e}")
+        # Re-raise so the caller can fail loudly instead of silently writing
+        # relevant-but-empty reports that are indistinguishable from "analysed,
+        # nothing found". A *successful* call returning an empty results array is
+        # legitimate and handled by the normal return above.
+        raise
 
-    return []
+    # tool_choice forces the batch tool, so a missing tool_use block is a
+    # malformed/failed response — surface it rather than returning [].
+    raise RuntimeError("Batch LLM response had no batch_analyze_news tool_use block")
 
 
 def _make_irrelevant_report(item: NewsItem, latency_ms: float) -> ImpactReport:
@@ -229,8 +236,23 @@ async def process_batch(items: List[NewsItem]) -> List[ImpactReport]:
         f"Batch: {len(relevant_items)}/{len(items)} relevant — calling LLM once"
     )
 
-    # Stage 2+3+5 fused: single LLM call
-    llm_results = await _call_batch_llm(relevant_items)
+    # Stage 2+3+5 fused: single LLM call.
+    # If the LLM is unavailable (over-limit/quota/network), DO NOT fabricate
+    # relevant-but-empty reports — those look "analysed, nothing found" and are
+    # indistinguishable from a real null result (the project's characteristic
+    # failure mode). Instead drop the relevant items unpublished and log loudly
+    # so the gap is visible and the items can be reprocessed.
+    try:
+        llm_results = await _call_batch_llm(relevant_items)
+    except Exception as e:
+        logger.error(
+            f"[BATCH] LLM unavailable — NOT publishing {len(relevant_indices)} "
+            f"relevant items as empty stubs. Dropped news_ids="
+            f"{[items[i].id for i in relevant_indices]} | cause: {e}"
+        )
+        for i in relevant_indices:
+            reports[i] = None
+        return reports  # type: ignore[return-value]
 
     # Index by article_index for quick lookup
     llm_by_idx = {r["article_index"]: r for r in llm_results}

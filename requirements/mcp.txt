@@ -1,0 +1,6 @@
+# MCP server exposing NSE-sourced grounding data (financials + prices).
+mcp>=1.2,<2
+sqlalchemy>=2.0,<3
+asyncpg>=0.29,<1
+pgvector>=0.2,<1
+pydantic>=2.6,<3

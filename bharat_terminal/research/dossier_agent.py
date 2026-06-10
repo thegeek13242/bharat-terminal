@@ -33,7 +33,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 import httpx
-from bharat_terminal import llm
+from bharat_terminal import grounding, llm
 from bharat_terminal.llm import provider_for_model
 
 from bharat_terminal.research import bse_xbrl, db
@@ -41,8 +41,12 @@ from bharat_terminal.research import bse_xbrl, db
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-DOSSIER_MODEL = os.getenv("DOSSIER_MODEL", "claude-sonnet-4-6")
+DOSSIER_MODEL = os.getenv("DOSSIER_MODEL", "gemini-3.1-pro-preview")
 DOSSIER_MAX_TURNS = int(os.getenv("DOSSIER_MAX_TURNS", "20"))
+# Gemini sometimes returns a text-only "thinking" turn with no tool call. Rather
+# than treat that as terminal, nudge the agent to continue — up to this many
+# times before giving up (bounds wasted cost).
+DOSSIER_MAX_NUDGES = int(os.getenv("DOSSIER_MAX_NUDGES", "3"))
 ENABLE_WEB_SEARCH = os.getenv("RESEARCH_ENABLE_WEB_SEARCH", "1") == "1"
 
 
@@ -126,6 +130,107 @@ TOOL_LIST_TRIGGERS = {
         "exposure to (even if beta is small)."
     ),
     "input_schema": {"type": "object", "properties": {}},
+}
+
+TOOL_GET_FINANCIALS = {
+    "name": "get_financials",
+    "description": (
+        "Authoritative quarterly financials straight from our NSE-sourced "
+        "financial_results table (current through the latest reported quarter). "
+        "Returns the full cost structure per quarter — revenue, cost of "
+        "materials, employee/finance/depreciation costs, total expenses, "
+        "EBITDA + margin, PAT, EPS, debt/equity, interest coverage, segment "
+        "data. This is parsed from NSE filings into our own database and is "
+        "AUTHORITATIVE — use it for every reported financial figure and cite it "
+        "via the returned `provenance` (source NSE_DB, period_end, nse_filing_id). "
+        "Do NOT call web_search or fetch_bse_xbrl_text to re-source these numbers."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "symbol": {"type": "string"},
+            "periods": {"type": "integer", "minimum": 1, "maximum": 24, "default": 8,
+                         "description": "Number of most-recent quarters, newest first."},
+            "consolidated": {"type": "boolean", "default": True,
+                              "description": "Prefer consolidated statements (falls back if unavailable)."},
+        },
+        "required": ["symbol"],
+    },
+}
+
+TOOL_GET_PRICE_RETURNS = {
+    "name": "get_price_returns",
+    "description": (
+        "Trailing price returns, annualized volatility and 1y max drawdown for "
+        "the symbol, computed from our NSE daily price_points (current to the "
+        "last trading day). Use to ground market-risk / momentum context. No "
+        "index beta is available (we hold no index series)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "symbol": {"type": "string"},
+            "windows": {"type": "array", "items": {"type": "integer"},
+                         "description": "Calendar-day lookback windows, e.g. [30,90,180,365]."},
+        },
+        "required": ["symbol"],
+    },
+}
+
+TOOL_GET_SHAREHOLDING = {
+    "name": "get_shareholding",
+    "description": (
+        "Quarterly shareholding pattern from our database (parsed from the "
+        "authoritative NSE shareholding XBRL): promoter %, FII %, DII %, public %, "
+        "promoter pledge %, total shareholder count — newest first. AUTHORITATIVE; "
+        "use this for ANY holding figure and cite source NSE_DB — do NOT web_search "
+        "for promoter/FII/DII holdings. A null promoter_pct means the company has "
+        "no promoter (e.g. HDFCBANK, ITC), not missing data."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "symbol": {"type": "string"},
+            "quarters": {"type": "integer", "minimum": 1, "maximum": 12, "default": 4},
+        },
+        "required": ["symbol"],
+    },
+}
+
+TOOL_GET_CORPORATE_ACTIONS = {
+    "name": "get_corporate_actions",
+    "description": (
+        "Recent corporate actions from our database (NSE-sourced): dividends "
+        "(with ₹/share value), bonuses, splits, buybacks, rights, restructurings — "
+        "newest ex_date first. AUTHORITATIVE; use for dividend/buyback/bonus "
+        "history and cite source NSE_DB — do NOT web_search for these. Optional "
+        "action_type filter (DIVIDEND/BUYBACK/BONUS/SPLIT/RIGHTS/RESTRUCTURE)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "symbol": {"type": "string"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+            "action_type": {"type": "string"},
+        },
+        "required": ["symbol"],
+    },
+}
+
+TOOL_WEB_SEARCH = {
+    "name": "web_search",
+    "description": (
+        "Google-Search-grounded web lookup. Use ONLY to fill gaps our own data "
+        "cannot — peer market shares, customer/supplier concentration, broker "
+        "targets, qualitative news. Returns an answer plus source URLs to cite. "
+        "Always try get_kb_company_context / get_financials / get_price_returns "
+        "FIRST; web_search is the fallback, not the default."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+    },
 }
 
 
@@ -393,13 +498,20 @@ TOOL_SUBMIT_DOSSIER = {
 def _build_tools() -> List[Dict[str, Any]]:
     tools: List[Dict[str, Any]] = [
         TOOL_GET_KB_CONTEXT,
+        TOOL_GET_FINANCIALS,
+        TOOL_GET_PRICE_RETURNS,
+        TOOL_GET_SHAREHOLDING,
+        TOOL_GET_CORPORATE_ACTIONS,
         TOOL_FETCH_BSE_FILINGS,
         TOOL_FETCH_BSE_XBRL_TEXT,
         TOOL_LIST_TRIGGERS,
         TOOL_SUBMIT_DOSSIER,
     ]
     if ENABLE_WEB_SEARCH:
-        tools.append({"type": "web_search_20250305", "name": "web_search"})
+        # Provider-agnostic web search: a normal function tool whose handler runs
+        # a Google-Search-grounded Gemini call (see _execute_tool). Works on both
+        # Gemini and Claude, unlike the old Anthropic server-side web_search tool.
+        tools.append(TOOL_WEB_SEARCH)
     return tools
 
 
@@ -411,22 +523,38 @@ def _build_system_prompt(refresh_kind: str) -> str:
         "is consumed by an automated trading-signal pipeline that needs to "
         "answer 'who is exposed to event X' in sub-100ms when news breaks.\n\n"
 
-        "WORKFLOW:\n"
-        "1. Call get_kb_company_context FIRST to see our pre-parsed financials.\n"
-        "2. Call list_triggers to see the catalog of macro/commodity variables.\n"
-        "3. Call fetch_bse_filings to discover the most recent annual report + "
-        "quarterly results.\n"
-        "4. Call fetch_bse_xbrl_text on key filings (latest AR + last 2 quarters) "
-        "to extract segment %, cost structure, debt mix, mgmt commentary, risk "
-        "factors. The XBRL text includes raw financial facts AND prose sections.\n"
-        "5. Use web_search to fill gaps: peer market shares, customer concentration "
-        "for B2B firms, supplier disclosures, broker target prices for cross-check.\n"
-        "6. End with EXACTLY ONE call to submit_dossier containing the full "
+        "WORKFLOW (ground in OUR NSE data before reaching for the web):\n"
+        "1. Call get_kb_company_context FIRST for the company profile.\n"
+        "2. Call get_financials for the authoritative quarterly cost structure "
+        "(revenue, material/employee/finance/depreciation costs, EBITDA margin, "
+        "PAT, EPS, debt/equity) straight from NSE filings — use these numbers "
+        "for the financial snapshot and to reason about input-cost vs "
+        "output-price sensitivities.\n"
+        "3. Call get_price_returns for trailing returns, volatility and drawdown.\n"
+        "4. Call get_shareholding for promoter / FII / DII / public % + pledge "
+        "(authoritative, from NSE) — use these for the holding figures.\n"
+        "5. Call get_corporate_actions for dividend / buyback / bonus / split "
+        "history (authoritative, from NSE).\n"
+        "6. Call list_triggers to see the catalog of macro/commodity variables.\n"
+        "7. Optionally call fetch_bse_filings / fetch_bse_xbrl_text for segment "
+        "detail, mgmt commentary and risk factors not in our parsed financials. "
+        "NEVER use these (or web_search) to re-source a REPORTED financial figure "
+        "that get_financials already returns — that data is in our database.\n"
+        "8. Use web_search ONLY to fill remaining gaps our data cannot cover: "
+        "peer market shares, customer/supplier concentration, broker targets, "
+        "forward guidance. Our DB already has financials, prices, SHAREHOLDING "
+        "(promoter/FII/DII), and CORPORATE ACTIONS (dividends/buybacks) — do NOT "
+        "web_search for any of those. Cite web source URLs it returns.\n"
+        "9. End with EXACTLY ONE call to submit_dossier containing the full "
         "structured payload.\n\n"
 
         "QUALITY RULES (non-negotiable):\n"
-        "• EVERY numeric claim — segment %, debt %, beta, holding % — must have "
-        "  a corresponding entry in `citations` with a real URL. No exceptions.\n"
+        "• EVERY numeric claim must have a `citations` entry. For figures from "
+        "  OUR DATABASE (get_financials, get_price_returns, get_kb_company_context) "
+        "  set the citation source to \"NSE_DB\" with the period_end + nse_filing_id "
+        "  from the tool's `provenance` — do NOT attach an external URL and do NOT "
+        "  re-fetch it from BSE/web; our DB is authoritative. Only figures genuinely "
+        "  sourced from the web need a real external URL.\n"
         "• DO NOT INVENT numbers. If a figure isn't disclosed, omit it and let "
         "  the field be null. Setting `data_quality` below 0.7 is acceptable.\n"
         "• Sensitivities: one row per (trigger, channel). Multiple channels per "
@@ -475,6 +603,34 @@ async def _execute_tool(name: str, args: Dict[str, Any]) -> Any:
     if name == "get_kb_company_context":
         ctx = await db.get_company_context(args["symbol"])
         return ctx or {"error": f"No KB record for {args['symbol']}"}
+
+    if name == "get_financials":
+        return await grounding.get_financials(
+            args["symbol"],
+            periods=int(args.get("periods", 8)),
+            consolidated=args.get("consolidated", True),
+        )
+
+    if name == "get_price_returns":
+        windows = args.get("windows") or [30, 90, 180, 365]
+        return await grounding.get_price_returns(
+            args["symbol"], windows=[int(w) for w in windows]
+        )
+
+    if name == "get_shareholding":
+        return await grounding.get_shareholding(
+            args["symbol"], quarters=int(args.get("quarters", 4))
+        )
+
+    if name == "get_corporate_actions":
+        return await grounding.get_corporate_actions(
+            args["symbol"],
+            limit=int(args.get("limit", 20)),
+            action_type=args.get("action_type"),
+        )
+
+    if name == "web_search":
+        return await llm.grounded_search(args["query"])
 
     if name == "list_triggers":
         # Pull from DB so the agent sees exactly what's in the triggers table.
@@ -594,8 +750,9 @@ async def research_company(
 
     # The LLM wrapper selects the provider from DOSSIER_MODEL and handles auth
     # (Vertex ADC for claude-*/gemini-*; console key for the legacy path). The
-    # multi-turn tool loop below requires Claude (Anthropic block round-trips);
-    # DOSSIER_MODEL should be a claude-* id.
+    # multi-turn tool loop below is provider-agnostic: it re-encodes each model
+    # turn via llm.assistant_content() and feeds Anthropic-style tool_result
+    # blocks, which the wrapper translates to Gemini function_response parts.
     tools = _build_tools()
     system = _build_system_prompt(refresh_kind)
 
@@ -606,6 +763,7 @@ async def research_company(
 
     submitted: Optional[Dict[str, Any]] = None
     tokens_in = tokens_out = 0
+    nudges = 0
 
     for turn in range(DOSSIER_MAX_TURNS):
         try:
@@ -635,10 +793,31 @@ async def research_company(
             break
 
         if not tool_uses:
-            logger.warning(
-                f"[DOSSIER] {symbol} ended without submit_dossier (turn={turn})"
+            # Text-only turn (no tool call). This is usually Gemini "thinking out
+            # loud", not a real finish — nudge it to continue rather than ending
+            # the run before submit_dossier. Bounded by DOSSIER_MAX_NUDGES.
+            if nudges >= DOSSIER_MAX_NUDGES:
+                logger.warning(
+                    f"[DOSSIER] {symbol} no tool call after {nudges} nudges "
+                    f"(turn={turn}) — giving up"
+                )
+                break
+            nudges += 1
+            logger.info(
+                f"[DOSSIER] {symbol} text-only turn={turn}; nudging "
+                f"({nudges}/{DOSSIER_MAX_NUDGES})"
             )
-            break
+            # Replay the model's turn (preserves any Gemini thought_signature);
+            # fall back to a placeholder so the assistant turn is never empty.
+            asst = llm.assistant_content(resp) or [{"type": "text", "text": "(continuing)"}]
+            messages.append({"role": "assistant", "content": asst})
+            messages.append({"role": "user", "content": (
+                "Continue your research using the tools. When you have gathered "
+                "enough, you MUST finish by calling the submit_dossier tool exactly "
+                "once with the full structured dossier. Do not reply with prose — "
+                "make a tool call now."
+            )})
+            continue
 
         # Execute tools and feed back
         tool_results = []
@@ -654,9 +833,9 @@ async def research_company(
                 "content": json.dumps(result)[:50000],  # cap per-result size
             })
 
-        # Re-submit the assistant turn using the provider-native content blocks
-        # (resp.raw is the underlying Anthropic response) so tool_use ids line up.
-        messages.append({"role": "assistant", "content": resp.raw.content})
+        # Re-submit the assistant turn via normalized blocks (provider-agnostic;
+        # preserves tool_use ids so the tool_result blocks below line up).
+        messages.append({"role": "assistant", "content": llm.assistant_content(resp)})
         messages.append({"role": "user", "content": tool_results})
 
     if not submitted:

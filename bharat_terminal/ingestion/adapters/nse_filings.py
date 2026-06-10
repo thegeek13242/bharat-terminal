@@ -84,12 +84,25 @@ class NSEFilingsAdapter(BaseAdapter):
                             continue
 
                         ts_str = item.get(ts_field, "")
+                        now = datetime.now(timezone.utc)
                         try:
                             ts = datetime.strptime(ts_str.strip(), ts_fmt).replace(
                                 tzinfo=timezone.utc
                             )
                         except Exception:
-                            ts = datetime.now(timezone.utc)
+                            ts = now
+
+                        # BOARD_MEETING uses bm_date — the *scheduled* meeting date,
+                        # which is in the future — as the only date field. A news
+                        # item's timestamp_utc must be when it was published, never
+                        # the future, so clamp forward-dated timestamps to ingestion
+                        # time (the announcement was seen now).
+                        if ts > now:
+                            logger.debug(
+                                f"[NSE] Clamping future timestamp {ts.isoformat()} "
+                                f"-> now for {category} {symbol}"
+                            )
+                            ts = now
 
                         ingest_latency = (time.time() - ingest_start) * 1000
 

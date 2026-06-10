@@ -545,8 +545,13 @@ class AngelOneMCXAdapter:
     def _on_error(self, wsapp, error) -> None:  # noqa: ARG002
         logger.error(f"[{self.source_name}] WS error: {error}")
 
-    def _on_close(self, wsapp) -> None:  # noqa: ARG002
-        logger.warning(f"[{self.source_name}] WS closed")
+    def _on_close(self, wsapp, close_status_code=None, close_msg=None) -> None:  # noqa: ARG002
+        # websocket-client invokes on_close with (wsapp, close_status_code,
+        # close_msg); accept the extra positional args to avoid a TypeError
+        # ("_on_close() takes 2 positional arguments but 4 were given").
+        logger.warning(
+            f"[{self.source_name}] WS closed (code={close_status_code}, msg={close_msg})"
+        )
 
     # ── Tick parsing + publish ───────────────────────────────────────────
 
