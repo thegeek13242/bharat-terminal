@@ -13,9 +13,9 @@ x-common-env: &common-env
   REDIS_URL: redis://redis:6379/0
   KB_SERVICE_URL: http://kb-service:8001
   PYTHONUNBUFFERED: "1"
-  EXTRACTION_MODEL: ${EXTRACTION_MODEL:-claude-haiku-4-5-20251001}
-  IMPACT_MODEL: ${IMPACT_MODEL:-claude-haiku-4-5-20251001}
-  SIGNALS_MODEL: ${SIGNALS_MODEL:-gemini-3.5-flash}
+  EXTRACTION_MODEL: ${EXTRACTION_MODEL:-gemini-2.5-flash}
+  IMPACT_MODEL: ${IMPACT_MODEL:-gemini-2.5-flash}
+  SIGNALS_MODEL: ${SIGNALS_MODEL:-gemini-3.1-pro-preview}
   DOSSIER_MODEL: ${DOSSIER_MODEL:-gemini-3.1-pro-preview}
   RELEVANCE_THRESHOLD: ${RELEVANCE_THRESHOLD:-0.35}
   # LLM routing: claude-* -> Vertex (AnthropicVertex) unless LLM_PROVIDER=anthropic;

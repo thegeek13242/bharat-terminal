@@ -18,7 +18,7 @@ from bharat_terminal.analysis.llm_logger import get_llm_logger, LLMCallRecord, c
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-LLM_MODEL = os.getenv("IMPACT_MODEL", "claude-haiku-4-5-20251001")
+LLM_MODEL = os.getenv("IMPACT_MODEL", "gemini-2.5-flash")
 KNOWLEDGE_BASE_URL = os.getenv("KNOWLEDGE_BASE_URL", "http://kb-service:8001")
 
 IMPACT_TOOL = {

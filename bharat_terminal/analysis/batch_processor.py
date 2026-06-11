@@ -28,7 +28,7 @@ from bharat_terminal.analysis.stages.stage2_extraction import BSE_SECTORS
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-LLM_MODEL = os.getenv("EXTRACTION_MODEL", "claude-haiku-4-5-20251001")
+LLM_MODEL = os.getenv("EXTRACTION_MODEL", "gemini-2.5-flash")
 
 # Batch limits
 BATCH_MAX_SIZE  = int(os.getenv("BATCH_MAX_SIZE",  "20"))   # articles per call

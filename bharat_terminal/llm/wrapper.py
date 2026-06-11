@@ -51,6 +51,25 @@ VERTEX_GEMINI_REGION = os.getenv("VERTEX_GEMINI_REGION", "global")
 # Gemini is fine here; the dossier model stays whatever DOSSIER_MODEL says.
 GROUNDING_MODEL = os.getenv("GROUNDING_MODEL", "gemini-3.5-flash")
 
+# Gemini emits structured function calls less token-efficiently than Claude — a
+# complex tool schema can truncate to MALFORMED_FUNCTION_CALL at small budgets
+# (e.g. Claude-Haiku fit extraction in 1024 tokens, flash-lite needs ~4k). Floor
+# the output budget when tools are present so forced tool calls aren't truncated.
+GEMINI_TOOL_MIN_OUTPUT_TOKENS = int(os.getenv("GEMINI_TOOL_MIN_OUTPUT_TOKENS", "4096"))
+
+# Smaller Gemini models (e.g. flash-lite) intermittently emit a
+# MALFORMED_FUNCTION_CALL for complex tool schemas — retry, since it's flaky not
+# deterministic (flash-lite ~75% valid → ~98% with 3 attempts).
+GEMINI_TOOL_MAX_ATTEMPTS = int(os.getenv("GEMINI_TOOL_MAX_ATTEMPTS", "3"))
+
+
+def _is_malformed_toolcall(resp) -> bool:
+    try:
+        fr = resp.candidates[0].finish_reason
+        return getattr(fr, "name", str(fr)) == "MALFORMED_FUNCTION_CALL"
+    except (AttributeError, IndexError, TypeError):
+        return False
+
 
 def provider_for_model(model: str) -> str:
     """Return the provider key for a model id."""
@@ -248,7 +267,10 @@ def _gemini_translate(system, messages, tools, tool_choice, max_tokens, temperat
         if parts:
             contents.append(types.Content(role=role, parts=parts))
 
-    cfg: Dict[str, Any] = {"max_output_tokens": max_tokens}
+    # Floor the output budget for tool calls so a complex schema isn't truncated
+    # into a MALFORMED_FUNCTION_CALL (Gemini is less token-efficient than Claude).
+    out_tokens = max(max_tokens, GEMINI_TOOL_MIN_OUTPUT_TOKENS) if tools else max_tokens
+    cfg: Dict[str, Any] = {"max_output_tokens": out_tokens}
     if temperature is not None:
         cfg["temperature"] = temperature
     if system is not None:
@@ -361,7 +383,12 @@ def complete(
     # the Client be GC'd mid-call in google-genai 1.x, raising
     # "Cannot send a request, as the client has been closed".
     client = _gemini_client()
-    resp = client.models.generate_content(model=model, contents=contents, config=cfg)
+    attempts = GEMINI_TOOL_MAX_ATTEMPTS if tools else 1
+    for attempt in range(attempts):
+        resp = client.models.generate_content(model=model, contents=contents, config=cfg)
+        if not (tools and _is_malformed_toolcall(resp)) or attempt == attempts - 1:
+            break
+        logger.info("gemini MALFORMED_FUNCTION_CALL; retry %d/%d", attempt + 1, attempts - 1)
     return _wrap_gemini_response(resp, model)
 
 
@@ -384,8 +411,13 @@ async def acomplete(
     # Retain the client in a local (see note in complete()): an inline
     # `_gemini_client().aio...` lets the Client be GC'd/closed mid-call.
     client = _gemini_client()
-    resp = await client.aio.models.generate_content(
-        model=model, contents=contents, config=cfg)
+    attempts = GEMINI_TOOL_MAX_ATTEMPTS if tools else 1
+    for attempt in range(attempts):
+        resp = await client.aio.models.generate_content(
+            model=model, contents=contents, config=cfg)
+        if not (tools and _is_malformed_toolcall(resp)) or attempt == attempts - 1:
+            break
+        logger.info("gemini MALFORMED_FUNCTION_CALL; retry %d/%d", attempt + 1, attempts - 1)
     return _wrap_gemini_response(resp, model)
 
 

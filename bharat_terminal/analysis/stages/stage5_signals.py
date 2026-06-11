@@ -16,7 +16,7 @@ from bharat_terminal.analysis.llm_logger import get_llm_logger, LLMCallRecord, c
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-LLM_MODEL = os.getenv("SIGNALS_MODEL", "claude-haiku-4-5-20251001")
+LLM_MODEL = os.getenv("SIGNALS_MODEL", "gemini-3.1-pro-preview")
 
 SIGNAL_TOOL = {
     "name": "generate_trade_signals",

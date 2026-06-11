@@ -16,7 +16,7 @@ from bharat_terminal.analysis.llm_logger import get_llm_logger, LLMCallRecord, c
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-LLM_MODEL = os.getenv("EXTRACTION_MODEL", "claude-haiku-4-5-20251001")
+LLM_MODEL = os.getenv("EXTRACTION_MODEL", "gemini-2.5-flash")
 
 # BSE sector codes (official)
 BSE_SECTORS = [
