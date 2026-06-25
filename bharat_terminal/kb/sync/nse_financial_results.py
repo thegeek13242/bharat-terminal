@@ -135,6 +135,11 @@ SECTOR_PL_OVERRIDES: Dict[str, Dict[str, str]] = {
     },
     "general_insurance": {
         "PremiumEarned": "revenue_cr",
+        # General insurers have no Ind AS `Income` element. `OperatingIncome` is a
+        # reported total that reconciles exactly as PremiumEarned +
+        # IncomeFromInvestmentsNet + OtherIncome (verified across all GI filers),
+        # so it is the authoritative total income (policyholders' revenue account).
+        "OperatingIncome": "total_income_cr",
         "ProfitOrLossBeforeTax": "pbt_cr",
         "ProfitLossAfterTax": "pat_cr",
     },
@@ -181,6 +186,11 @@ SECTOR_FINANCIALS_MAPS: Dict[str, Dict[str, str]] = {
         "GrossPremiumsWritten": "gross_premium_written",
         "NetPremiumWritten": "net_premium_written",
         "PremiumEarned": "premium_earned",
+        # Income components (total income = premium_earned + income_from_investments
+        # + other_income; shareholders' investment income is additional company
+        # income reported in the P&L/shareholders' account).
+        "IncomeFromInvestmentsNet": "income_from_investments",
+        "ShareholdersAccountIncomeFromInvestments": "shareholders_investment_income",
         "IncurredClaims": "claims_incurred",
         "ClaimsPaid": "claims_paid",
         "NetCommission": "net_commission",
