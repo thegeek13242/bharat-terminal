@@ -24,6 +24,8 @@ from bharat_terminal.analysis.stages.stage1_relevance import classify_relevance
 from bharat_terminal.analysis.stages.stage4_propagation import propagate_impacts
 from bharat_terminal.analysis.llm_logger import get_llm_logger, LLMCallRecord, compute_cost
 from bharat_terminal.analysis.stages.stage2_extraction import BSE_SECTORS
+from bharat_terminal.analysis.signal_gates import is_derivative_headline
+from bharat_terminal.analysis.pipeline import process_news_item
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,8 @@ LLM_MODEL = os.getenv("EXTRACTION_MODEL", "gemini-2.5-flash")
 # Batch limits
 BATCH_MAX_SIZE  = int(os.getenv("BATCH_MAX_SIZE",  "20"))   # articles per call
 BATCH_WINDOW_S  = int(os.getenv("BATCH_WINDOW_S",  "300"))  # 5-min window
+# Max strong items escalated from batch triage to the full pipeline per batch.
+BATCH_ESCALATE_MAX = int(os.getenv("BATCH_ESCALATE_MAX", "5"))
 # Body truncation per article to keep prompt small
 _BODY_CHARS = 300
 
@@ -296,22 +300,12 @@ async def process_batch(items: List[NewsItem]) -> List[ImpactReport]:
 
         latency_ms = (time.time() - batch_start) * 1000
 
-        # Build trade signal if LLM suggested a directional trade
+        # Batch triage NEVER fabricates trade signals. The shallow batch call
+        # (300-char bodies, forced per-article direction enum) produced template
+        # signals with unvalidated symbols — unacceptable output. Strong items
+        # are instead escalated to the full per-item pipeline below, where real
+        # stage-5 generation + quality gates apply.
         trade_signals: List[TradeSignal] = []
-        direction = llm_r.get("trade_direction", "none")
-        if direction in ("long", "short") and all_impacts:
-            top = all_impacts[0]
-            trade_signals.append(
-                TradeSignal(
-                    symbol=top.symbol,
-                    direction=direction,
-                    instrument_type="equity",
-                    conviction=llm_r.get("conviction", "low"),
-                    reasoning=f"Batch analysis: {llm_r.get('macro_theme', '')}",
-                    stop_loss_rationale="Off-hours batch signal — use tight stop",
-                    position_size_pct_of_portfolio=1.0,
-                )
-            )
 
         reports[original_idx] = ImpactReport(
             id=str(uuid.uuid4()),
@@ -332,9 +326,36 @@ async def process_batch(items: List[NewsItem]) -> List[ImpactReport]:
         for oi, item, llm_r, di in stage4_tasks
     ])
 
+    # ── Escalation: strong batch items get the FULL per-item pipeline ──────
+    # Batch triage is for cheap classification; signals require the real
+    # stage 2→3→5 analysis with quality gates. Escalate only items where the
+    # triage saw a high-conviction directional event on a non-derivative
+    # headline, capped per batch to bound cost.
+    candidates = []
+    for original_idx, item, llm_r, direct_impacts in stage4_tasks:
+        if (
+            llm_r.get("trade_direction") in ("long", "short")
+            and llm_r.get("conviction") == "high"
+            and direct_impacts
+            and not is_derivative_headline(item.headline)
+        ):
+            candidates.append(
+                (float(llm_r.get("overall_confidence", 0.0)), original_idx, item)
+            )
+    candidates.sort(reverse=True)
+
+    for _conf, original_idx, item in candidates[:BATCH_ESCALATE_MAX]:
+        try:
+            logger.info(f"[BATCH→FULL] escalating: {item.headline[:80]!r}")
+            reports[original_idx] = await process_news_item(item)
+        except Exception as e:
+            # Keep the triage report (impacts, no signals) on escalation failure.
+            logger.warning(f"[BATCH→FULL] escalation failed for {item.id}: {e}")
+
     elapsed = (time.time() - batch_start) * 1000
     logger.info(
         f"Batch complete: {len(items)} items in {elapsed:.0f}ms "
-        f"({len(relevant_indices)} relevant)"
+        f"({len(relevant_indices)} relevant, "
+        f"{min(len(candidates), BATCH_ESCALATE_MAX)} escalated)"
     )
     return reports  # type: ignore[return-value]

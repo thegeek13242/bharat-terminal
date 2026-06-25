@@ -11,6 +11,8 @@ httpx==0.27.0
 # Pillar 2 — article body extraction + dedup
 trafilatura==1.12.2
 readability-lxml==0.8.1
+# NSE filing PDF-attachment text extraction (pure-Python, no poppler/system deps)
+pypdf==6.11.0
 redis==5.0.8
 simhash==2.1.2
 # Angel One SmartAPI — MCX commodity tick stream

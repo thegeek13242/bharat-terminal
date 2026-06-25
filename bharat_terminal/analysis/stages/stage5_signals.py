@@ -12,6 +12,9 @@ from bharat_terminal import llm
 from bharat_terminal.llm import provider_for_model
 from bharat_terminal.types import CompanyImpact, TradeSignal, NewsItem
 from bharat_terminal.analysis.llm_logger import get_llm_logger, LLMCallRecord, compute_cost
+from bharat_terminal.analysis.signal_gates import (
+    is_derivative_headline, is_stale_article, filter_signals,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +60,20 @@ def generate_signals(
     Returns list of TradeSignal objects.
     """
     llm_logger = get_llm_logger()
+
+    # Derivative content (recaps, gainers/losers, third-party recommendations,
+    # multibagger stories) describes moves that already happened or recycles
+    # someone else's call — never signal from it, and skip the LLM cost.
+    if is_derivative_headline(news_item.headline):
+        logger.info(f"[stage5] skipped derivative headline: {news_item.headline[:80]!r}")
+        return []
+
+    # Stale article: published too long before we processed it (slow feed /
+    # syndicated re-publish). The event is already priced — never signal.
+    if is_stale_article(news_item):
+        logger.info(f"[stage5] skipped stale article ({news_item.timestamp_utc}): "
+                    f"{news_item.headline[:80]!r}")
+        return []
 
     # Only generate signals for direct, material impacts
     signal_candidates = [
@@ -155,7 +172,8 @@ INSTRUCTIONS:
                 reasoning=s["reasoning"],
             ))
 
-        return signals
+        # Quality gates: canonical NSE symbol (drop unroutable), dedup window.
+        return filter_signals(signals, news_item.headline)
 
     except Exception as e:
         llm_latency = (time.time() - llm_start) * 1000

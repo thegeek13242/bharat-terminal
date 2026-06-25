@@ -17,6 +17,10 @@ logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 LLM_MODEL = os.getenv("EXTRACTION_MODEL", "gemini-2.5-flash")
+# How much of the (now PDF-enriched) filing body to feed the extractor. NSE
+# filings carry full attachment text in body; 800 chars clipped it. gemini-flash
+# is cheap, so give it the salient disclosure.
+EXTRACTION_BODY_CHARS = int(os.getenv("EXTRACTION_BODY_CHARS", "6000"))
 
 # BSE sector codes (official)
 BSE_SECTORS = [
@@ -199,7 +203,7 @@ def extract_entities(news_item: NewsItem) -> ExtractionResult:
     prompt = f"""Analyze this Indian financial news and extract structured market intelligence.
 
 Headline: {news_item.headline}
-Body: {(news_item.body or '')[:800]}
+Body: {(news_item.body or '')[:EXTRACTION_BODY_CHARS]}
 Source: {news_item.source}
 
 Extract all relevant market entities, sectors, and the macro theme."""
@@ -243,13 +247,20 @@ Extract all relevant market entities, sectors, and the macro theme."""
         if total_latency > 800:
             logger.warning(f"Stage 2 SLA breach: {total_latency:.0f}ms > 800ms for {news_item.id}")
 
-        # Combine explicit symbols from news_item with LLM-extracted ones
+        # Combine explicit symbols from news_item with LLM-extracted companies.
+        # Every candidate goes through KB resolution: validates LLM-guessed
+        # tickers and falls back to company-NAME lookup when the LLM gives no
+        # symbol (e.g. "UltraTech Cement" -> ULTRACEMCO). Unresolvable -> drop.
+        from bharat_terminal.analysis.signal_gates import resolve_symbol
         resolved_symbols = list(news_item.symbols_mentioned)
         for co in tool_result.get("named_companies", []):
+            canonical = None
             if co.get("probable_symbol"):
-                sym = co["probable_symbol"].upper().strip()
-                if sym and sym not in resolved_symbols:
-                    resolved_symbols.append(sym)
+                canonical = resolve_symbol(co["probable_symbol"])
+            if not canonical and co.get("name"):
+                canonical = resolve_symbol(co["name"])
+            if canonical and canonical not in resolved_symbols:
+                resolved_symbols.append(canonical)
 
         return ExtractionResult(
             macro_theme=tool_result.get("macro_theme", "SECTORAL"),
