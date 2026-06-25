@@ -113,9 +113,18 @@ async def get_financials(
         period: Dict[str, Any] = {
             "period_end": r.period_end.isoformat() if r.period_end else None,
             "period_type": r.period_type,
+            # Accounting taxonomy this company files under. For banking / insurance,
+            # the generic P&L columns below (cost_of_materials_cr, etc.) do not apply
+            # — their real operating lines are in `sector_financials`, and revenue_cr
+            # is interest earned (banks) / premium (insurers).
+            "taxonomy": r.taxonomy,
             "consolidated": r.consolidated,
             "audited": r.audited,
             "segment_data": r.segment_data,
+            # Sector-specific P&L lines (banks: interest_earned/interest_expended/
+            # net_interest_income/provisions; insurers: premium/claims_incurred/
+            # net_commission). NULL for general (Ind AS / NBFC / non-Ind AS) companies.
+            "sector_financials": r.sector_financials,
             # Provenance: these figures are PARSED FROM NSE FILINGS into our own
             # database — they are authoritative and need no external lookup. Cite
             # them as source NSE_DB with this period_end + nse_filing_id. The

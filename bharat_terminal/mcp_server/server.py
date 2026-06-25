@@ -35,6 +35,14 @@ async def get_financials(
     employee/finance/depreciation costs, total expenses, EBITDA + margin, PAT,
     EPS, debt/equity, interest coverage, plus segment_data. Prefer this over web
     search for any historical financial figure.
+
+    Each period carries a `taxonomy` (indas / nbfc / banking / life_insurance /
+    general_insurance / nonindas). For banking & insurance the generic cost
+    columns are not applicable — `revenue_cr` is interest earned (banks) or
+    premium (insurers), and the sector's real operating lines (interest expended,
+    net interest income, provisions; premium / claims_incurred / net_commission)
+    are in the `sector_financials` object. Read `taxonomy` first, then interpret
+    the figures accordingly.
     """
     return await grounding.get_financials(
         symbol, periods=periods, consolidated=consolidated
