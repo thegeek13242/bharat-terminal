@@ -313,6 +313,10 @@ async def _upsert_financial_result(
         "ytd_revenue_cr": ytd.get("revenue_cr"),
         "ytd_pat_cr": ytd.get("pat_cr"),
         "ytd_eps_basic": ytd.get("eps_basic"),
+        # Taxonomy + sector-specific P&L lines (banks/insurers); NULL for general
+        # Ind AS / NBFC / non-Ind AS companies whose lines map to the columns above.
+        "taxonomy": parsed.get("taxonomy"),
+        "sector_financials": parsed.get("sector_financials"),
         # Provenance
         "source": "nse_xbrl",
         "nse_filing_id": nse_filing_id,

@@ -11,6 +11,7 @@ XBRL Context Reference:
   OneI  = Current quarter-end (instant — balance sheet items)
 """
 import logging
+import re
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timezone
 from typing import List, Dict, Optional, Any
@@ -74,6 +75,156 @@ XBRL_META_TAGS = {
     "DebtEquityRatio": "debt_equity_ratio",
     "InterestServiceCoverageRatio": "interest_coverage_ratio",
 }
+
+# ── Taxonomy classification + per-sector P&L element maps ────────────────────
+#
+# NSE files financial results under DIFFERENT XBRL taxonomies per sector, and the
+# taxonomy is encoded in the XBRL *filename* (e.g. INTEGRATED_FILING_BANKING_...,
+# INTEGRATED_FILING_LI_..., legacy NBFC_INDAS_...). The default Ind AS element
+# names (`RevenueFromOperations`, `ProfitBeforeTax`, `ProfitLossForPeriod`, …) do
+# NOT exist in banking/insurance filings, which is why those rows previously had
+# NULL revenue/PBT/PAT/EPS. We classify by filename and apply a sector-specific
+# override map for the lines whose element names differ.
+#
+# Filename token → taxonomy key. Tokens observed across all stored filings.
+_TAXONOMY_TOKEN_RE = re.compile(
+    r"/(?:INTEGRATED_FILING_)?(BANKING|NBFC_INDAS|NONINDAS|GI|LI|INDAS)_\d", re.I
+)
+_TOKEN_TO_TAXONOMY = {
+    "BANKING": "banking",
+    "NBFC_INDAS": "nbfc",
+    "NONINDAS": "nonindas",
+    "GI": "general_insurance",
+    "LI": "life_insurance",
+    "INDAS": "indas",
+}
+
+
+def classify_taxonomy(filename_or_url: Optional[str]) -> str:
+    """Return the taxonomy key for an XBRL file, derived from its NSE filename.
+
+    Defaults to 'indas' (the general-company taxonomy the base map targets) when
+    the filename is missing or unrecognised — i.e. unknown filings parse exactly
+    as before. NBFC/NONINDAS resolve correctly under the base map already and have
+    no override entry; only banking + the two insurance taxonomies override.
+    """
+    if filename_or_url:
+        m = _TAXONOMY_TOKEN_RE.search(filename_or_url)
+        if m:
+            return _TOKEN_TO_TAXONOMY.get(m.group(1).upper(), "indas")
+    return "indas"
+
+
+# Per-sector P&L element overrides (monetary; element local-name → our field).
+# Element names verified against NSE's official Integrated-Filing taxonomy
+# templates (Banking / Life Insurance / General Insurance) AND against live
+# filings (values are 2026-03-31, ÷1e7 = Cr):
+#   banking           — InterestEarned (HDFCBANK 87,182), PBT 26,948, PAT 20,350
+#   life_insurance    — NetPremiumIncome (HDFCLIFE 25,998), PBT/PAT from period rows
+#   general_insurance — PremiumEarned (ICICIGI 5,790), PBT 718, PAT 547
+SECTOR_PL_OVERRIDES: Dict[str, Dict[str, str]] = {
+    "banking": {
+        "InterestEarned": "revenue_cr",
+        "ProfitLossFromOrdinaryActivitiesBeforeTax": "pbt_cr",
+        "ProfitLossFromOrdinaryActivitiesAfterTax": "pat_cr",
+    },
+    "life_insurance": {
+        "NetPremiumIncome": "revenue_cr",
+        "ProfitLossBeforeTax": "pbt_cr",
+        "ProfitLossAfterTaxAndExtraordinaryItems": "pat_cr",
+    },
+    "general_insurance": {
+        "PremiumEarned": "revenue_cr",
+        "ProfitOrLossBeforeTax": "pbt_cr",
+        "ProfitLossAfterTax": "pat_cr",
+    },
+    # Non-Ind AS (old Indian GAAP). Structurally the SAME P&L as Ind AS, but two
+    # element names differ: PAT is `ProfitLossForThePeriod` (vs Ind AS
+    # `ProfitLossForPeriod`), and legacy filings carry total income as `Revenue`
+    # (= RevenueFromOperations + OtherIncome; verified) rather than `Income`.
+    # Applied null-guarded, so when the Ind AS `Income` IS present it wins.
+    "nonindas": {
+        "ProfitLossForThePeriod": "pat_cr",
+        "Revenue": "total_income_cr",
+    },
+}
+
+# Per-sector EPS element overrides (per-share — NOT divided). Applied only when
+# the base Ind AS EPS element was absent, so a valid base EPS is never overwritten.
+SECTOR_EPS_OVERRIDES: Dict[str, Dict[str, str]] = {
+    "banking": {
+        "BasicEarningsPerShareAfterExtraordinaryItems": "eps_basic",
+        "DilutedEarningsPerShareAfterExtraordinaryItems": "eps_diluted",
+    },
+    "life_insurance": {
+        "BasicAndDilutedEPSAfterExtraordinaryItemsNetOfTaxExpenseForThePeriodNotToBeAnnualized": "eps_basic",
+    },
+    "general_insurance": {
+        "BasicAndDilutedEPSAfterExtraordinaryItemsNetOfTaxExpenseForThePeriodNotToBeAnnualized": "eps_basic",
+    },
+}
+
+# Sector-specific P&L lines that have NO generic column (a bank's interest
+# expended / provisions, an insurer's claims / commission). These are stored in
+# the `sector_financials` JSONB rather than forced into Ind AS columns. Keys are
+# normalized snake_case; values are monetary (÷ divisor → Cr). Element names
+# verified against NSE templates + live filings (HDFCBANK / ICICIGI / SBILIFE).
+SECTOR_FINANCIALS_MAPS: Dict[str, Dict[str, str]] = {
+    "banking": {
+        "InterestEarned": "interest_earned",
+        "InterestExpended": "interest_expended",
+        "OperatingExpenses": "operating_expenses",
+        "OperatingProfitBeforeProvisionAndContingencies": "operating_profit_pre_provisions",
+        "ProvisionsOtherThanTaxAndContingencies": "provisions_and_contingencies",
+    },
+    "general_insurance": {
+        "GrossPremiumsWritten": "gross_premium_written",
+        "NetPremiumWritten": "net_premium_written",
+        "PremiumEarned": "premium_earned",
+        "IncurredClaims": "claims_incurred",
+        "ClaimsPaid": "claims_paid",
+        "NetCommission": "net_commission",
+    },
+    "life_insurance": {
+        "GrossPremiumIncome": "gross_premium",
+        "NetPremiumIncome": "net_premium",
+        "BenefitsPaidNet": "benefits_paid_net",
+        "NetCommission": "net_commission",
+    },
+}
+
+
+def _extract_sector_financials(
+    facts: Dict[str, str], metadata: Dict[str, Any], taxonomy: str
+) -> Optional[Dict[str, float]]:
+    """Build the sector-specific P&L line-item dict for banking/insurance.
+
+    Returns None for taxonomies whose P&L maps to the generic columns
+    (indas / nbfc / nonindas) so those rows leave `sector_financials` NULL.
+    """
+    mapping = SECTOR_FINANCIALS_MAPS.get(taxonomy)
+    if not mapping:
+        return None
+    divisor = _rounding_divisor(metadata)
+    out: Dict[str, float] = {}
+    for xbrl_tag, key in mapping.items():
+        raw = facts.get(xbrl_tag)
+        if raw is not None:
+            try:
+                out[key] = round(float(raw) / divisor, 2)
+            except (ValueError, TypeError):
+                continue
+    # Convenience derived line for banks (net interest income).
+    if taxonomy == "banking" and "interest_earned" in out and "interest_expended" in out:
+        out["net_interest_income"] = round(out["interest_earned"] - out["interest_expended"], 2)
+    return out or None
+
+
+# Final safety net: if a top-line revenue is STILL unset after the base map and
+# any sector override (e.g. an unrecognised/future filename that defaulted to
+# 'indas'), try these sector top-line elements. Null-guarded → never overrides a
+# value already produced above.
+XBRL_REVENUE_FALLBACK_TAGS = ("InterestEarned", "NetPremiumIncome", "PremiumEarned")
 
 # Value in Crores = absolute_value / 1e7.  But XBRL values are already in INR.
 # Actually: XBRL reports in INR absolute. LevelOfRoundingUsedInFinancialStatements = "Crores"
@@ -282,7 +433,7 @@ async def download_xbrl(
 
 # ── XBRL Parsing ─────────────────────────────────────────────────────────────
 
-def parse_xbrl(xml_bytes: bytes) -> Dict[str, Any]:
+def parse_xbrl(xml_bytes: bytes, taxonomy: str = "indas") -> Dict[str, Any]:
     """
     Parse an NSE XBRL XML file and extract financial facts.
 
@@ -316,13 +467,16 @@ def parse_xbrl(xml_bytes: bytes) -> Dict[str, Any]:
     metadata = _extract_metadata(one_d)
 
     # Parse P&L for current quarter
-    quarter = _extract_financials(one_d, metadata)
+    quarter = _extract_financials(one_d, metadata, taxonomy)
 
     # Parse YTD cumulative
-    ytd = _extract_financials(four_d, metadata)
+    ytd = _extract_financials(four_d, metadata, taxonomy)
 
     # Parse segment data
     segment_data = _extract_segments(facts_by_context)
+
+    # Sector-specific P&L lines (banks/insurers) that have no generic column.
+    sector_financials = _extract_sector_financials(one_d, metadata, taxonomy)
 
     # Monetary facts are absolute INR (÷1e7 = crores), regardless of the taxonomy's
     # display `LevelOfRounding` (e.g. "Lakhs"), which we intentionally ignore. The XBRL
@@ -336,6 +490,8 @@ def parse_xbrl(xml_bytes: bytes) -> Dict[str, Any]:
         "metadata": metadata,
         "segment_data": segment_data,
         "raw_facts": raw_facts,
+        "taxonomy": taxonomy,
+        "sector_financials": sector_financials,
     }
 
 
@@ -366,21 +522,27 @@ def _extract_metadata(facts: Dict[str, str]) -> Dict[str, Any]:
     }
 
 
-def _extract_financials(facts: Dict[str, str], metadata: Dict[str, Any]) -> Dict[str, Optional[float]]:
+def _rounding_divisor(metadata: Dict[str, Any]) -> float:
+    """Divisor that converts an XBRL monetary fact to Crores.
+
+    NSE instance documents report monetary facts in absolute INR (÷1e7 = Cr); the
+    declared `LevelOfRounding` is honoured only when it is explicitly lakh/million
+    (rare), otherwise we default to absolute INR.
+    """
+    rounding = (metadata.get("rounding") or "").lower()
+    if "lakh" in rounding:
+        return 1e5
+    if "million" in rounding:
+        return 1e6
+    return INR_TO_CRORES  # "crore" or blank/unknown → absolute INR
+
+
+def _extract_financials(
+    facts: Dict[str, str], metadata: Dict[str, Any], taxonomy: str = "indas"
+) -> Dict[str, Optional[float]]:
     """Extract P&L line items from XBRL facts, converting to Crores."""
     result = {}
-
-    # Determine the divisor based on rounding level
-    rounding = metadata.get("rounding", "").lower()
-    if "lakh" in rounding:
-        divisor = 1e5
-    elif "crore" in rounding:
-        divisor = INR_TO_CRORES
-    elif "million" in rounding:
-        divisor = 1e6
-    else:
-        # Default: assume absolute INR → convert to Crores
-        divisor = INR_TO_CRORES
+    divisor = _rounding_divisor(metadata)
 
     # P&L tags → fields (these are monetary, convert to Crores)
     for xbrl_tag, field_name in XBRL_PL_TAGS.items():
@@ -390,6 +552,34 @@ def _extract_financials(facts: Dict[str, str], metadata: Dict[str, Any]) -> Dict
                 result[field_name] = round(float(raw) / divisor, 2)
             except (ValueError, TypeError):
                 result[field_name] = None
+
+    # Sector-specific P&L overrides (banking / insurance / non-Ind AS). These
+    # element names exist only in those filings, so for Ind AS / NBFC the override
+    # map is empty and this is a no-op. Null-guarded: a field is only filled from
+    # the sector element when the base map didn't already produce it (so e.g. a
+    # NONINDAS filing that DOES carry the Ind AS `Income` keeps that value).
+    # Monetary → divide by divisor.
+    for xbrl_tag, field_name in SECTOR_PL_OVERRIDES.get(taxonomy, {}).items():
+        if result.get(field_name) is not None:
+            continue
+        raw = facts.get(xbrl_tag)
+        if raw is not None:
+            try:
+                result[field_name] = round(float(raw) / divisor, 2)
+            except (ValueError, TypeError):
+                pass
+
+    # Final revenue safety net (see XBRL_REVENUE_FALLBACK_TAGS). Null-guarded, so
+    # it only fires if neither the base map nor a sector override set revenue.
+    if result.get("revenue_cr") is None:
+        for xbrl_tag in XBRL_REVENUE_FALLBACK_TAGS:
+            raw = facts.get(xbrl_tag)
+            if raw is not None:
+                try:
+                    result["revenue_cr"] = round(float(raw) / divisor, 2)
+                    break
+                except (ValueError, TypeError):
+                    continue
 
     # EPS tags → fields (these are per-share, NOT converted)
     for xbrl_tag, field_name in XBRL_EPS_TAGS.items():
@@ -407,6 +597,18 @@ def _extract_financials(facts: Dict[str, str], metadata: Dict[str, Any]) -> Dict
         result["eps_diluted"] = result["eps_diluted_continuing"]
     result.pop("eps_basic_continuing", None)
     result.pop("eps_diluted_continuing", None)
+
+    # Sector-specific EPS overrides (banking / insurance). Per-share → NOT divided.
+    # Applied only where the base Ind AS EPS element was absent, so a valid base
+    # EPS is never overwritten. No-op for Ind AS / NBFC.
+    for xbrl_tag, field_name in SECTOR_EPS_OVERRIDES.get(taxonomy, {}).items():
+        if result.get(field_name) is None:
+            raw = facts.get(xbrl_tag)
+            if raw is not None:
+                try:
+                    result[field_name] = round(float(raw), 2)
+                except (ValueError, TypeError):
+                    pass
 
     # Meta tags (face value is per-share, paid-up capital is monetary)
     for xbrl_tag, field_name in XBRL_META_TAGS.items():
@@ -524,7 +726,9 @@ async def fetch_and_parse_xbrl(
         return None
 
     try:
-        parsed = parse_xbrl(xml_bytes)
+        # The taxonomy (general Ind AS vs banking / insurance) is encoded in the
+        # XBRL filename; classify from it so the sector-specific element maps apply.
+        parsed = parse_xbrl(xml_bytes, classify_taxonomy(url))
         return parsed
     except ET.ParseError as e:
         logger.warning(f"XBRL parse error for {filing.get('symbol')}: {e}")
