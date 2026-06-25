@@ -72,3 +72,6 @@ Cargo.lock
 # Local sqlite databases
 *.db
 
+
+# DB backup dumps (operational, not source)
+exports/backup_*.csv

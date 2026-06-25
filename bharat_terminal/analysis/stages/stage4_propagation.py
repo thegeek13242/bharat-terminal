@@ -13,8 +13,10 @@ from bharat_terminal.types import CompanyImpact
 
 logger = logging.getLogger(__name__)
 
-DECAY_HOP1 = 0.6
-DECAY_HOP2 = 0.35
+DECAY_HOP1 = 0.6   # legacy fallback for weightless edges only
+DECAY_HOP2 = 0.35  # legacy fallback for weightless edges only
+# Edges weaker than this transmit too little to matter — skip (noise control).
+MIN_EDGE_WEIGHT = float(os.getenv("PROPAGATION_MIN_EDGE_WEIGHT", "0.15"))
 MAX_HOPS = 2
 KNOWLEDGE_BASE_URL = os.getenv("KNOWLEDGE_BASE_URL", "http://kb-service:8001")
 
@@ -31,9 +33,18 @@ async def fetch_company_relationships(symbol: str) -> List[dict]:
     return []
 
 
-def apply_decay(impact: CompanyImpact, hop: int) -> CompanyImpact:
-    """Apply decay factor for graph propagation."""
-    decay = DECAY_HOP1 if hop == 1 else DECAY_HOP2
+def apply_decay(impact: CompanyImpact, hop: int, weight: float | None = None) -> CompanyImpact:
+    """Apply decay for graph propagation.
+
+    Decay = the edge's calibrated weight (price-calibrated transmitted
+    co-movement, or real NSE ownership stake) when present — so a 56%
+    parent-subsidiary edge propagates far more than a 0.2 sector peer.
+    Falls back to the legacy flat constants only for weightless edges.
+    """
+    if weight is not None and weight > 0:
+        decay = max(0.1, min(0.9, float(weight)))
+    else:
+        decay = DECAY_HOP1 if hop == 1 else DECAY_HOP2
 
     # Decay the magnitude (but keep minimum at 1)
     new_magnitude = max(1, round(impact.magnitude * decay))
@@ -80,12 +91,17 @@ async def propagate_impacts(
     for impact, edges in zip(direct_impacts, hop1_results):
         if isinstance(edges, Exception) or not edges:
             continue
-        for edge in edges[:10]:  # Max 10 neighbors per company
+        # Strongest edges first; ignore weak ones entirely (noise control).
+        ranked = sorted(edges, key=lambda e: e.get("weight") or 0, reverse=True)
+        for edge in ranked[:10]:  # Max 10 neighbors per company
             neighbor_symbol = edge.get("target_symbol") or edge.get("symbol")
             if not neighbor_symbol or neighbor_symbol in all_impacts:
                 continue
+            w = edge.get("weight")
+            if w is not None and w < MIN_EDGE_WEIGHT:
+                continue
 
-            indirect = apply_decay(impact, hop=1)
+            indirect = apply_decay(impact, hop=1, weight=w)
             # Override symbol/name for the neighbor
             propagated = CompanyImpact(
                 symbol=neighbor_symbol,
@@ -96,7 +112,7 @@ async def propagate_impacts(
                 affected_line_items=indirect.affected_line_items,
                 explanation=indirect.explanation,
                 hop_distance=1,
-                decay_factor=DECAY_HOP1,
+                decay_factor=indirect.decay_factor,
             )
 
             if neighbor_symbol not in hop1_companies:
@@ -121,12 +137,18 @@ async def propagate_impacts(
         for hop1_impact, edges in zip(top_hop1, hop2_results):
             if isinstance(edges, Exception) or not edges:
                 continue
-            for edge in edges[:5]:  # Max 5 neighbors per hop-1 company
+            ranked = sorted(edges, key=lambda e: e.get("weight") or 0, reverse=True)
+            for edge in ranked[:5]:  # Max 5 neighbors per hop-1 company
                 neighbor_symbol = edge.get("target_symbol") or edge.get("symbol")
                 if not neighbor_symbol or neighbor_symbol in all_impacts:
                     continue
+                w = edge.get("weight")
+                if w is not None and w < MIN_EDGE_WEIGHT:
+                    continue
 
-                indirect = apply_decay(hop1_impact, hop=2)
+                # hop-1 magnitude is already weight-decayed, so applying this
+                # edge's weight compounds transmission naturally (w1 x w2).
+                indirect = apply_decay(hop1_impact, hop=2, weight=w)
                 propagated = CompanyImpact(
                     symbol=neighbor_symbol,
                     company_name=edge.get("target_name", neighbor_symbol),
@@ -136,7 +158,7 @@ async def propagate_impacts(
                     affected_line_items=indirect.affected_line_items,
                     explanation=indirect.explanation,
                     hop_distance=2,
-                    decay_factor=DECAY_HOP2,
+                    decay_factor=indirect.decay_factor,
                 )
                 all_impacts[neighbor_symbol] = propagated
 

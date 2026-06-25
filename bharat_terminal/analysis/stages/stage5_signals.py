@@ -7,15 +7,19 @@ import time
 import logging
 import os
 import uuid
-import anthropic
 from typing import List
+from bharat_terminal import llm
+from bharat_terminal.llm import provider_for_model
 from bharat_terminal.types import CompanyImpact, TradeSignal, NewsItem
 from bharat_terminal.analysis.llm_logger import get_llm_logger, LLMCallRecord, compute_cost
+from bharat_terminal.analysis.signal_gates import (
+    is_derivative_headline, is_stale_article, filter_signals,
+)
 
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-LLM_MODEL = os.getenv("SIGNALS_MODEL", "claude-haiku-4-5-20251001")
+LLM_MODEL = os.getenv("SIGNALS_MODEL", "gemini-3.1-pro-preview")
 
 SIGNAL_TOOL = {
     "name": "generate_trade_signals",
@@ -57,6 +61,20 @@ def generate_signals(
     """
     llm_logger = get_llm_logger()
 
+    # Derivative content (recaps, gainers/losers, third-party recommendations,
+    # multibagger stories) describes moves that already happened or recycles
+    # someone else's call — never signal from it, and skip the LLM cost.
+    if is_derivative_headline(news_item.headline):
+        logger.info(f"[stage5] skipped derivative headline: {news_item.headline[:80]!r}")
+        return []
+
+    # Stale article: published too long before we processed it (slow feed /
+    # syndicated re-publish). The event is already priced — never signal.
+    if is_stale_article(news_item):
+        logger.info(f"[stage5] skipped stale article ({news_item.timestamp_utc}): "
+                    f"{news_item.headline[:80]!r}")
+        return []
+
     # Only generate signals for direct, material impacts
     signal_candidates = [
         imp for imp in company_impacts
@@ -66,7 +84,9 @@ def generate_signals(
     if not signal_candidates:
         return []
 
-    if not ANTHROPIC_API_KEY:
+    # Mock only when the console-Anthropic backend is selected but has no key.
+    # Vertex/Gemini backends authenticate via GCP ADC, not ANTHROPIC_API_KEY.
+    if provider_for_model(LLM_MODEL) == "anthropic" and not ANTHROPIC_API_KEY:
         return [
             TradeSignal(
                 symbol=imp.symbol,
@@ -79,8 +99,6 @@ def generate_signals(
             )
             for imp in signal_candidates[:3]
         ]
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     impact_summaries = "\n".join([
         f"- {imp.symbol}: {imp.sentiment.upper()}, magnitude={imp.magnitude}/5, "
@@ -111,7 +129,7 @@ INSTRUCTIONS:
 
     llm_start = time.time()
     try:
-        response = client.messages.create(
+        response = llm.complete(
             model=LLM_MODEL,
             max_tokens=2048,
             tools=[SIGNAL_TOOL],
@@ -154,7 +172,8 @@ INSTRUCTIONS:
                 reasoning=s["reasoning"],
             ))
 
-        return signals
+        # Quality gates: canonical NSE symbol (drop unroutable), dedup window.
+        return filter_signals(signals, news_item.headline)
 
     except Exception as e:
         llm_latency = (time.time() - llm_start) * 1000

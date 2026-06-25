@@ -16,22 +16,27 @@ import uuid
 from datetime import datetime, timezone
 from typing import List
 
-import anthropic
+from bharat_terminal import llm
+from bharat_terminal.llm import provider_for_model
 
 from bharat_terminal.types import NewsItem, ImpactReport, CompanyImpact, TradeSignal
 from bharat_terminal.analysis.stages.stage1_relevance import classify_relevance
 from bharat_terminal.analysis.stages.stage4_propagation import propagate_impacts
 from bharat_terminal.analysis.llm_logger import get_llm_logger, LLMCallRecord, compute_cost
 from bharat_terminal.analysis.stages.stage2_extraction import BSE_SECTORS
+from bharat_terminal.analysis.signal_gates import is_derivative_headline
+from bharat_terminal.analysis.pipeline import process_news_item
 
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-LLM_MODEL = os.getenv("EXTRACTION_MODEL", "claude-haiku-4-5-20251001")
+LLM_MODEL = os.getenv("EXTRACTION_MODEL", "gemini-2.5-flash")
 
 # Batch limits
 BATCH_MAX_SIZE  = int(os.getenv("BATCH_MAX_SIZE",  "20"))   # articles per call
 BATCH_WINDOW_S  = int(os.getenv("BATCH_WINDOW_S",  "300"))  # 5-min window
+# Max strong items escalated from batch triage to the full pipeline per batch.
+BATCH_ESCALATE_MAX = int(os.getenv("BATCH_ESCALATE_MAX", "5"))
 # Body truncation per article to keep prompt small
 _BODY_CHARS = 300
 
@@ -126,13 +131,12 @@ def _build_prompt(items: List[NewsItem]) -> str:
 
 
 async def _call_batch_llm(items: List[NewsItem]) -> list:
-    """Single Claude call for N articles. Returns raw 'results' list or []."""
-    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    """Single LLM call for N articles. Returns raw 'results' list or []."""
     llm_logger = get_llm_logger()
     t0 = time.time()
 
     try:
-        response = await client.messages.create(
+        response = await llm.acomplete(
             model=LLM_MODEL,
             max_tokens=4096,
             tools=[_BATCH_TOOL],
@@ -181,8 +185,15 @@ async def _call_batch_llm(items: List[NewsItem]) -> list:
         )
         llm_logger.log(record)
         logger.error(f"Batch LLM call failed: {e}")
+        # Re-raise so the caller can fail loudly instead of silently writing
+        # relevant-but-empty reports that are indistinguishable from "analysed,
+        # nothing found". A *successful* call returning an empty results array is
+        # legitimate and handled by the normal return above.
+        raise
 
-    return []
+    # tool_choice forces the batch tool, so a missing tool_use block is a
+    # malformed/failed response — surface it rather than returning [].
+    raise RuntimeError("Batch LLM response had no batch_analyze_news tool_use block")
 
 
 def _make_irrelevant_report(item: NewsItem, latency_ms: float) -> ImpactReport:
@@ -229,8 +240,23 @@ async def process_batch(items: List[NewsItem]) -> List[ImpactReport]:
         f"Batch: {len(relevant_items)}/{len(items)} relevant — calling LLM once"
     )
 
-    # Stage 2+3+5 fused: single LLM call
-    llm_results = await _call_batch_llm(relevant_items)
+    # Stage 2+3+5 fused: single LLM call.
+    # If the LLM is unavailable (over-limit/quota/network), DO NOT fabricate
+    # relevant-but-empty reports — those look "analysed, nothing found" and are
+    # indistinguishable from a real null result (the project's characteristic
+    # failure mode). Instead drop the relevant items unpublished and log loudly
+    # so the gap is visible and the items can be reprocessed.
+    try:
+        llm_results = await _call_batch_llm(relevant_items)
+    except Exception as e:
+        logger.error(
+            f"[BATCH] LLM unavailable — NOT publishing {len(relevant_indices)} "
+            f"relevant items as empty stubs. Dropped news_ids="
+            f"{[items[i].id for i in relevant_indices]} | cause: {e}"
+        )
+        for i in relevant_indices:
+            reports[i] = None
+        return reports  # type: ignore[return-value]
 
     # Index by article_index for quick lookup
     llm_by_idx = {r["article_index"]: r for r in llm_results}
@@ -274,22 +300,12 @@ async def process_batch(items: List[NewsItem]) -> List[ImpactReport]:
 
         latency_ms = (time.time() - batch_start) * 1000
 
-        # Build trade signal if LLM suggested a directional trade
+        # Batch triage NEVER fabricates trade signals. The shallow batch call
+        # (300-char bodies, forced per-article direction enum) produced template
+        # signals with unvalidated symbols — unacceptable output. Strong items
+        # are instead escalated to the full per-item pipeline below, where real
+        # stage-5 generation + quality gates apply.
         trade_signals: List[TradeSignal] = []
-        direction = llm_r.get("trade_direction", "none")
-        if direction in ("long", "short") and all_impacts:
-            top = all_impacts[0]
-            trade_signals.append(
-                TradeSignal(
-                    symbol=top.symbol,
-                    direction=direction,
-                    instrument_type="equity",
-                    conviction=llm_r.get("conviction", "low"),
-                    reasoning=f"Batch analysis: {llm_r.get('macro_theme', '')}",
-                    stop_loss_rationale="Off-hours batch signal — use tight stop",
-                    position_size_pct_of_portfolio=1.0,
-                )
-            )
 
         reports[original_idx] = ImpactReport(
             id=str(uuid.uuid4()),
@@ -310,9 +326,36 @@ async def process_batch(items: List[NewsItem]) -> List[ImpactReport]:
         for oi, item, llm_r, di in stage4_tasks
     ])
 
+    # ── Escalation: strong batch items get the FULL per-item pipeline ──────
+    # Batch triage is for cheap classification; signals require the real
+    # stage 2→3→5 analysis with quality gates. Escalate only items where the
+    # triage saw a high-conviction directional event on a non-derivative
+    # headline, capped per batch to bound cost.
+    candidates = []
+    for original_idx, item, llm_r, direct_impacts in stage4_tasks:
+        if (
+            llm_r.get("trade_direction") in ("long", "short")
+            and llm_r.get("conviction") == "high"
+            and direct_impacts
+            and not is_derivative_headline(item.headline)
+        ):
+            candidates.append(
+                (float(llm_r.get("overall_confidence", 0.0)), original_idx, item)
+            )
+    candidates.sort(reverse=True)
+
+    for _conf, original_idx, item in candidates[:BATCH_ESCALATE_MAX]:
+        try:
+            logger.info(f"[BATCH→FULL] escalating: {item.headline[:80]!r}")
+            reports[original_idx] = await process_news_item(item)
+        except Exception as e:
+            # Keep the triage report (impacts, no signals) on escalation failure.
+            logger.warning(f"[BATCH→FULL] escalation failed for {item.id}: {e}")
+
     elapsed = (time.time() - batch_start) * 1000
     logger.info(
         f"Batch complete: {len(items)} items in {elapsed:.0f}ms "
-        f"({len(relevant_indices)} relevant)"
+        f"({len(relevant_indices)} relevant, "
+        f"{min(len(candidates), BATCH_ESCALATE_MAX)} escalated)"
     )
     return reports  # type: ignore[return-value]

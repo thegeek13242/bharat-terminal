@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 RESEARCH_MODEL = os.getenv(
-    "RESEARCH_MODEL", "claude-sonnet-4-6"
+    "RESEARCH_MODEL", "gemini-3.1-pro-preview"
 )
 MAX_AGENT_TURNS = int(os.getenv("RESEARCH_MAX_TURNS", "8"))
 ENABLE_WEB_SEARCH = os.getenv("RESEARCH_ENABLE_WEB_SEARCH", "1") == "1"

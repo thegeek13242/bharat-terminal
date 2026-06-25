@@ -313,6 +313,10 @@ async def _upsert_financial_result(
         "ytd_revenue_cr": ytd.get("revenue_cr"),
         "ytd_pat_cr": ytd.get("pat_cr"),
         "ytd_eps_basic": ytd.get("eps_basic"),
+        # Taxonomy + sector-specific P&L lines (banks/insurers); NULL for general
+        # Ind AS / NBFC / non-Ind AS companies whose lines map to the columns above.
+        "taxonomy": parsed.get("taxonomy"),
+        "sector_financials": parsed.get("sector_financials"),
         # Provenance
         "source": "nse_xbrl",
         "nse_filing_id": nse_filing_id,
@@ -491,6 +495,15 @@ async def sync_financials(
     async with SessionFactory() as session:
         log_id = await start_sync_log(session, "financials", "nse_xbrl")
         await session.commit()
+
+        # Initialise progress counters BEFORE the try so the except handler can
+        # always close the sync_log row. If a failure happens early (e.g.
+        # _resolve_symbols or create_nse_client raising on an NSE 403), these
+        # would otherwise be unbound and the handler would itself raise
+        # UnboundLocalError — leaving the row stuck in 'running' forever.
+        total_parsed = 0
+        total_failed = 0
+        last_symbol = None
 
         try:
             # Resolve resume point

@@ -318,6 +318,15 @@ class FinancialResult(Base):
         Integer, ForeignKey("nse_filings.id"), nullable=True
     )
     raw_xbrl_facts: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    # Accounting taxonomy this row was filed under (indas / nbfc / banking /
+    # life_insurance / general_insurance / nonindas). Tells consumers how to
+    # interpret the common columns and which sector_financials keys exist.
+    taxonomy: Mapped[Optional[str]] = mapped_column(String(30), nullable=True, index=True)
+    # Sector-specific P&L lines that have no generic column (e.g. banks'
+    # interest_expended / provisions, insurers' claims_incurred / net_commission).
+    # NULL for general (Ind AS / NBFC / non-Ind AS) companies whose P&L maps to
+    # the typed columns above. Normalized snake_case keys, values in Crores.
+    sector_financials: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

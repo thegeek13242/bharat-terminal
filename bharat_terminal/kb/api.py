@@ -17,12 +17,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sess
 from sqlalchemy import select, and_
 
 from bharat_terminal.kb.models import Company, CompanyRelationship
+from bharat_terminal.kb.company_memory import build_company_memory
 
 logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://bharat:bharat@postgres:5432/bharat_terminal")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 CACHE_TTL = 6 * 3600  # 6 hours
+MEMORY_CACHE_TTL = 15 * 60  # 15 min — memory shifts as fresh news flows
 
 app = FastAPI(title="Bharat Terminal KB API", version="1.0.0")
 app.add_middleware(
@@ -106,6 +108,33 @@ async def get_company(symbol: str):
             await redis_client.setex(cache_key, CACHE_TTL, json.dumps(data, default=str))
         except Exception as e:
             logger.warning(f"Redis write failed for {symbol}: {e}")
+
+    return data
+
+
+@app.get("/company/{symbol}/memory")
+async def get_company_memory(symbol: str):
+    """Bounded, recency-decayed event memory for a company (derived from
+    impact_reports). Used by the analysis agents for event context. 15-min cache."""
+    symbol = symbol.upper().strip()
+    cache_key = f"memory:{symbol}"
+
+    if redis_client:
+        try:
+            cached = await redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception as e:
+            logger.warning(f"Redis read failed for memory:{symbol}: {e}")
+
+    async with AsyncSessionLocal() as session:
+        data = await build_company_memory(session, symbol)
+
+    if redis_client:
+        try:
+            await redis_client.setex(cache_key, MEMORY_CACHE_TTL, json.dumps(data, default=str))
+        except Exception as e:
+            logger.warning(f"Redis write failed for memory:{symbol}: {e}")
 
     return data
 

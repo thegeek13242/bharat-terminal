@@ -8,14 +8,19 @@ import logging
 import os
 import uuid
 from typing import TypedDict, List, Tuple
-import anthropic
+from bharat_terminal import llm
+from bharat_terminal.llm import provider_for_model
 from bharat_terminal.types import NewsItem
 from bharat_terminal.analysis.llm_logger import get_llm_logger, LLMCallRecord, compute_cost
 
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-LLM_MODEL = os.getenv("EXTRACTION_MODEL", "claude-haiku-4-5-20251001")
+LLM_MODEL = os.getenv("EXTRACTION_MODEL", "gemini-2.5-flash")
+# How much of the (now PDF-enriched) filing body to feed the extractor. NSE
+# filings carry full attachment text in body; 800 chars clipped it. gemini-flash
+# is cheap, so give it the salient disclosure.
+EXTRACTION_BODY_CHARS = int(os.getenv("EXTRACTION_BODY_CHARS", "6000"))
 
 # BSE sector codes (official)
 BSE_SECTORS = [
@@ -181,7 +186,7 @@ def extract_entities(news_item: NewsItem) -> ExtractionResult:
     start_time = time.time()
     llm_logger = get_llm_logger()
 
-    if not ANTHROPIC_API_KEY:
+    if provider_for_model(LLM_MODEL) == "anthropic" and not ANTHROPIC_API_KEY:
         logger.warning("No ANTHROPIC_API_KEY — using heuristic extraction")
         sectors, macro_theme, resolved = _heuristic_extract(news_item)
         return ExtractionResult(
@@ -195,19 +200,17 @@ def extract_entities(news_item: NewsItem) -> ExtractionResult:
             resolved_symbols=resolved,
         )
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
     prompt = f"""Analyze this Indian financial news and extract structured market intelligence.
 
 Headline: {news_item.headline}
-Body: {(news_item.body or '')[:800]}
+Body: {(news_item.body or '')[:EXTRACTION_BODY_CHARS]}
 Source: {news_item.source}
 
 Extract all relevant market entities, sectors, and the macro theme."""
 
     llm_start = time.time()
     try:
-        response = client.messages.create(
+        response = llm.complete(
             model=LLM_MODEL,
             max_tokens=1024,
             tools=[EXTRACTION_TOOL],
@@ -244,13 +247,20 @@ Extract all relevant market entities, sectors, and the macro theme."""
         if total_latency > 800:
             logger.warning(f"Stage 2 SLA breach: {total_latency:.0f}ms > 800ms for {news_item.id}")
 
-        # Combine explicit symbols from news_item with LLM-extracted ones
+        # Combine explicit symbols from news_item with LLM-extracted companies.
+        # Every candidate goes through KB resolution: validates LLM-guessed
+        # tickers and falls back to company-NAME lookup when the LLM gives no
+        # symbol (e.g. "UltraTech Cement" -> ULTRACEMCO). Unresolvable -> drop.
+        from bharat_terminal.analysis.signal_gates import resolve_symbol
         resolved_symbols = list(news_item.symbols_mentioned)
         for co in tool_result.get("named_companies", []):
+            canonical = None
             if co.get("probable_symbol"):
-                sym = co["probable_symbol"].upper().strip()
-                if sym and sym not in resolved_symbols:
-                    resolved_symbols.append(sym)
+                canonical = resolve_symbol(co["probable_symbol"])
+            if not canonical and co.get("name"):
+                canonical = resolve_symbol(co["name"])
+            if canonical and canonical not in resolved_symbols:
+                resolved_symbols.append(canonical)
 
         return ExtractionResult(
             macro_theme=tool_result.get("macro_theme", "SECTORAL"),

@@ -2,8 +2,12 @@ import time
 import logging
 import json
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import AsyncIterator
+
+IST = ZoneInfo("Asia/Kolkata")
 from bharat_terminal.types import NewsItem
+from bharat_terminal.ingestion.pdf_fetch import fetch_pdf_text
 from .base import BaseAdapter
 
 logger = logging.getLogger(__name__)
@@ -84,12 +88,47 @@ class NSEFilingsAdapter(BaseAdapter):
                             continue
 
                         ts_str = item.get(ts_field, "")
+                        now = datetime.now(timezone.utc)
                         try:
+                            # NSE publishes timestamps in IST. Stamping them as
+                            # UTC made every filing look 5.5h in the future and
+                            # the clamp below then erased the real publication
+                            # time. Parse as IST, convert to UTC.
                             ts = datetime.strptime(ts_str.strip(), ts_fmt).replace(
-                                tzinfo=timezone.utc
-                            )
+                                tzinfo=IST
+                            ).astimezone(timezone.utc)
                         except Exception:
-                            ts = datetime.now(timezone.utc)
+                            ts = now
+
+                        # BOARD_MEETING uses bm_date — the *scheduled* meeting date,
+                        # which is in the future — as the only date field. A news
+                        # item's timestamp_utc must be when it was published, never
+                        # the future, so clamp forward-dated timestamps to ingestion
+                        # time (the announcement was seen now).
+                        if ts > now:
+                            logger.debug(
+                                f"[NSE] Clamping future timestamp {ts.isoformat()} "
+                                f"-> now for {category} {symbol}"
+                            )
+                            ts = now
+
+                        # The filing's real content lives in the PDF attachment
+                        # (attchmntFile); the JSON only carries a truncated
+                        # attchmntText. Fetch + extract it so analysis reads the
+                        # full filing, not a clipped headline. Fail-soft: fall
+                        # back to the truncated text / structured fields.
+                        attachment = item.get("attchmntFile")
+                        pdf_text = (
+                            await fetch_pdf_text(attachment, session)
+                            if attachment
+                            else None
+                        )
+                        body = (
+                            pdf_text
+                            or item.get("bm_desc")
+                            or item.get("details")
+                            or item.get("attchmntText")
+                        )
 
                         ingest_latency = (time.time() - ingest_start) * 1000
 
@@ -98,7 +137,7 @@ class NSEFilingsAdapter(BaseAdapter):
                             source=self.source_name,
                             timestamp_utc=ts,
                             headline=headline,
-                            body=item.get("bm_desc") or item.get("details"),
+                            body=body,
                             url=(
                                 f"https://www.nseindia.com/company-info/"
                                 f"corporate-announcements?symbol={symbol}"
