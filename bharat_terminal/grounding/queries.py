@@ -80,8 +80,13 @@ async def get_financials(
 
     All rows in `financial_results` are quarterly; trailing-twelve-month figures
     can be derived by summing the four most recent flow rows (revenue, pat, …).
-    `consolidated=True` (default) prefers consolidated statements, falling back
-    to whatever exists if the company files only standalone.
+    `consolidated=True` (default) prefers consolidated statements, but the
+    preference is applied PER QUARTER: a quarter is returned as consolidated only
+    if a consolidated filing exists for it; quarters filed standalone-only are
+    returned as standalone rather than falling back to an older consolidated
+    quarter. This guarantees the latest reported quarters are always included
+    (companies that switch to standalone-only reporting are no longer stuck on a
+    stale consolidated quarter).
     """
     symbol = (symbol or "").upper().strip()
     periods = max(1, min(int(periods), 24))
@@ -96,17 +101,31 @@ async def get_financials(
         )
 
     async with _session() as s:
-        stmt = _base()
-        if consolidated is not None:
-            stmt = stmt.where(FinancialResult.consolidated == consolidated)
-        rows = (await s.execute(stmt.limit(periods))).all()
+        # Fetch ALL quarters (both bases), newest first; choose the basis per
+        # quarter below rather than filtering globally.
+        all_rows = (await s.execute(_base())).all()
 
-        # Fall back to the other basis if the preferred one has no rows.
-        if not rows and consolidated is not None:
-            rows = (await s.execute(_base().limit(periods))).all()
-
-    if not rows:
+    if not all_rows:
         return {"error": f"No financial_results rows for {symbol}"}
+
+    # Per quarter (period_end), keep the preferred reporting basis: when
+    # `consolidated` is set, a row matching that basis replaces a non-matching one
+    # for the same quarter — but a quarter that exists in ONLY the other basis is
+    # kept as-is (no stale fallback to an older quarter). Then take the most
+    # recent `periods` quarters.
+    chosen: Dict[Any, Any] = {}
+    for r, filing_url in all_rows:
+        pe = r.period_end
+        current = chosen.get(pe)
+        if current is None:
+            chosen[pe] = (r, filing_url)
+        elif (
+            consolidated is not None
+            and r.consolidated == consolidated
+            and current[0].consolidated != consolidated
+        ):
+            chosen[pe] = (r, filing_url)
+    rows = [chosen[pe] for pe in sorted(chosen, reverse=True)[:periods]]
 
     out: List[Dict[str, Any]] = []
     for r, filing_url in rows:
@@ -141,10 +160,14 @@ async def get_financials(
             period[f] = getattr(r, f, None)
         out.append(period)
 
+    # Basis may now be mixed across the returned quarters (per-quarter selection).
+    all_cons = all(p["consolidated"] for p in out)
+    any_cons = any(p["consolidated"] for p in out)
+    basis = "consolidated" if all_cons else ("standalone" if not any_cons else "mixed")
     return {
         "symbol": symbol,
         "currency": "INR_crore",
-        "basis": "consolidated" if (consolidated and out[0]["consolidated"]) else "as_filed",
+        "basis": basis,
         "source": "NSE_DB",  # authoritative; cite our DB, never re-fetch externally
         "count": len(out),
         "periods": out,
