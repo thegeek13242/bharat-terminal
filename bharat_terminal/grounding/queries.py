@@ -17,7 +17,7 @@ import math
 import os
 import statistics
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Any, AsyncIterator, Dict, List, Optional, Sequence
 
 from sqlalchemy import select
@@ -255,6 +255,62 @@ async def get_price_returns(
         "volatility_annualized_pct": vol_annual_pct,
         "max_drawdown_1y_pct": max_drawdown_pct,
         "beta_vs_index": None,  # no index series in price_points
+    }
+
+
+async def get_forward_returns(
+    symbol: str,
+    from_date: date,
+    horizons: Sequence[int] = (1, 5, 10, 20),
+) -> Dict[str, Any]:
+    """Realized forward returns (percent) for `symbol` measured from the first
+    tradeable close on/after `from_date`, over each horizon in TRADING days.
+
+    Used by the signal-accuracy job (Feature 2). Look-ahead-safe:
+      - `entry` = first `price_points` close with date >= from_date.
+      - horizon H return = close[entry_index + H] / entry_close - 1; if there are
+        not yet H rows after entry, that horizon returns None (NOT 0) — the signal
+        is simply too recent to evaluate at that horizon.
+      - If no close exists on/after from_date at all, returns status 'no_entry'.
+    """
+    symbol = (symbol or "").upper().strip()
+
+    async with _session() as s:
+        rows = (await s.execute(
+            select(PricePoint.date, PricePoint.close)
+            .where(PricePoint.symbol == symbol)
+            .order_by(PricePoint.date.asc())
+        )).all()
+
+    series = [(r[0], float(r[1])) for r in rows if r[1] is not None]
+    if not series:
+        return {"symbol": symbol, "status": "no_price_data", "returns": {}}
+
+    # First close on/after from_date is the entry (the first tradeable price).
+    entry_idx = next((i for i, (d, _) in enumerate(series) if d >= from_date), None)
+    if entry_idx is None:
+        # from_date is after our latest price — nothing tradeable yet.
+        return {"symbol": symbol, "status": "no_entry", "returns": {}}
+
+    entry_date, entry_close = series[entry_idx]
+    returns: Dict[str, Optional[float]] = {}
+    elapsed_all = True
+    for h in horizons:
+        tgt = entry_idx + int(h)
+        if tgt < len(series):
+            returns[f"{h}d"] = _pct(series[tgt][1], entry_close)
+        else:
+            returns[f"{h}d"] = None  # horizon not yet elapsed
+            elapsed_all = False
+
+    return {
+        "symbol": symbol,
+        "from_date": from_date.isoformat(),
+        "entry_date": entry_date.isoformat(),
+        "entry_price": round(entry_close, 2),
+        "returns": returns,
+        "all_horizons_elapsed": elapsed_all,
+        "status": "ok",
     }
 
 
