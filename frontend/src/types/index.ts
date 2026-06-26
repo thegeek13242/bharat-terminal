@@ -145,7 +145,9 @@ export interface CompanySummary {
   symbol: string;
   company_name: string;
   sector?: string | null;
-  mcap_cr?: number | null;
+  ltp?: number | null;
+  chg_1m_pct?: number | null;
+  pe_ratio?: number | null;
   is_active: boolean;
   latest_quarter?: string | null;
   quarters_loaded: number;
@@ -160,31 +162,45 @@ export interface CompanyDetail {
   sector?: string | null;
   industry?: string | null;
   mcap_cr?: number | null;
-  market_cap_tier?: string | null;
   exchange?: string | null;
   is_active: boolean;
+  description_200w?: string | null;
+  moat_classification?: string | null;
   revenue_ttm_cr?: number | null;
-  pat_ttm_cr?: number | null;
+  pat_cr?: number | null;
   ebitda_margin_pct?: number | null;
   pe_ratio?: number | null;
   pb_ratio?: number | null;
   roe_pct?: number | null;
-  roce_pct?: number | null;
-  dividend_yield_pct?: number | null;
-  book_value?: number | null;
   eps_ttm?: number | null;
-  face_value?: number | null;
-  last_price?: number | null;
-  fifty_two_week_high?: number | null;
-  fifty_two_week_low?: number | null;
-  dcf_fair_value?: number | null;
-  dcf_margin_of_safety_pct?: number | null;
+  net_debt_cr?: number | null;
+  interest_coverage?: number | null;
+  fcf_yield_pct?: number | null;
+  fair_value_per_share?: number | null;
+  margin_of_safety_pct?: number | null;
+  dcf_bull_value?: number | null;
+  dcf_bear_value?: number | null;
+  dcf_confidence?: string | null;
+  median_target_price?: number | null;
+  num_analysts?: number | null;
+  buy_pct?: number | null;
+  hold_pct?: number | null;
+  sell_pct?: number | null;
+  revenue_segments?: unknown;
+  geography_split?: unknown;
   created_at?: string;
   updated_at?: string;
   latest_quarter?: string | null;
   quarters_loaded?: number;
   latest_price_date?: string | null;
   has_dossier: boolean;
+}
+
+export interface AuthUser {
+  id: number;
+  email: string;
+  name?: string | null;
+  picture?: string | null;
 }
 
 export interface FinancialResult {

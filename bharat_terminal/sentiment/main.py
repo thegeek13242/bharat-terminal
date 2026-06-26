@@ -16,6 +16,7 @@ from collections import Counter
 from bharat_terminal.sentiment.classifier import classify
 from bharat_terminal.sentiment.consumer import SentimentKafkaConsumer
 from bharat_terminal.sentiment.publisher import SentimentSnapshotPublisher
+from bharat_terminal.sentiment.snapshot_consumer import SentimentImpactBridgeConsumer
 from bharat_terminal.types import SentimentItem
 
 logging.basicConfig(
@@ -28,9 +29,13 @@ logger = logging.getLogger(__name__)
 async def main() -> None:
     consumer = SentimentKafkaConsumer()
     publisher = SentimentSnapshotPublisher()
+    # Feature 3(b): a second consumer turns classified snapshots into company
+    # ImpactReports on analysed.impact.in (Polymarket → company-level signals).
+    bridge = SentimentImpactBridgeConsumer()
 
     await consumer.start()
     await publisher.start()
+    await bridge.start()
 
     # ── Cycle stats: log every N messages ────────────────────────────────────
     stats = Counter()
@@ -66,11 +71,12 @@ async def main() -> None:
         loop.add_signal_handler(sig, shutdown.set)
 
     consumer_task = asyncio.create_task(consumer.consume(handle), name="sentiment-consume")
+    bridge_task = asyncio.create_task(bridge.run(), name="sentiment-impact-bridge")
     shutdown_task = asyncio.create_task(shutdown.wait(), name="sentiment-shutdown")
 
-    logger.info("[SENTIMENT-WORKER] running")
+    logger.info("[SENTIMENT-WORKER] running (classifier + impact bridge)")
     done, pending = await asyncio.wait(
-        [consumer_task, shutdown_task],
+        [consumer_task, bridge_task, shutdown_task],
         return_when=asyncio.FIRST_COMPLETED,
     )
 
@@ -83,6 +89,7 @@ async def main() -> None:
 
     await consumer.stop()
     await publisher.stop()
+    await bridge.stop()
     logger.info("[SENTIMENT-WORKER] stopped cleanly")
 
 

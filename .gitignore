@@ -75,3 +75,6 @@ Cargo.lock
 
 # DB backup dumps (operational, not source)
 exports/backup_*.csv
+
+# TLS origin certs (Cloudflare Origin CA / self-signed) — never commit
+certs/

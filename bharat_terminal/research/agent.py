@@ -30,8 +30,8 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-import anthropic
-
+from bharat_terminal import llm
+from bharat_terminal.llm import provider_for_model
 from bharat_terminal.research import bse_xbrl, db
 
 logger = logging.getLogger(__name__)
@@ -177,7 +177,22 @@ def _build_tools() -> List[Dict[str, Any]]:
         TOOL_SUBMIT_EXPOSURE,
     ]
     if ENABLE_WEB_SEARCH:
-        tools.append({"type": "web_search_20250305", "name": "web_search"})
+        # Provider-agnostic client-side web search (Gemini google_search /
+        # Vertex grounding via the llm wrapper), replacing the Anthropic-only
+        # server-side web_search tool. Results are fed back as a tool_result.
+        tools.append({
+            "name": "web_search",
+            "description": (
+                "Search the web for analyst commentary, segment disclosures or "
+                "macro data not in our DB. Returns text results with source URLs "
+                "to cite. Use only to fill gaps our own data cannot cover."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        })
     return tools
 
 
@@ -255,18 +270,20 @@ async def research_pair(
     trigger_id: str,
     trigger_label: str,
     *,
-    client: Optional[anthropic.AsyncAnthropic] = None,
+    client: Optional[Any] = None,  # deprecated/unused: provider chosen by the llm wrapper
 ) -> Optional[Dict[str, Any]]:
     """
     Run the agent for one (symbol, trigger) pair. Persists results into
     `trigger_betas` and (if exposure_kind != 'none') `fundamental_exposures`.
     Returns the submitted JSON, or None on agent failure.
-    """
-    if not ANTHROPIC_API_KEY:
-        logger.error("ANTHROPIC_API_KEY not set — cannot run research agent")
-        return None
 
-    client = client or anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    The LLM provider is selected from RESEARCH_MODEL by the llm wrapper (Vertex
+    Gemini by default); ANTHROPIC_API_KEY is only required if RESEARCH_MODEL is a
+    console-Anthropic model.
+    """
+    if provider_for_model(RESEARCH_MODEL) == "anthropic" and not ANTHROPIC_API_KEY:
+        logger.error("ANTHROPIC_API_KEY not set but RESEARCH_MODEL is an Anthropic model")
+        return None
 
     tools = _build_tools()
     system = _build_system_prompt()
@@ -278,7 +295,7 @@ async def research_pair(
 
     for turn in range(MAX_AGENT_TURNS):
         try:
-            resp = await client.messages.create(
+            resp = await llm.acomplete(
                 model=RESEARCH_MODEL,
                 max_tokens=2048,
                 system=system,
@@ -297,8 +314,8 @@ async def research_pair(
             )
             break
 
-        # Append the assistant turn
-        messages.append({"role": "assistant", "content": resp.content})
+        # Append the assistant turn (provider-agnostic normalized blocks).
+        messages.append({"role": "assistant", "content": llm.assistant_content(resp)})
 
         # Handle each tool_use, building a single user turn with tool_results
         tool_results = []
@@ -313,11 +330,16 @@ async def research_pair(
                 })
                 continue
             if tu.name == "web_search":
-                # Server-side; should never appear here as a client-side tool_use.
+                # Client-side grounded search (Gemini/Vertex) via the llm wrapper.
+                try:
+                    out = await llm.grounded_search(dict(tu.input).get("query", ""))
+                    content = json.dumps(out, default=str)[:50_000]
+                except Exception as e:
+                    content = json.dumps({"error": str(e)})
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tu.id,
-                    "content": "Web search is server-side; results were inlined.",
+                    "content": content,
                 })
                 continue
             try:

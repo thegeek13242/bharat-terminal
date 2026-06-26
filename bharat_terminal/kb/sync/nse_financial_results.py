@@ -132,6 +132,9 @@ SECTOR_PL_OVERRIDES: Dict[str, Dict[str, str]] = {
         "NetPremiumIncome": "revenue_cr",
         "ProfitLossBeforeTax": "pbt_cr",
         "ProfitLossAfterTaxAndExtraordinaryItems": "pat_cr",
+        # Insurers report tax as `ProvisionsForTaxes` (shareholders' account), not
+        # the Ind AS `TaxExpense`; it reconciles PBT−PAT exactly (verified HDFCLIFE).
+        "ProvisionsForTaxes": "tax_cr",
     },
     "general_insurance": {
         "PremiumEarned": "revenue_cr",
@@ -142,6 +145,9 @@ SECTOR_PL_OVERRIDES: Dict[str, Dict[str, str]] = {
         "OperatingIncome": "total_income_cr",
         "ProfitOrLossBeforeTax": "pbt_cr",
         "ProfitLossAfterTax": "pat_cr",
+        # General insurers report tax as `ProvisionForTax`; reconciles PBT−PAT
+        # exactly (verified STARHEALTH).
+        "ProvisionForTax": "tax_cr",
     },
     # Non-Ind AS (old Indian GAAP). Structurally the SAME P&L as Ind AS, but two
     # element names differ: PAT is `ProfitLossForThePeriod` (vs Ind AS
@@ -201,24 +207,70 @@ SECTOR_FINANCIALS_MAPS: Dict[str, Dict[str, str]] = {
         "BenefitsPaidNet": "benefits_paid_net",
         "NetCommission": "net_commission",
     },
+    # NBFC (Ind AS Schedule III Division III). The generic columns capture
+    # RevenueFromOperations / Expenses / PBT / PAT correctly, but lose the lines an
+    # analyst actually needs for a lender: credit cost (impairment), core interest
+    # income, and fee income. Verified against BAJFINANCE Q4FY26 live filing.
+    "nbfc": {
+        "InterestEarned": "interest_earned",
+        "FeesAndCommissionIncome": "fees_and_commission_income",
+        "NetGainOnFairValueChanges": "net_gain_on_fair_value_changes",
+        "FinanceCosts": "finance_cost",
+        "FeesAndCommissionExpense": "fees_and_commission_expense",
+        "ImpairmentOnFinancialInstruments": "impairment_on_financial_instruments",
+    },
+}
+
+# Sector balance-sheet lines, read from the INSTANT context (`OneI`, period-end
+# snapshot) rather than the flow contexts. For an NBFC the balance sheet — loan
+# book, funding mix and net worth — is as important as the P&L, and the SEBI 2026
+# integrated filing carries it. Merged into the same `sector_financials` JSONB.
+# Verified against BAJFINANCE Q4FY26. (Pre-2026 filings lack these tags → best
+# effort: absent lines are simply omitted.)
+SECTOR_BALANCE_SHEET_MAPS: Dict[str, Dict[str, str]] = {
+    "nbfc": {
+        "Loans": "loans",
+        "Investments": "investments",
+        "CashAndCashEquivalents": "cash_and_equivalents",
+        "Assets": "total_assets",
+        "Equity": "equity",
+        "DebtSecurities": "debt_securities",
+        "Borrowings": "borrowings",
+        "Deposits": "deposits",
+        "SubordinatedLiabilities": "subordinated_liabilities",
+    },
 }
 
 
 def _extract_sector_financials(
-    facts: Dict[str, str], metadata: Dict[str, Any], taxonomy: str
+    facts: Dict[str, str],
+    instant_facts: Dict[str, str],
+    metadata: Dict[str, Any],
+    taxonomy: str,
 ) -> Optional[Dict[str, float]]:
-    """Build the sector-specific P&L line-item dict for banking/insurance.
+    """Build the sector-specific line-item dict for banking / insurance / NBFC.
 
-    Returns None for taxonomies whose P&L maps to the generic columns
-    (indas / nbfc / nonindas) so those rows leave `sector_financials` NULL.
+    `facts` is the flow context (OneD); `instant_facts` is the period-end snapshot
+    (OneI), used for balance-sheet lines. Returns None for taxonomies whose P&L
+    maps to the generic columns (indas / nonindas) so those rows leave
+    `sector_financials` NULL.
     """
     mapping = SECTOR_FINANCIALS_MAPS.get(taxonomy)
-    if not mapping:
+    bs_mapping = SECTOR_BALANCE_SHEET_MAPS.get(taxonomy)
+    if not mapping and not bs_mapping:
         return None
     divisor = _rounding_divisor(metadata)
     out: Dict[str, float] = {}
-    for xbrl_tag, key in mapping.items():
+    for xbrl_tag, key in (mapping or {}).items():
         raw = facts.get(xbrl_tag)
+        if raw is not None:
+            try:
+                out[key] = round(float(raw) / divisor, 2)
+            except (ValueError, TypeError):
+                continue
+    # Balance-sheet lines from the instant (period-end) context.
+    for xbrl_tag, key in (bs_mapping or {}).items():
+        raw = instant_facts.get(xbrl_tag)
         if raw is not None:
             try:
                 out[key] = round(float(raw) / divisor, 2)
@@ -227,6 +279,20 @@ def _extract_sector_financials(
     # Convenience derived line for banks (net interest income).
     if taxonomy == "banking" and "interest_earned" in out and "interest_expended" in out:
         out["net_interest_income"] = round(out["interest_earned"] - out["interest_expended"], 2)
+    # NBFC net interest income = interest earned − cost of funds (finance cost).
+    if taxonomy == "nbfc" and "interest_earned" in out and "finance_cost" in out:
+        out["net_interest_income"] = round(out["interest_earned"] - out["finance_cost"], 2)
+    # NBFC funding mix + leverage (derived from the balance-sheet lines).
+    if taxonomy == "nbfc":
+        funding = sum(
+            out[k] for k in ("debt_securities", "borrowings", "deposits", "subordinated_liabilities")
+            if k in out
+        )
+        if funding:
+            out["total_borrowings"] = round(funding, 2)
+        if out.get("equity"):
+            if "total_assets" in out:
+                out["leverage_x"] = round(out["total_assets"] / out["equity"], 2)
     return out or None
 
 
@@ -235,6 +301,13 @@ def _extract_sector_financials(
 # 'indas'), try these sector top-line elements. Null-guarded → never overrides a
 # value already produced above.
 XBRL_REVENUE_FALLBACK_TAGS = ("InterestEarned", "NetPremiumIncome", "PremiumEarned")
+
+# Taxonomies for which EBITDA is meaningless: for a lender/insurer, finance cost is
+# the core operating cost (cost of funds / claims funding), not a capital-structure
+# add-back. Adding it back yields a nonsensical "EBITDA" (e.g. BAJFINANCE ₹15,053 cr).
+# Banks/insurers already produce NULL because they have no generic FinanceCosts; NBFC
+# does, so it must be excluded explicitly. EBITDA stays computed for indas/nonindas.
+_NO_EBITDA_TAXONOMIES = {"nbfc", "banking", "life_insurance", "general_insurance"}
 
 # Value in Crores = absolute_value / 1e7.  But XBRL values are already in INR.
 # Actually: XBRL reports in INR absolute. LevelOfRoundingUsedInFinancialStatements = "Crores"
@@ -470,8 +543,9 @@ def parse_xbrl(xml_bytes: bytes, taxonomy: str = "indas") -> Dict[str, Any]:
 
     one_d = facts_by_context.get("OneD", {})
     four_d = facts_by_context.get("FourD", {})
-    # OneI (instant) facts retained in original parser; not currently consumed
-    _one_i = facts_by_context.get("OneI", {})  # noqa: F841
+    # OneI = instant (period-end) context — balance-sheet snapshot. Consumed for
+    # sector balance-sheet lines (NBFC loan book / funding / net worth).
+    one_i = facts_by_context.get("OneI", {})
 
     # Parse metadata
     metadata = _extract_metadata(one_d)
@@ -486,7 +560,7 @@ def parse_xbrl(xml_bytes: bytes, taxonomy: str = "indas") -> Dict[str, Any]:
     segment_data = _extract_segments(facts_by_context)
 
     # Sector-specific P&L lines (banks/insurers) that have no generic column.
-    sector_financials = _extract_sector_financials(one_d, metadata, taxonomy)
+    sector_financials = _extract_sector_financials(one_d, one_i, metadata, taxonomy)
 
     # Monetary facts are absolute INR (÷1e7 = crores), regardless of the taxonomy's
     # display `LevelOfRounding` (e.g. "Lakhs"), which we intentionally ignore. The XBRL
@@ -639,7 +713,7 @@ def _extract_financials(
     dep = result.get("depreciation_cr")
     other_inc = result.get("other_income_cr")
     exceptional = result.get("exceptional_items_cr")
-    if pbt is not None and finance is not None and dep is not None:
+    if taxonomy not in _NO_EBITDA_TAXONOMIES and pbt is not None and finance is not None and dep is not None:
         ebitda = pbt + finance + dep
         if other_inc is not None:
             ebitda -= other_inc

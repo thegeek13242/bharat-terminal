@@ -9,3 +9,9 @@ pydantic==2.6.3
 httpx==0.27.0
 psycopg2-binary==2.9.9
 beautifulsoup4==4.12.3
+# Feature 1: on-demand live NSE equity LTP (kb/live_price.py) reuses the Angel
+# One session via SmartConnect REST. logzero is an undeclared transitive of
+# smartapi-python 1.5.5 (without it `from SmartApi import SmartConnect` crashes).
+smartapi-python==1.5.5
+logzero==1.7.0
+websocket-client==1.8.0

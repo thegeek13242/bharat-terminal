@@ -240,6 +240,11 @@ class AngelOneMCXAdapter:
                 # 1) Login (gets jwt + feed token)
                 await asyncio.to_thread(self._smartapi_login)
 
+                # 1b) Publish the session token to Redis so other services (the
+                # KB price endpoint) can REUSE it for on-demand equity LTP without
+                # a second login (Angel One is single-session). Fail-open.
+                await self._publish_session()
+
                 # 2) Refresh scrip master if stale (or first time)
                 now = time.time()
                 if now - last_scrip_refresh > self._scrip_refresh_hours * 3600:
@@ -295,6 +300,29 @@ class AngelOneMCXAdapter:
         if not all([self._jwt_token, self._feed_token]):
             raise RuntimeError(f"SmartAPI login returned incomplete tokens: {data}")
         logger.info(f"[{self.source_name}] SmartAPI login OK ({self._client_code})")
+
+    async def _publish_session(self) -> None:
+        """Publish the current session token to Redis (`angelone:session`) so the
+        KB service can reuse it for stateless equity LTP lookups. Fail-open."""
+        try:
+            import json as _json
+            import redis.asyncio as _aioredis
+            if getattr(self, "_redis", None) is None:
+                self._redis = _aioredis.from_url(
+                    os.getenv("REDIS_URL", "redis://redis:6379/0"),
+                    encoding="utf-8", decode_responses=True,
+                )
+            payload = _json.dumps({
+                "api_key": self._api_key,
+                "access_token": self._jwt_token,
+                "feed_token": self._feed_token,
+            })
+            # TTL slightly longer than the login cadence so it never goes stale
+            # mid-session; refreshed on every (re)login.
+            await self._redis.setex("angelone:session", 13 * 3600, payload)
+            logger.info(f"[{self.source_name}] published session token to Redis for equity LTP reuse")
+        except Exception as e:
+            logger.warning(f"[{self.source_name}] session publish failed (fail-open): {e}")
 
     # ── Scrip master → near-month token resolution ───────────────────
 

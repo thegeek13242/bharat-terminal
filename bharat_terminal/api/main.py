@@ -3,13 +3,15 @@ Bharat Terminal API Gateway — FastAPI application.
 Port 8000. Proxies KB service + streams WebSocket events.
 """
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
+from bharat_terminal.api.auth import get_current_user
 from bharat_terminal.api.kafka_relay import start_kafka_relay, stop_kafka_relay
 from bharat_terminal.api.sentiment_relay import (
     start_sentiment_relay,
@@ -17,6 +19,7 @@ from bharat_terminal.api.sentiment_relay import (
 )
 from bharat_terminal.api.db import close_engine
 from bharat_terminal.api.routes import (
+    auth,
     news,
     impact,
     company,
@@ -27,6 +30,7 @@ from bharat_terminal.api.routes import (
     watchlist,
     websocket,
     sentiment,
+    signal_accuracy,
 )
 from bharat_terminal.api.ws_manager import manager
 
@@ -59,24 +63,38 @@ app = FastAPI(
 )
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# CORS: cookie-based auth requires explicit origins + allow_credentials (no "*").
+# Set CORS_ORIGINS (comma-separated) to the real dev + prod origins in production.
+_cors_origins = [
+    o.strip()
+    for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production: restrict to frontend origin
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Register routers
-app.include_router(news.router)
-app.include_router(impact.router)
-app.include_router(company.router)
-app.include_router(companies.router)
-app.include_router(dossier.router)
-app.include_router(db_explorer.router)
-app.include_router(graph.router)
-app.include_router(watchlist.router)
-app.include_router(sentiment.router)
+# Auth router is public (login / session check / logout).
+app.include_router(auth.router)
+
+# Every data router requires an authenticated session (the WebSocket route
+# authenticates from the session cookie on connect inside the handler).
+_auth = [Depends(get_current_user)]
+app.include_router(news.router, dependencies=_auth)
+app.include_router(impact.router, dependencies=_auth)
+app.include_router(company.router, dependencies=_auth)
+app.include_router(companies.router, dependencies=_auth)
+app.include_router(dossier.router, dependencies=_auth)
+app.include_router(db_explorer.router, dependencies=_auth)
+app.include_router(graph.router, dependencies=_auth)
+app.include_router(watchlist.router, dependencies=_auth)
+app.include_router(sentiment.router, dependencies=_auth)
+app.include_router(signal_accuracy.router, dependencies=_auth)
 app.include_router(websocket.router)
 
 

@@ -16,8 +16,14 @@ from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy import select
 
-from bharat_terminal.kb.models import Base, Company, CompanyRelationship
-from bharat_terminal.kb.dcf import DCFInputs, compute_dcf
+from bharat_terminal.kb.models import Base, Company, CompanyRelationship, FinancialResult
+from bharat_terminal.kb.dcf import (
+    DCFInputs, compute_dcf, fade_growth_path, DEFAULT_TERMINAL_GROWTH as DEFAULT_TG,
+)
+
+# An unlevered-FCFF DCF is meaningless for lenders/insurers (finance cost is their
+# core operating cost; "EBITDA" doesn't apply). Skip these taxonomies entirely.
+_NON_DCF_TAXONOMIES = {"nbfc", "banking", "life_insurance", "general_insurance"}
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -26,6 +32,40 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://bharat:bharat@loc
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+
+async def _latest_taxonomy(session, symbol: str):
+    """Taxonomy of the most recent financial_results row for `symbol` (or None)."""
+    row = await session.execute(
+        select(FinancialResult.taxonomy)
+        .where(FinancialResult.symbol == symbol)
+        .order_by(FinancialResult.period_end.desc())
+        .limit(1)
+    )
+    return row.scalar_one_or_none()
+
+
+async def _historical_revenue_cagr(session, symbol: str):
+    """Company's own revenue CAGR from quarterly history (TTM-vs-TTM), clamped to a
+    sane band. 3-yr CAGR when ≥16 quarters exist, else 1-yr growth, else None."""
+    rows = (
+        await session.execute(
+            select(FinancialResult.revenue_cr)
+            .where(FinancialResult.symbol == symbol, FinancialResult.consolidated == True)  # noqa: E712
+            .order_by(FinancialResult.period_end.desc())
+            .limit(16)
+        )
+    ).scalars().all()
+    if len(rows) < 8 or any(r is None for r in rows[:8]):
+        return None
+    ttm_now = sum(rows[:4])
+    if len(rows) >= 16 and all(r is not None for r in rows[12:16]) and sum(rows[12:16]) > 0:
+        cagr = (ttm_now / sum(rows[12:16])) ** (1 / 3) - 1
+    elif sum(rows[4:8]) > 0:
+        cagr = ttm_now / sum(rows[4:8]) - 1
+    else:
+        return None
+    return max(-0.05, min(0.30, cagr))  # clamp: no perpetual decline / hypergrowth
 
 
 async def refresh_dcf(symbol: str):
@@ -44,6 +84,16 @@ async def refresh_dcf(symbol: str):
             logger.error(f"No revenue data for {symbol}, cannot compute DCF")
             return
 
+        # Gate: skip lenders/insurers (FCFF DCF invalid) and anyone without a real
+        # EBITDA margin — never fabricate a 15% default just to produce a number.
+        taxonomy = await _latest_taxonomy(session, company.symbol)
+        if taxonomy in _NON_DCF_TAXONOMIES:
+            logger.info(f"Skipping DCF for {symbol}: {taxonomy} (FCFF DCF not applicable)")
+            return
+        if not company.ebitda_margin_pct or company.ebitda_margin_pct <= 0:
+            logger.info(f"Skipping DCF for {symbol}: no EBITDA margin")
+            return
+
         # Derive shares outstanding from market cap / price (price = EPS * PE)
         if company.pe_ratio and company.eps_ttm and company.pe_ratio > 0 and company.eps_ttm > 0:
             price_per_share = company.pe_ratio * company.eps_ttm
@@ -51,15 +101,25 @@ async def refresh_dcf(symbol: str):
         else:
             shares_cr = 100.0
 
+        # Per-company growth: fade the company's own historical CAGR to terminal
+        # growth, instead of the universal 12/11/10/9/8% path.
+        cagr = await _historical_revenue_cagr(session, company.symbol)
+        start_growth = cagr if cagr is not None else 0.08
+        gy1, gy2, gy3, gy4, gy5 = fade_growth_path(start_growth, DEFAULT_TG)
+
         inputs = DCFInputs(
             symbol=company.symbol,
             revenue_ttm_cr=company.revenue_ttm_cr,
-            ebitda_margin_pct=company.ebitda_margin_pct or 15.0,
+            ebitda_margin_pct=company.ebitda_margin_pct,
             net_debt_cr=company.net_debt_cr or 0.0,
             shares_outstanding_cr=shares_cr,
             equity_value_cr=company.mcap_cr,
-            source="screener_api" if company.data_quality_score > 0.5 else "llm_inferred",
-            confidence=company.data_quality_score,
+            revenue_growth_y1=gy1, revenue_growth_y2=gy2, revenue_growth_y3=gy3,
+            revenue_growth_y4=gy4, revenue_growth_y5=gy5,
+            # Heuristic model (universal assumptions beyond growth) → cap confidence
+            # so downstream never over-trusts it; flag whether growth was data-derived.
+            source="dcf_fcff_cagr" if cagr is not None else "dcf_fcff_default",
+            confidence=round(min(company.data_quality_score or 0.4, 0.5), 2),
         )
 
         dcf_result = compute_dcf(inputs)

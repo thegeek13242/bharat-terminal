@@ -17,6 +17,7 @@ from bharat_terminal.analysis.stages.stage2_extraction import extract_entities
 from bharat_terminal.analysis.stages.stage3_impact import score_impacts
 from bharat_terminal.analysis.stages.stage4_propagation import propagate_impacts
 from bharat_terminal.analysis.stages.stage5_signals import generate_signals
+from bharat_terminal.analysis.priced_in import apply_priced_in
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,9 @@ class PipelineState(TypedDict):
 
     # Stage 3 outputs
     direct_impacts: List[CompanyImpact]
+
+    # Priced-in adjustments (observability; see priced_in.py)
+    priced_in_adjustments: List[dict]
 
     # Stage 4 outputs
     all_impacts: List[CompanyImpact]
@@ -84,6 +88,20 @@ async def stage3_node(state: PipelineState) -> PipelineState:
         state["macro_theme"],
     )
     return {**state, "direct_impacts": impacts}
+
+
+async def priced_in_node(state: PipelineState) -> PipelineState:
+    """Downgrade direct impacts the market has already priced in (Feature 1).
+
+    Runs before stage4 so propagation decays from the corrected base. Fail-open:
+    a price-lookup error simply leaves impacts unchanged.
+    """
+    try:
+        adjusted, adjustments = await apply_priced_in(state["direct_impacts"])
+    except Exception as e:  # never block the pipeline on the priced-in check
+        logger.warning(f"[priced_in] node error (skipping downgrade): {e}")
+        return {**state, "priced_in_adjustments": []}
+    return {**state, "direct_impacts": adjusted, "priced_in_adjustments": adjustments}
 
 
 async def stage4_node(state: PipelineState) -> PipelineState:
@@ -160,6 +178,7 @@ def build_pipeline() -> StateGraph:
     graph.add_node("stage1", stage1_node)
     graph.add_node("stage2", stage2_node)
     graph.add_node("stage3", stage3_node)
+    graph.add_node("priced_in", priced_in_node)
     graph.add_node("stage4", stage4_node)
     graph.add_node("stage5", stage5_node)
     graph.add_node("finalize", finalize_node)
@@ -173,7 +192,8 @@ def build_pipeline() -> StateGraph:
     })
 
     graph.add_edge("stage2", "stage3")
-    graph.add_edge("stage3", "stage4")
+    graph.add_edge("stage3", "priced_in")
+    graph.add_edge("priced_in", "stage4")
     graph.add_edge("stage4", "stage5")
     graph.add_edge("stage5", "finalize")
     graph.add_edge("finalize", END)
@@ -207,6 +227,7 @@ async def process_news_item(news_item: NewsItem) -> ImpactReport:
         resolved_symbols=[],
         extraction_sentiment="neutral",
         direct_impacts=[],
+        priced_in_adjustments=[],
         all_impacts=[],
         trade_signals=[],
         impact_report=None,

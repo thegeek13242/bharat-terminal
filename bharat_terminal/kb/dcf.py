@@ -15,6 +15,10 @@ DEFAULT_BETA = 1.0
 DEFAULT_COST_OF_DEBT = 0.09  # ~9% for average India corporate
 DEFAULT_TAX_RATE = 0.25      # Base corporate tax rate India
 DEFAULT_TERMINAL_GROWTH = 0.06  # ~6% nominal (India long-term GDP growth)
+# Gordon terminal value = FCF*(1+g)/(WACC-g) requires WACC strictly > g, with a
+# margin so the denominator never collapses. The WACC clamp floor (6%) can equal
+# the default terminal growth (6%) → divide-by-zero / exploding TV without this.
+MIN_WACC_TG_SPREAD = 0.02
 
 
 @dataclass
@@ -112,6 +116,21 @@ def estimate_wacc(inputs: DCFInputs) -> float:
     return max(0.06, min(0.20, wacc))
 
 
+def fade_growth_path(
+    start_growth: float, terminal_growth: float, years: int = 5
+) -> List[float]:
+    """Linear 'fade to terminal' revenue-growth path: year 1 = `start_growth`
+    (typically the company's own historical CAGR), fading to `terminal_growth` by
+    the final year. Replaces the one-size-fits-all 12/11/10/9/8% assumption so each
+    company is projected off its own trajectory."""
+    if years <= 1:
+        return [start_growth]
+    return [
+        round(start_growth + (terminal_growth - start_growth) * i / (years - 1), 4)
+        for i in range(years)
+    ]
+
+
 def project_fcf(
     revenue_ttm: float,
     ebitda_margin: float,
@@ -177,6 +196,11 @@ def compute_dcf(inputs: DCFInputs, current_price: Optional[float] = None) -> DCF
     """
     wacc = estimate_wacc(inputs)
     terminal_growth = inputs.terminal_growth_pct
+    # Guard: WACC must exceed terminal growth by a margin, else the Gordon terminal
+    # value divides by ~0 and explodes. Base, bull (lower WACC) and bear all guarded.
+    wacc = max(wacc, terminal_growth + MIN_WACC_TG_SPREAD)
+    bull_wacc = max(wacc * 0.98, terminal_growth + MIN_WACC_TG_SPREAD)
+    bear_wacc = wacc * 1.02  # higher than base WACC → denominator always safe
 
     ebitda_margin = inputs.ebitda_margin_pct / 100
     # terminal margin is computed but unused on this path; keep for clarity
@@ -215,12 +239,12 @@ def compute_dcf(inputs: DCFInputs, current_price: Optional[float] = None) -> DCF
     bull_projs = project_fcf(
         inputs.revenue_ttm_cr, ebitda_margin + 0.01, bull_growths,
         inputs.capex_pct_of_revenue, inputs.working_capital_change_pct,
-        inputs.tax_rate, wacc * 0.98, shares
+        inputs.tax_rate, bull_wacc, shares
     )
     bull_pv_fcfs = sum(p.discounted_fcf for p in bull_projs)
     bull_final_fcf = bull_projs[-1].fcf
-    bull_tv = bull_final_fcf * (1 + terminal_growth) / ((wacc * 0.98) - terminal_growth)
-    bull_pv_tv = bull_tv / ((1 + wacc * 0.98) ** 5)
+    bull_tv = bull_final_fcf * (1 + terminal_growth) / (bull_wacc - terminal_growth)
+    bull_pv_tv = bull_tv / ((1 + bull_wacc) ** 5)
     bull_ev = bull_pv_fcfs + bull_pv_tv - (inputs.net_debt_cr or 0)
     bull_value = bull_ev / shares if shares > 0 else 0
 
@@ -229,12 +253,12 @@ def compute_dcf(inputs: DCFInputs, current_price: Optional[float] = None) -> DCF
     bear_projs = project_fcf(
         inputs.revenue_ttm_cr, max(0.05, ebitda_margin - 0.01), bear_growths,
         inputs.capex_pct_of_revenue, inputs.working_capital_change_pct,
-        inputs.tax_rate, wacc * 1.02, shares
+        inputs.tax_rate, bear_wacc, shares
     )
     bear_pv_fcfs = sum(p.discounted_fcf for p in bear_projs)
     bear_final_fcf = bear_projs[-1].fcf
-    bear_tv = bear_final_fcf * (1 + terminal_growth) / ((wacc * 1.02) - terminal_growth)
-    bear_pv_tv = bear_tv / ((1 + wacc * 1.02) ** 5)
+    bear_tv = bear_final_fcf * (1 + terminal_growth) / (bear_wacc - terminal_growth)
+    bear_pv_tv = bear_tv / ((1 + bear_wacc) ** 5)
     bear_ev = bear_pv_fcfs + bear_pv_tv - (inputs.net_debt_cr or 0)
     bear_value = bear_ev / shares if shares > 0 else 0
 

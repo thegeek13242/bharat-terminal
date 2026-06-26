@@ -27,9 +27,7 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks: {
-          vendor: ['react', 'react-dom'],
-          charts: ['recharts'],
-          graph: ['sigma', 'graphology'],
+          vendor: ['react', 'react-dom', 'react-router-dom'],
         },
       },
     },

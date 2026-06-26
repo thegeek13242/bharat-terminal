@@ -50,6 +50,24 @@ async def get_financials(
 
 
 @mcp.tool()
+async def get_nbfc_metrics(symbol: str, periods: int = 8) -> Dict[str, Any]:
+    """Lender metrics for an NBFC (e.g. BAJFINANCE, CHOLAFIN), newest quarter first.
+
+    Use this instead of get_financials when analysing an NBFC: it surfaces the
+    balance-sheet and credit lines that the generic P&L columns omit — loan book
+    (`loans`), funding mix (debt_securities / borrowings / deposits /
+    subordinated_liabilities + `total_borrowings`), net worth (`equity`),
+    `leverage_x`, `net_interest_income`, and credit cost
+    (`impairment_on_financial_instruments`) — plus derived ratios per quarter
+    (credit_cost_pct_qtr, roa_pct_qtr, loans_yoy_pct). All amounts ₹ crore.
+
+    Returns an error if the symbol is not an NBFC; use get_financials for banks,
+    insurers and Ind-AS companies.
+    """
+    return await grounding.get_nbfc_metrics(symbol, periods=periods)
+
+
+@mcp.tool()
 async def get_price_returns(
     symbol: str, windows: Optional[List[int]] = None
 ) -> Dict[str, Any]:

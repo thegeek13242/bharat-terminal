@@ -17,7 +17,7 @@ import math
 import os
 import statistics
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Any, AsyncIterator, Dict, List, Optional, Sequence
 
 from sqlalchemy import select
@@ -174,6 +174,102 @@ async def get_financials(
     }
 
 
+async def get_nbfc_metrics(symbol: str, periods: int = 8) -> Dict[str, Any]:
+    """Lender-specific metrics for an NBFC, newest quarter first.
+
+    For an NBFC the generic P&L columns understate the business: the figures that
+    matter are the loan book, funding mix, net worth/leverage, net interest income
+    and credit cost — which live in `sector_financials` (parsed from the SEBI
+    integrated-filing balance sheet). This surfaces them, with a few derived ratios,
+    so an agent doesn't have to reconstruct them. Returns an error if `symbol` files
+    under a non-NBFC taxonomy (use get_financials for those).
+
+    Per quarter: `lender_lines` (interest_earned, net_interest_income,
+    impairment_on_financial_instruments, loans, investments, equity, total_assets,
+    debt_securities/borrowings/deposits/subordinated_liabilities, total_borrowings,
+    leverage_x) and `derived` (credit_cost_pct_qtr = impairment/loans, roa_pct_qtr =
+    pat/total_assets, loans_yoy_pct). All amounts are ₹ crore; ratios are %.
+    """
+    symbol = (symbol or "").upper().strip()
+    periods = max(1, min(int(periods), 24))
+
+    async with _session() as s:
+        rows = (
+            await s.execute(
+                select(FinancialResult)
+                .where(
+                    FinancialResult.symbol == symbol,
+                    FinancialResult.taxonomy == "nbfc",
+                )
+                .order_by(FinancialResult.period_end.desc())
+            )
+        ).scalars().all()
+
+    if not rows:
+        return {
+            "error": f"No NBFC financial_results for {symbol}. It may not be an "
+            f"NBFC — use get_financials for banks/insurers/Ind-AS companies."
+        }
+
+    # Prefer consolidated per quarter (mirrors get_financials), then take `periods`.
+    chosen: Dict[Any, FinancialResult] = {}
+    for r in rows:
+        cur = chosen.get(r.period_end)
+        if cur is None or (r.consolidated and not cur.consolidated):
+            chosen[r.period_end] = r
+    selected = [chosen[pe] for pe in sorted(chosen, reverse=True)[:periods]]
+
+    out: List[Dict[str, Any]] = []
+    for r in selected:
+        sf = dict(r.sector_financials or {})
+        loans = sf.get("loans")
+        impair = sf.get("impairment_on_financial_instruments")
+        total_assets = sf.get("total_assets")
+        derived: Dict[str, Any] = {}
+        # Credit cost = impairment charge as % of the loan book (quarterly, not
+        # annualised — multiply by ~4 for a rough annual run-rate).
+        if loans and impair is not None:
+            derived["credit_cost_pct_qtr"] = round(impair / loans * 100, 3)
+        if r.pat_cr is not None and total_assets:
+            derived["roa_pct_qtr"] = round(r.pat_cr / total_assets * 100, 3)
+        out.append(
+            {
+                "period_end": r.period_end.isoformat() if r.period_end else None,
+                "consolidated": r.consolidated,
+                "revenue_cr": r.revenue_cr,
+                "total_income_cr": r.total_income_cr,
+                "pat_cr": r.pat_cr,
+                "tax_cr": r.tax_cr,
+                "lender_lines": sf,
+                "derived": derived,
+                "provenance": {
+                    "source": "NSE_DB",
+                    "table": "financial_results",
+                    "nse_filing_id": r.nse_filing_id,
+                    "period_end": r.period_end.isoformat() if r.period_end else None,
+                },
+            }
+        )
+
+    # Year-on-year loan growth: compare each quarter to the one ~4 quarters back.
+    for i, period in enumerate(out):
+        loans_now = period["lender_lines"].get("loans")
+        if loans_now and i + 4 < len(out):
+            loans_ago = out[i + 4]["lender_lines"].get("loans")
+            if loans_ago:
+                period["derived"]["loans_yoy_pct"] = round(
+                    (loans_now - loans_ago) / loans_ago * 100, 2
+                )
+
+    return {
+        "symbol": symbol,
+        "currency": "INR_crore",
+        "source": "NSE_DB",  # authoritative; cite our DB, never re-fetch externally
+        "count": len(out),
+        "periods": out,
+    }
+
+
 # ── Price returns / risk ────────────────────────────────────────────────────
 
 def _pct(curr: float, prev: float) -> Optional[float]:
@@ -255,6 +351,62 @@ async def get_price_returns(
         "volatility_annualized_pct": vol_annual_pct,
         "max_drawdown_1y_pct": max_drawdown_pct,
         "beta_vs_index": None,  # no index series in price_points
+    }
+
+
+async def get_forward_returns(
+    symbol: str,
+    from_date: date,
+    horizons: Sequence[int] = (1, 5, 10, 20),
+) -> Dict[str, Any]:
+    """Realized forward returns (percent) for `symbol` measured from the first
+    tradeable close on/after `from_date`, over each horizon in TRADING days.
+
+    Used by the signal-accuracy job (Feature 2). Look-ahead-safe:
+      - `entry` = first `price_points` close with date >= from_date.
+      - horizon H return = close[entry_index + H] / entry_close - 1; if there are
+        not yet H rows after entry, that horizon returns None (NOT 0) — the signal
+        is simply too recent to evaluate at that horizon.
+      - If no close exists on/after from_date at all, returns status 'no_entry'.
+    """
+    symbol = (symbol or "").upper().strip()
+
+    async with _session() as s:
+        rows = (await s.execute(
+            select(PricePoint.date, PricePoint.close)
+            .where(PricePoint.symbol == symbol)
+            .order_by(PricePoint.date.asc())
+        )).all()
+
+    series = [(r[0], float(r[1])) for r in rows if r[1] is not None]
+    if not series:
+        return {"symbol": symbol, "status": "no_price_data", "returns": {}}
+
+    # First close on/after from_date is the entry (the first tradeable price).
+    entry_idx = next((i for i, (d, _) in enumerate(series) if d >= from_date), None)
+    if entry_idx is None:
+        # from_date is after our latest price — nothing tradeable yet.
+        return {"symbol": symbol, "status": "no_entry", "returns": {}}
+
+    entry_date, entry_close = series[entry_idx]
+    returns: Dict[str, Optional[float]] = {}
+    elapsed_all = True
+    for h in horizons:
+        tgt = entry_idx + int(h)
+        if tgt < len(series):
+            returns[f"{h}d"] = _pct(series[tgt][1], entry_close)
+        else:
+            returns[f"{h}d"] = None  # horizon not yet elapsed
+            elapsed_all = False
+
+    return {
+        "symbol": symbol,
+        "from_date": from_date.isoformat(),
+        "entry_date": entry_date.isoformat(),
+        "entry_price": round(entry_close, 2),
+        "returns": returns,
+        "all_horizons_elapsed": elapsed_all,
+        "status": "ok",
     }
 
 
