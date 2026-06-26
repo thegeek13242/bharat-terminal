@@ -174,6 +174,102 @@ async def get_financials(
     }
 
 
+async def get_nbfc_metrics(symbol: str, periods: int = 8) -> Dict[str, Any]:
+    """Lender-specific metrics for an NBFC, newest quarter first.
+
+    For an NBFC the generic P&L columns understate the business: the figures that
+    matter are the loan book, funding mix, net worth/leverage, net interest income
+    and credit cost — which live in `sector_financials` (parsed from the SEBI
+    integrated-filing balance sheet). This surfaces them, with a few derived ratios,
+    so an agent doesn't have to reconstruct them. Returns an error if `symbol` files
+    under a non-NBFC taxonomy (use get_financials for those).
+
+    Per quarter: `lender_lines` (interest_earned, net_interest_income,
+    impairment_on_financial_instruments, loans, investments, equity, total_assets,
+    debt_securities/borrowings/deposits/subordinated_liabilities, total_borrowings,
+    leverage_x) and `derived` (credit_cost_pct_qtr = impairment/loans, roa_pct_qtr =
+    pat/total_assets, loans_yoy_pct). All amounts are ₹ crore; ratios are %.
+    """
+    symbol = (symbol or "").upper().strip()
+    periods = max(1, min(int(periods), 24))
+
+    async with _session() as s:
+        rows = (
+            await s.execute(
+                select(FinancialResult)
+                .where(
+                    FinancialResult.symbol == symbol,
+                    FinancialResult.taxonomy == "nbfc",
+                )
+                .order_by(FinancialResult.period_end.desc())
+            )
+        ).scalars().all()
+
+    if not rows:
+        return {
+            "error": f"No NBFC financial_results for {symbol}. It may not be an "
+            f"NBFC — use get_financials for banks/insurers/Ind-AS companies."
+        }
+
+    # Prefer consolidated per quarter (mirrors get_financials), then take `periods`.
+    chosen: Dict[Any, FinancialResult] = {}
+    for r in rows:
+        cur = chosen.get(r.period_end)
+        if cur is None or (r.consolidated and not cur.consolidated):
+            chosen[r.period_end] = r
+    selected = [chosen[pe] for pe in sorted(chosen, reverse=True)[:periods]]
+
+    out: List[Dict[str, Any]] = []
+    for r in selected:
+        sf = dict(r.sector_financials or {})
+        loans = sf.get("loans")
+        impair = sf.get("impairment_on_financial_instruments")
+        total_assets = sf.get("total_assets")
+        derived: Dict[str, Any] = {}
+        # Credit cost = impairment charge as % of the loan book (quarterly, not
+        # annualised — multiply by ~4 for a rough annual run-rate).
+        if loans and impair is not None:
+            derived["credit_cost_pct_qtr"] = round(impair / loans * 100, 3)
+        if r.pat_cr is not None and total_assets:
+            derived["roa_pct_qtr"] = round(r.pat_cr / total_assets * 100, 3)
+        out.append(
+            {
+                "period_end": r.period_end.isoformat() if r.period_end else None,
+                "consolidated": r.consolidated,
+                "revenue_cr": r.revenue_cr,
+                "total_income_cr": r.total_income_cr,
+                "pat_cr": r.pat_cr,
+                "tax_cr": r.tax_cr,
+                "lender_lines": sf,
+                "derived": derived,
+                "provenance": {
+                    "source": "NSE_DB",
+                    "table": "financial_results",
+                    "nse_filing_id": r.nse_filing_id,
+                    "period_end": r.period_end.isoformat() if r.period_end else None,
+                },
+            }
+        )
+
+    # Year-on-year loan growth: compare each quarter to the one ~4 quarters back.
+    for i, period in enumerate(out):
+        loans_now = period["lender_lines"].get("loans")
+        if loans_now and i + 4 < len(out):
+            loans_ago = out[i + 4]["lender_lines"].get("loans")
+            if loans_ago:
+                period["derived"]["loans_yoy_pct"] = round(
+                    (loans_now - loans_ago) / loans_ago * 100, 2
+                )
+
+    return {
+        "symbol": symbol,
+        "currency": "INR_crore",
+        "source": "NSE_DB",  # authoritative; cite our DB, never re-fetch externally
+        "count": len(out),
+        "periods": out,
+    }
+
+
 # ── Price returns / risk ────────────────────────────────────────────────────
 
 def _pct(curr: float, prev: float) -> Optional[float]:

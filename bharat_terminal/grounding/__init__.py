@@ -6,6 +6,7 @@ numbers before reaching for web search.
 """
 from bharat_terminal.grounding.queries import (
     get_financials,
+    get_nbfc_metrics,
     get_price_returns,
     get_shareholding,
     get_corporate_actions,
@@ -13,6 +14,7 @@ from bharat_terminal.grounding.queries import (
 
 __all__ = [
     "get_financials",
+    "get_nbfc_metrics",
     "get_price_returns",
     "get_shareholding",
     "get_corporate_actions",

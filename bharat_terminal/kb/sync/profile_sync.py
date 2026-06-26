@@ -3,23 +3,29 @@ Company profile sync — populates company master fields from OFFICIAL NSE sourc
 
 No third-party data vendors. Sources (all on the NSE archives host, same one used
 for bhavcopy and filings):
-  - EQUITY_L.csv                  → ISIN + face value, full equity universe (~2,365)
-  - ind_niftytotalmarket_list.csv → NSE Sector classification ("Industry" column),
-                                    the broad investable universe (~755 large/mid/small).
+  - EQUITY_L.csv                  → ISIN + face value + listing date, full equity
+                                    universe (~2,365)
+  - ind_niftytotalmarket_list.csv → NSE Sector ("Industry" column) for the broad
+                                    investable universe (~750; = Nifty 500 + Microcap
+                                    250, so it is the maximal archive sector source).
 
 Fields this populates on `companies`:
-  - isin        (from EQUITY_L; authoritative)
-  - sector_nse  (from the index "Industry" column = NSE Sector level)
-  - face_value  (from EQUITY_L; not stored on companies but returned for callers)
+  - isin         (from EQUITY_L; authoritative)
+  - listing_date (from EQUITY_L 'DATE OF LISTING'; authoritative, full universe)
+  - sector_nse   (from the index "Industry" column = NSE Sector level)
+  - face_value   (from EQUITY_L; not stored on companies but returned for callers)
 
 Deliberately NOT populated here (no official archive source):
   - industry_nse: the finer NSE Basic-Industry level lives only behind the
     Akamai-protected /api/quote-equity endpoint (HTTP 403 from this network).
+  - sector_nse for the ~1,400 non-index small-caps: not in any index constituent
+    file; needs the quote API (403) or a vendor.
   - mcap_cr / description_200w / embedding: handled elsewhere.
 """
 import csv
 import io
 import logging
+from datetime import datetime, date
 from typing import Dict, Optional, Any
 
 import httpx
@@ -32,8 +38,14 @@ logger = logging.getLogger(__name__)
 
 NSE_ARCHIVES = "https://nsearchives.nseindia.com"
 EQUITY_MASTER_URL = f"{NSE_ARCHIVES}/content/equities/EQUITY_L.csv"
-# Nifty Total Market = the broad investable universe (large + mid + small cap).
-INDEX_SECTOR_URL = f"{NSE_ARCHIVES}/content/indices/ind_niftytotalmarket_list.csv"
+# NSE Sector classification ("Industry" column) from index constituent lists.
+# Nifty Total Market (~750) already = Nifty 500 + Nifty Microcap 250, so it is the
+# maximal sector source on the archives host (Microcap/Smallcap files are subsets and
+# add nothing). The ~1,600 non-index small-caps have no archive sector source. The
+# list form is kept so a genuinely-disjoint source can be added later.
+INDEX_SECTOR_URLS = [
+    f"{NSE_ARCHIVES}/content/indices/ind_niftytotalmarket_list.csv",
+]
 
 # A homepage hit first sets the cookies the archives host expects.
 NSE_HOME = "https://www.nseindia.com/"
@@ -58,8 +70,19 @@ async def _get_csv(client: httpx.AsyncClient, url: str) -> list:
     return rows
 
 
+def _parse_listing_date(s: str) -> Optional[date]:
+    """Parse EQUITY_L's 'DD-MON-YYYY' listing date (e.g. '06-OCT-2008')."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%d-%b-%Y").date()
+    except ValueError:
+        return None
+
+
 async def fetch_equity_master(client: httpx.AsyncClient) -> Dict[str, Dict[str, Any]]:
-    """symbol → {isin, face_value, name} from EQUITY_L.csv (official NSE master)."""
+    """symbol → {isin, face_value, name, listing_date} from EQUITY_L.csv (NSE master)."""
     out: Dict[str, Dict[str, Any]] = {}
     for r in await _get_csv(client, EQUITY_MASTER_URL):
         sym = r.get("SYMBOL", "")
@@ -70,18 +93,30 @@ async def fetch_equity_master(client: httpx.AsyncClient) -> Dict[str, Dict[str, 
             fv = float(r.get("FACE VALUE", "") or 0) or None
         except ValueError:
             fv = None
-        out[sym] = {"isin": isin, "face_value": fv, "name": r.get("NAME OF COMPANY")}
+        out[sym] = {
+            "isin": isin,
+            "face_value": fv,
+            "name": r.get("NAME OF COMPANY"),
+            "listing_date": _parse_listing_date(r.get("DATE OF LISTING", "")),
+        }
     return out
 
 
 async def fetch_index_sectors(client: httpx.AsyncClient) -> Dict[str, str]:
-    """symbol → NSE Sector, from the Nifty Total Market constituent list."""
+    """symbol → NSE Sector, unioned across the index constituent lists. Earlier
+    files win on conflict (Total Market before Microcap), though they're disjoint."""
     out: Dict[str, str] = {}
-    for r in await _get_csv(client, INDEX_SECTOR_URL):
-        sym = r.get("Symbol", "")
-        sector = r.get("Industry", "")  # NSE labels the Sector level "Industry" here
-        if sym and sector:
-            out[sym] = sector
+    for url in INDEX_SECTOR_URLS:
+        try:
+            rows = await _get_csv(client, url)
+        except Exception as e:
+            logger.warning("index sector fetch failed: %s: %s", url, e)
+            continue
+        for r in rows:
+            sym = r.get("Symbol", "")
+            sector = r.get("Industry", "")  # NSE labels the Sector level "Industry" here
+            if sym and sector and sym not in out:
+                out[sym] = sector
     return out
 
 
@@ -91,7 +126,7 @@ async def sync_company_profiles() -> Dict[str, int]:
     Only writes a field when we have a value for it (never nulls existing data).
     Returns counts for reporting.
     """
-    stats = {"isin_set": 0, "sector_set": 0, "symbols_seen": 0, "no_match": 0}
+    stats = {"isin_set": 0, "sector_set": 0, "listing_date_set": 0, "symbols_seen": 0, "no_match": 0}
 
     async with httpx.AsyncClient(
         timeout=30, headers=_HEADERS, follow_redirects=True
@@ -120,6 +155,8 @@ async def sync_company_profiles() -> Dict[str, int]:
             em = equity.get(sym)
             if em and em.get("isin"):
                 values["isin"] = em["isin"]
+            if em and em.get("listing_date"):
+                values["listing_date"] = em["listing_date"]
             sec = sectors.get(sym)
             if sec:
                 values["sector_nse"] = sec
@@ -133,6 +170,8 @@ async def sync_company_profiles() -> Dict[str, int]:
                 stats["isin_set"] += 1
             if "sector_nse" in values:
                 stats["sector_set"] += 1
+            if "listing_date" in values:
+                stats["listing_date_set"] += 1
         await session.commit()
 
     logger.info("profile_sync done: %s", stats)
