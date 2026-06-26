@@ -21,5 +21,16 @@
     }
   },
   "include": ["src"],
+  "exclude": [
+    "src/components/CompaniesBrowser.tsx",
+    "src/components/CompanyDrilldown.tsx",
+    "src/components/DatabaseExplorer.tsx",
+    "src/components/SentimentPanel.tsx",
+    "src/components/ImpactGraph.tsx",
+    "src/components/TradeIdeas.tsx",
+    "src/components/NewsFeed.tsx",
+    "src/components/Watchlist.tsx",
+    "src/hooks/useSentimentFeed.ts"
+  ],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

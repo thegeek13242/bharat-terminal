@@ -1,17 +1,53 @@
 const BASE_URL = '/api';
 
+/** Notified on 401 so the auth layer can clear state + redirect to /login. */
+let onUnauthorized: (() => void) | null = null;
+export function setUnauthorizedHandler(fn: () => void) {
+  onUnauthorized = fn;
+}
+
+export class ApiError extends Error {
+  status: number;
+  detail: string;
+  constructor(status: number, detail: string) {
+    super(`API error ${status}: ${detail}`);
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${BASE_URL}${path}`, {
     headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
     ...options,
   });
   if (!response.ok) {
-    throw new Error(`API error ${response.status}: ${await response.text()}`);
+    const text = await response.text();
+    let detail = text;
+    try {
+      detail = JSON.parse(text).detail ?? text;
+    } catch {
+      /* not JSON */
+    }
+    if (response.status === 401) onUnauthorized?.();
+    throw new ApiError(response.status, detail);
   }
   return response.json();
 }
 
 export const api = {
+  // ── Auth ─────────────────────────────────────────────────────────────
+  authGoogle: (idToken: string) =>
+    request<{ user: any }>('/auth/google', {
+      method: 'POST',
+      body: JSON.stringify({ id_token: idToken }),
+    }),
+
+  me: () => request<{ user: any }>('/auth/me'),
+
+  logout: () => request<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
+
   getNewsFeed: (limit = 50, sector?: string) =>
     request<{ items: any[]; count: number }>(
       `/news/feed?limit=${limit}${sector ? `&sector=${sector}` : ''}`

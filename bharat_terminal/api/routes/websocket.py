@@ -1,7 +1,8 @@
 """WebSocket endpoint for real-time ImpactReport streaming."""
 import uuid
 import logging
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
+from bharat_terminal.api.auth import user_from_session_cookie
 from bharat_terminal.api.ws_manager import manager
 
 logger = logging.getLogger(__name__)
@@ -15,6 +16,12 @@ async def websocket_feed(websocket: WebSocket):
     Client can send JSON messages to filter by sector:
     {"action": "subscribe_sector", "sector": "BANKING"}
     """
+    # Authenticate from the session cookie sent during the handshake.
+    user = user_from_session_cookie(websocket.cookies)
+    if not user:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
     client_id = str(uuid.uuid4())
     await manager.connect(websocket, client_id)
 

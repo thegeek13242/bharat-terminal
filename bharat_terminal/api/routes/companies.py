@@ -60,20 +60,43 @@ async def list_companies(
             {k: v for k, v in params.items() if k not in ("limit", "offset")},
         )).scalar_one()
 
+        # Analyst-first columns backed by data we can TRUST:
+        #  - ltp / chg_1m_pct from price_points (market data, reliable).
+        #  - pe computed live = ltp / eps_ttm, guarded to a sane band (0, 500].
+        #  - mcap_cr and revenue_ttm_cr are systematically scale-corrupted in source
+        #    (small/mid-caps show lakh-crore values overlapping the real large-caps),
+        #    so they are NOT returned — a wrong number is worse than none. Reinstate
+        #    once the fundamentals scale bug is fixed at ingestion.
+        #  - pb_ratio / roe_pct are 100% NULL in source (no equity/book value).
+        #  Default order surfaces names we have a dossier for, then alphabetical.
         rows = (await s.execute(
             text(f"""
                 SELECT c.symbol,
                        c.company_name,
                        c.sector_nse AS sector,
-                       c.mcap_cr,
+                       px.ltp,
+                       CASE WHEN px.close_1m > 0
+                            THEN round((((px.ltp - px.close_1m) / px.close_1m) * 100)::numeric, 2)
+                       END AS chg_1m_pct,
+                       CASE WHEN c.eps_ttm > 0 AND px.ltp IS NOT NULL AND (px.ltp / c.eps_ttm) <= 500
+                            THEN round((px.ltp / c.eps_ttm)::numeric, 1)
+                       END AS pe_ratio,
                        c.is_active,
                        (SELECT MAX(fr.period_end) FROM financial_results fr WHERE fr.symbol = c.symbol) AS latest_quarter,
                        (SELECT COUNT(*) FROM financial_results fr WHERE fr.symbol = c.symbol) AS quarters_loaded,
                        (SELECT d.generated_at FROM company_dossiers d WHERE d.symbol = c.symbol) AS dossier_at,
                        (SELECT d.data_quality FROM company_dossiers d WHERE d.symbol = c.symbol) AS dossier_quality
                 FROM companies c
+                LEFT JOIN LATERAL (
+                    SELECT
+                      (SELECT pp.close FROM price_points pp WHERE pp.symbol = c.symbol
+                         ORDER BY pp.date DESC LIMIT 1) AS ltp,
+                      (SELECT pp.close FROM price_points pp WHERE pp.symbol = c.symbol
+                         AND pp.date <= now() - interval '30 days'
+                         ORDER BY pp.date DESC LIMIT 1) AS close_1m
+                ) px ON true
                 WHERE {where_clause}
-                ORDER BY c.mcap_cr DESC NULLS LAST, c.symbol
+                ORDER BY EXISTS (SELECT 1 FROM company_dossiers d WHERE d.symbol = c.symbol) DESC, c.symbol
                 LIMIT :limit OFFSET :offset
             """),
             params,
@@ -91,13 +114,16 @@ async def get_company(symbol: str):
             text("""
                 SELECT
                     c.symbol, c.company_name, c.isin, c.sector_nse AS sector,
-                    c.industry, c.mcap_cr, c.market_cap_tier,
-                    c.exchange, c.is_active,
-                    c.revenue_ttm_cr, c.pat_ttm_cr, c.ebitda_margin_pct,
-                    c.pe_ratio, c.pb_ratio, c.roe_pct, c.roce_pct,
-                    c.dividend_yield_pct, c.book_value, c.eps_ttm,
-                    c.face_value, c.last_price, c.fifty_two_week_high,
-                    c.fifty_two_week_low, c.dcf_fair_value, c.dcf_margin_of_safety_pct,
+                    c.industry_nse AS industry, c.mcap_cr,
+                    c.exchange, c.is_active, c.description_200w, c.moat_classification,
+                    c.revenue_ttm_cr, c.pat_cr, c.ebitda_margin_pct,
+                    c.pe_ratio, c.pb_ratio, c.roe_pct, c.eps_ttm,
+                    c.net_debt_cr, c.interest_coverage, c.fcf_yield_pct,
+                    c.fair_value_per_share, c.margin_of_safety_pct,
+                    c.dcf_bull_value, c.dcf_bear_value, c.dcf_confidence,
+                    c.median_target_price, c.num_analysts,
+                    c.buy_pct, c.hold_pct, c.sell_pct,
+                    c.revenue_segments, c.geography_split,
                     c.created_at, c.updated_at,
                     (SELECT MAX(period_end) FROM financial_results WHERE symbol = c.symbol) AS latest_quarter,
                     (SELECT COUNT(*) FROM financial_results WHERE symbol = c.symbol) AS quarters_loaded,
