@@ -123,13 +123,14 @@ EVENT_SECTOR_EDGES: list[tuple] = [
     ("budget_infra", 2, "Steel / Construction Materials", "bull", 3, "T+30-90", 30, 90,
      "Second-order demand pull from infra projects ramping."),
 
-    # ── commodity_shock — generic continuous-trigger sleeve used by the
-    # commodity_engine. The detector resolves which specific commodity fired
-    # and the signal generator picks edges by trigger_id at query time.
-    ("commodity_shock", 1, "Direct cost-exposed sectors", "bear", 4, "Intraday", 0, 1,
-     "Companies with the commodity as a major COGS line absorb the move first."),
-    ("commodity_shock", 1, "Direct revenue-exposed sectors", "bull", 4, "Intraday", 0, 1,
-     "Companies that sell the commodity see revenue uplift."),
+    # ── commodity_shock — NO sector edges on purpose.
+    # The commodity engine + Polymarket bridge resolve exposures by trigger_id
+    # against per-company `trigger_betas`; the calibrated beta IS the filter
+    # (only structurally-exposed companies get one). Seeding generic sector
+    # labels here ("Direct cost-exposed sectors", …) would NOT match any real
+    # companies.sector_nse value (which is ~68% NULL and uses NSE sector strings),
+    # so resolve_exposures would silently drop every symbol. Leaving this event
+    # edge-less makes resolve_exposures pass betas through unscoped — verified.
 ]
 
 

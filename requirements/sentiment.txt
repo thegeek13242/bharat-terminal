@@ -1,2 +1,8 @@
 pydantic>=2.6,<3
 aiokafka==0.10.0
+# Feature 3(b): the Polymarket->impact bridge resolves company exposures from the
+# DB (commodity.kb_lookup -> kb.models), so the sentiment image now needs the
+# async DB stack. DATABASE_URL is already provided via compose common-env.
+sqlalchemy[asyncio]==2.0.30
+asyncpg==0.29.0
+pgvector>=0.2,<1
