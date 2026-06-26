@@ -18,6 +18,8 @@ from sqlalchemy import select, and_
 
 from bharat_terminal.kb.models import Company, CompanyRelationship
 from bharat_terminal.kb.company_memory import build_company_memory
+from bharat_terminal.grounding.queries import get_price_returns
+from bharat_terminal.kb.live_price import get_current_ltps
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://bharat:bharat@pos
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 CACHE_TTL = 6 * 3600  # 6 hours
 MEMORY_CACHE_TTL = 15 * 60  # 15 min — memory shifts as fresh news flows
+PRICE_RETURNS_CACHE_TTL = 15 * 60  # prices are EOD-daily; short cache is plenty
 
 app = FastAPI(title="Bharat Terminal KB API", version="1.0.0")
 app.add_middleware(
@@ -135,6 +138,61 @@ async def get_company_memory(symbol: str):
             await redis_client.setex(cache_key, MEMORY_CACHE_TTL, json.dumps(data, default=str))
         except Exception as e:
             logger.warning(f"Redis write failed for memory:{symbol}: {e}")
+
+    return data
+
+
+@app.get("/company/{symbol}/price-returns")
+async def get_company_price_returns(symbol: str, windows: str = Query("1,3,5,30")):
+    """Trailing price returns (+ volatility / drawdown) for a symbol from
+    `price_points`, via grounding.get_price_returns. Backs the analysis
+    'priced-in' check (short windows like 1/3/5d). Short cache; fail-soft —
+    callers treat any error/empty payload as 'unknown' and skip downgrades."""
+    symbol = symbol.upper().strip()
+    try:
+        wins = tuple(int(w) for w in windows.split(",") if w.strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="windows must be comma-separated integers")
+    if not wins:
+        wins = (1, 3, 5, 30)
+    cache_key = f"pricereturns:{symbol}:{windows}"
+
+    if redis_client:
+        try:
+            cached = await redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception as e:
+            logger.warning(f"Redis read failed for {cache_key}: {e}")
+
+    data = await get_price_returns(symbol, windows=wins)
+
+    # Default recent move = shortest available trailing return (daily, EOD).
+    tr = (data.get("trailing_returns_pct") or {}) if isinstance(data, dict) else {}
+    data["recent_move_pct"] = next((tr[k] for k in ("1d", "3d", "5d") if tr.get(k) is not None), None)
+
+    # Enrich with the LIVE equity price (Angel One, fail-open) so the priced-in
+    # check sees today's intraday move, not just yesterday's close. recent_move
+    # becomes (current_ltp / close~3d-ago - 1), combining current + history.
+    if not data.get("error"):
+        try:
+            live = await get_current_ltps([symbol], redis_client)
+            info = live.get(symbol.upper())
+            latest_close = data.get("latest_close")
+            if info and info.get("ltp") and latest_close:
+                data["current_ltp"] = round(info["ltp"], 2)
+                ret_base = next((tr[k] for k in ("3d", "5d", "1d") if tr.get(k) is not None), 0.0) or 0.0
+                baseline = latest_close / (1 + ret_base / 100.0)
+                if baseline:
+                    data["recent_move_pct"] = round((info["ltp"] / baseline - 1) * 100, 2)
+        except Exception as e:
+            logger.debug(f"live-price enrich failed for {symbol} (fail-open): {e}")
+
+    if redis_client:
+        try:
+            await redis_client.setex(cache_key, PRICE_RETURNS_CACHE_TTL, json.dumps(data, default=str))
+        except Exception as e:
+            logger.warning(f"Redis write failed for {cache_key}: {e}")
 
     return data
 
