@@ -20,8 +20,10 @@ logger = logging.getLogger(__name__)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 LLM_MODEL = os.getenv("IMPACT_MODEL", "gemini-2.5-flash")
 KNOWLEDGE_BASE_URL = os.getenv("KNOWLEDGE_BASE_URL", "http://kb-service:8001")
-# Body budget for the impact assessment (filings now carry full attachment text).
-IMPACT_BODY_CHARS = int(os.getenv("IMPACT_BODY_CHARS", "4000"))
+# Body budget for the impact assessment. Accuracy over latency: feed the full
+# filing/article (filings carry full attachment text), not a clipped first page.
+# Bounded only by the PDF extraction cap (FILING_PDF_TEXT_MAX_CHARS).
+IMPACT_BODY_CHARS = int(os.getenv("IMPACT_BODY_CHARS", "120000"))
 
 IMPACT_TOOL = {
     "name": "score_company_impacts",

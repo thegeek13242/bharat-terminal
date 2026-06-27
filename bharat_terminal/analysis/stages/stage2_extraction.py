@@ -20,7 +20,8 @@ LLM_MODEL = os.getenv("EXTRACTION_MODEL", "gemini-2.5-flash")
 # How much of the (now PDF-enriched) filing body to feed the extractor. NSE
 # filings carry full attachment text in body; 800 chars clipped it. gemini-flash
 # is cheap, so give it the salient disclosure.
-EXTRACTION_BODY_CHARS = int(os.getenv("EXTRACTION_BODY_CHARS", "6000"))
+# Accuracy over latency: extract entities/sectors from the full filing text.
+EXTRACTION_BODY_CHARS = int(os.getenv("EXTRACTION_BODY_CHARS", "120000"))
 
 # BSE sector codes (official)
 BSE_SECTORS = [

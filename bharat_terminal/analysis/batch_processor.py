@@ -37,8 +37,10 @@ BATCH_MAX_SIZE  = int(os.getenv("BATCH_MAX_SIZE",  "20"))   # articles per call
 BATCH_WINDOW_S  = int(os.getenv("BATCH_WINDOW_S",  "300"))  # 5-min window
 # Max strong items escalated from batch triage to the full pipeline per batch.
 BATCH_ESCALATE_MAX = int(os.getenv("BATCH_ESCALATE_MAX", "5"))
-# Body truncation per article to keep prompt small
-_BODY_CHARS = 300
+# Off-hours batch triage snippet. Accuracy over latency: a 300-char fragment
+# mis-triages material filings (judged irrelevant -> never escalated -> never
+# analyzed). Give the triage enough context to decide correctly.
+_BODY_CHARS = int(os.getenv("BATCH_BODY_CHARS", "3000"))
 
 _BATCH_TOOL = {
     "name": "batch_analyze_news",

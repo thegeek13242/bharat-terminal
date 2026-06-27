@@ -28,13 +28,14 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-# Guardrails (env-tunable without a rebuild).
-PDF_MAX_BYTES = int(os.getenv("FILING_PDF_MAX_BYTES", str(15 * 1024 * 1024)))  # 15 MB
-PDF_MAX_PAGES = int(os.getenv("FILING_PDF_MAX_PAGES", "40"))
-PDF_FETCH_TIMEOUT_S = float(os.getenv("FILING_PDF_TIMEOUT_S", "12"))
-# Cap stored text so a long filing doesn't bloat Kafka/Postgres; the salient
-# disclosure is near the top (subject, regulation, the actual update).
-PDF_TEXT_MAX_CHARS = int(os.getenv("FILING_PDF_TEXT_MAX_CHARS", "20000"))
+# Guardrails (env-tunable without a rebuild). Accuracy over latency: read the
+# COMPLETE attachment — generous caps so long/detailed filings aren't truncated
+# (and large filings aren't skipped) before analysis. A higher timeout lets big
+# PDFs finish rather than failing soft to the truncated attchmntText.
+PDF_MAX_BYTES = int(os.getenv("FILING_PDF_MAX_BYTES", str(50 * 1024 * 1024)))  # 50 MB
+PDF_MAX_PAGES = int(os.getenv("FILING_PDF_MAX_PAGES", "200"))
+PDF_FETCH_TIMEOUT_S = float(os.getenv("FILING_PDF_TIMEOUT_S", "30"))
+PDF_TEXT_MAX_CHARS = int(os.getenv("FILING_PDF_TEXT_MAX_CHARS", "120000"))
 
 # nsearchives serves the PDF; a browser-like UA + NSE referer avoids 403.
 _PDF_HEADERS = {
