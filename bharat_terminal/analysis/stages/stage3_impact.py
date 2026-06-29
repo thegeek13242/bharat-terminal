@@ -138,7 +138,7 @@ Revenue Segments: {json.dumps(ctx.get('business', {}).get('revenue_segments', []
 
 NEWS:
 Headline: {news_item.headline}
-Body: {(news_item.body or '')[:IMPACT_BODY_CHARS]}
+Body: {(news_item.full_body or news_item.body or '')[:IMPACT_BODY_CHARS]}
 Source: {news_item.source}
 
 COMPANY PROFILES:
@@ -214,7 +214,11 @@ async def score_impacts(
 
     llm_start = time.time()
     try:
-        response = llm.complete(
+        # MUST be the async client: score_impacts runs on the event loop (async
+        # node). A blocking llm.complete() here freezes the loop for the whole
+        # call (30-90s with full_body), which stalls aiokafka heartbeats →
+        # consumer eviction → rebalance storm → pipeline hang.
+        response = await llm.acomplete(
             model=LLM_MODEL,
             max_tokens=2048,
             tools=[IMPACT_TOOL],

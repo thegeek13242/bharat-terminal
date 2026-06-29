@@ -50,7 +50,7 @@ SIGNAL_TOOL = {
 }
 
 
-def generate_signals(
+async def generate_signals(
     news_item: NewsItem,
     company_impacts: List[CompanyImpact],
     macro_theme: str,
@@ -129,7 +129,8 @@ INSTRUCTIONS:
 
     llm_start = time.time()
     try:
-        response = llm.complete(
+        # Async client so the call never blocks the event loop (see stage3 note).
+        response = await llm.acomplete(
             model=LLM_MODEL,
             max_tokens=2048,
             tools=[SIGNAL_TOOL],

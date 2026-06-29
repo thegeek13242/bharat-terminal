@@ -105,6 +105,11 @@ async def main() -> None:
                 f"({len(report.company_impacts)} impacts)"
             )
         except Exception as e:
+            try:
+                from bharat_terminal.alerts import get_monitor
+                get_monitor().record_breach("COMMODITY_PUBLISH_ERROR", str(e)[:200])
+            except Exception:
+                pass
             logger.error(
                 f"[COMMODITY-ENGINE] publish error for {shock.commodity}: {e}",
                 exc_info=True,
@@ -136,4 +141,12 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        try:
+            from bharat_terminal.alerts import get_monitor
+            get_monitor().alert_now("COMMODITY_CRASH", f"commodity engine crashed: {str(e)[:200]}")
+        except Exception:
+            pass
+        raise

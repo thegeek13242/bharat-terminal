@@ -18,9 +18,20 @@ class MoneyControlAdapter(BaseAdapter):
     poll_interval_slow = 300.0
     rate_limit_per_minute = 5
 
+    # Investing.com RSS carries NO <description> — items are headline + link
+    # only — and the article pages are Cloudflare-locked, so this is a
+    # headline-only macro feed. We subscribe to the categories most relevant to
+    # the macro-trigger graph: economy, commodities, forex, broad market, and
+    # earnings. (in.investing.com is in ingestion's _SKIP_FETCH_DOMAINS, so no
+    # body-fetch attempts are made for these.)
     RSS_FEEDS = [
-        "https://in.investing.com/rss/news_14.rss",   # India markets
-        "https://in.investing.com/rss/news_301.rss",  # India economy
+        "https://in.investing.com/rss/news_14.rss",    # Economy news
+        "https://in.investing.com/rss/news_301.rss",   # India economy
+        "https://in.investing.com/rss/news_95.rss",    # Economic indicators
+        "https://in.investing.com/rss/news_11.rss",    # Commodities news
+        "https://in.investing.com/rss/news_1.rss",     # Forex news
+        "https://in.investing.com/rss/news_25.rss",    # Stock market news
+        "https://in.investing.com/rss/news_1062.rss",  # Earnings reports & whispers
     ]
 
     async def fetch(self) -> AsyncIterator[NewsItem]:
@@ -50,6 +61,7 @@ class MoneyControlAdapter(BaseAdapter):
                         category="NEWS",
                         symbols_mentioned=[],
                         tier="tier2",
+                        body_extraction_method="rss",  # headline-only source
                     )
             except Exception as e:
                 logger.error(f"[MC] Error fetching {feed_url}: {e}")

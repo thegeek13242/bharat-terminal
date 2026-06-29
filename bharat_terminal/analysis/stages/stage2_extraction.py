@@ -143,7 +143,7 @@ def _heuristic_extract(news_item: NewsItem) -> Tuple[List[str], str, List[str]]:
     Keyword-based sector detection + symbol extraction for use when no API key is set.
     Returns (affected_sectors, macro_theme, resolved_symbols).
     """
-    text = f"{news_item.headline} {news_item.body or ''}".lower()
+    text = f"{news_item.headline} {news_item.full_body or news_item.body or ''}".lower()
 
     # Sector detection (ordered, deduped)
     seen_sectors: set = set()
@@ -179,7 +179,7 @@ class ExtractionResult(TypedDict):
     resolved_symbols: List[str]
 
 
-def extract_entities(news_item: NewsItem) -> ExtractionResult:
+async def extract_entities(news_item: NewsItem) -> ExtractionResult:
     """
     Extract sector and entity information using Claude Haiku function calling.
     SLA: ≤800ms
@@ -204,14 +204,15 @@ def extract_entities(news_item: NewsItem) -> ExtractionResult:
     prompt = f"""Analyze this Indian financial news and extract structured market intelligence.
 
 Headline: {news_item.headline}
-Body: {(news_item.body or '')[:EXTRACTION_BODY_CHARS]}
+Body: {(news_item.full_body or news_item.body or '')[:EXTRACTION_BODY_CHARS]}
 Source: {news_item.source}
 
 Extract all relevant market entities, sectors, and the macro theme."""
 
     llm_start = time.time()
     try:
-        response = llm.complete(
+        # Async client so the call never blocks the event loop (see stage3 note).
+        response = await llm.acomplete(
             model=LLM_MODEL,
             max_tokens=1024,
             tools=[EXTRACTION_TOOL],

@@ -4,52 +4,68 @@
  * come from the CSS variables in index.css.
  */
 import { CSSProperties, ReactNode } from 'react';
-import logoUrl from '@/assets/logo.svg';
 
 // ── Logo ──────────────────────────────────────────────────────────────────
+// Matches the landing page brand lockup (taperead-landing-page/src/ds/Logo.jsx):
+// inline tape SVG (currentColor bars + one accent bar) + mono "taperead." wordmark
+// + optional TERMINAL tag. Renders as a link when `href` is provided.
 export function Logo({
   size = 22,
   showTag = true,
+  href,
 }: {
   size?: number;
   showTag?: boolean;
+  href?: string;
 }) {
-  return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10 }}>
-      <img
-        src={logoUrl}
-        alt="taperead"
-        width={size}
-        height={size}
-        style={{ width: size, height: size, borderRadius: size * 0.22, display: 'block', flexShrink: 0 }}
-      />
-      <span
-        style={{
-          fontFamily: 'var(--sans)',
-          fontWeight: 600,
-          fontSize: size * 0.74,
-          letterSpacing: '-0.02em',
-          color: 'var(--ink)',
-        }}
-      >
-        taperead
+  const wrap: CSSProperties = {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 10,
+    textDecoration: 'none',
+    color: 'var(--ink)',
+  };
+  const inner = (
+    <>
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-label="Taperead">
+        <rect x="2" y="3.5" width="5" height="2" fill="currentColor" opacity="0.7" />
+        <rect x="9" y="3.5" width="7" height="2" fill="currentColor" opacity="0.45" />
+        <rect x="18" y="3.5" width="4" height="2" fill="currentColor" opacity="0.7" />
+        <rect x="2" y="8.5" width="3" height="2" fill="currentColor" opacity="0.45" />
+        <rect x="7" y="8.5" width="9" height="2" fill="var(--accent)" />
+        <rect x="18" y="8.5" width="4" height="2" fill="currentColor" opacity="0.45" />
+        <rect x="4" y="13.5" width="6" height="2" fill="currentColor" opacity="0.6" />
+        <rect x="12" y="13.5" width="8" height="2" fill="currentColor" opacity="0.45" />
+        <rect x="2" y="18.5" width="10" height="2" fill="currentColor" opacity="0.35" />
+        <rect x="14" y="18.5" width="5" height="2" fill="currentColor" opacity="0.35" />
+      </svg>
+      <span className="mono" style={{ fontSize: 15, fontWeight: 600, letterSpacing: '0.01em', color: 'var(--ink)' }}>
+        taperead<span style={{ color: 'var(--accent)' }}>.</span>
       </span>
       {showTag && (
         <span
           className="mono upper"
           style={{
-            fontSize: 8.5,
-            letterSpacing: '0.18em',
-            color: 'var(--accent)',
-            border: '1px solid var(--accent-line)',
-            borderRadius: 2,
-            padding: '2px 5px',
+            fontSize: 9,
+            letterSpacing: '0.22em',
+            color: 'var(--ink-mute)',
+            borderLeft: '1px solid var(--border-hi)',
+            paddingLeft: 9,
+            marginLeft: 1,
+            alignSelf: 'center',
           }}
         >
-          Terminal
+          TERMINAL
         </span>
       )}
-    </span>
+    </>
+  );
+  return href ? (
+    <a href={href} style={wrap}>
+      {inner}
+    </a>
+  ) : (
+    <span style={wrap}>{inner}</span>
   );
 }
 

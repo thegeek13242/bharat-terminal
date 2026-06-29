@@ -62,6 +62,35 @@ GEMINI_TOOL_MIN_OUTPUT_TOKENS = int(os.getenv("GEMINI_TOOL_MIN_OUTPUT_TOKENS", "
 # deterministic (flash-lite ~75% valid → ~98% with 3 attempts).
 GEMINI_TOOL_MAX_ATTEMPTS = int(os.getenv("GEMINI_TOOL_MAX_ATTEMPTS", "3"))
 
+# ── Per-call timeout budget ──────────────────────────────────────────────────
+# A single model call must NEVER hang forever: a stuck Vertex call froze the
+# analysis consumer for ~7h and silently keeps draining credits. Every call is
+# bounded two ways: (1) an HTTP-level timeout on the SDK client, and (2) an
+# asyncio.wait_for backstop on the async path, in case the SDK timeout fails to
+# fire. On timeout the call RAISES and is NOT retried — a hung call should fail
+# fast (the pipeline skips that item) rather than double the spend.
+LLM_CALL_TIMEOUT_S = float(os.getenv("LLM_CALL_TIMEOUT_S", "120"))
+# The asyncio backstop sits just beyond the HTTP timeout so the SDK aborts the
+# request cleanly first; wait_for only fires if the SDK somehow does not.
+_LLM_WAIT_BACKSTOP_S = LLM_CALL_TIMEOUT_S + float(os.getenv("LLM_TIMEOUT_GRACE_S", "15"))
+
+
+async def _await_budget(coro, *, model: str, what: str):
+    """Await a model-call coroutine under a hard time budget.
+
+    Guarantees the await returns (raising TimeoutError) even if the SDK's own
+    HTTP timeout does not fire — so a stuck Vertex call can never block the
+    caller indefinitely.
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=_LLM_WAIT_BACKSTOP_S)
+    except asyncio.TimeoutError:
+        logger.error(
+            "LLM call exceeded %.0fs budget (model=%s, %s) — aborted to avoid a "
+            "stuck/credit-draining call", _LLM_WAIT_BACKSTOP_S, model, what)
+        raise TimeoutError(
+            f"LLM call to {model} exceeded {_LLM_WAIT_BACKSTOP_S:.0f}s budget ({what})")
+
 
 def _is_malformed_toolcall(resp) -> bool:
     try:
@@ -147,10 +176,11 @@ def _anthropic_client(async_: bool, vertex: bool):
     import anthropic
     if vertex:
         cls = anthropic.AsyncAnthropicVertex if async_ else anthropic.AnthropicVertex
-        return cls(project_id=VERTEX_PROJECT, region=VERTEX_CLAUDE_REGION)
+        return cls(project_id=VERTEX_PROJECT, region=VERTEX_CLAUDE_REGION,
+                   timeout=LLM_CALL_TIMEOUT_S)
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     cls = anthropic.AsyncAnthropic if async_ else anthropic.Anthropic
-    return cls(api_key=api_key)
+    return cls(api_key=api_key, timeout=LLM_CALL_TIMEOUT_S)
 
 
 def _anthropic_kwargs(model: str, vertex: bool, max_tokens: int, system, messages,
@@ -328,8 +358,13 @@ def _wrap_gemini_response(resp, model: str) -> LLMResponse:
 
 def _gemini_client():
     from google import genai
+    from google.genai import types
+    # HttpOptions.timeout is in milliseconds. Bounds every Vertex HTTP request so
+    # a single generate_content can't hang indefinitely (sync path relies on this;
+    # the async path additionally has the asyncio.wait_for backstop).
     return genai.Client(
         vertexai=True, project=VERTEX_PROJECT, location=VERTEX_GEMINI_REGION,
+        http_options=types.HttpOptions(timeout=int(LLM_CALL_TIMEOUT_S * 1000)),
     )
 
 
@@ -404,7 +439,9 @@ async def acomplete(
         client = _anthropic_client(async_=True, vertex=vertex)
         kwargs = _anthropic_kwargs(model, vertex, max_tokens, system, messages,
                                    tools, tool_choice, temperature)
-        return _wrap_anthropic_response(await client.messages.create(**kwargs), model, provider)
+        resp = await _await_budget(client.messages.create(**kwargs),
+                                   model=model, what="anthropic.messages.create")
+        return _wrap_anthropic_response(resp, model, provider)
     # gemini-vertex
     contents, cfg = _gemini_translate(system, messages, tools, tool_choice,
                                       max_tokens, temperature)
@@ -413,8 +450,9 @@ async def acomplete(
     client = _gemini_client()
     attempts = GEMINI_TOOL_MAX_ATTEMPTS if tools else 1
     for attempt in range(attempts):
-        resp = await client.aio.models.generate_content(
-            model=model, contents=contents, config=cfg)
+        resp = await _await_budget(
+            client.aio.models.generate_content(model=model, contents=contents, config=cfg),
+            model=model, what="gemini.generate_content")
         if not (tools and _is_malformed_toolcall(resp)) or attempt == attempts - 1:
             break
         logger.info("gemini MALFORMED_FUNCTION_CALL; retry %d/%d", attempt + 1, attempts - 1)
@@ -477,10 +515,18 @@ async def grounded_search(
     for attempt in range(GROUNDING_MAX_RETRIES):
         client = _gemini_client()  # retained local; see complete() note
         try:
-            resp = await client.aio.models.generate_content(
-                model=model, contents=contents, config=cfg)
+            resp = await _await_budget(
+                client.aio.models.generate_content(model=model, contents=contents, config=cfg),
+                model=model, what="grounded_search")
             return {"text": _wrap_gemini_response(resp, model).text,
                     "sources": _extract_sources(resp)}
+        except TimeoutError as e:
+            # A stuck grounding call must not hang the agent or burn credits on a
+            # retry — degrade gracefully so the dossier proceeds on DB-grounded data.
+            logger.warning("grounded_search timed out; degrading gracefully: %s", str(e)[:200])
+            return {"text": "", "sources": [],
+                    "error": "web_search timed out — proceed using DB-grounded data; "
+                             "do not retry this query immediately."}
         except Exception as e:
             if not _is_rate_limited(e):
                 raise

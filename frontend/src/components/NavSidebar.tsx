@@ -8,6 +8,7 @@ const SIDEBAR_MAX = 420;
 
 const NAV: { to: string; label: string; key: string }[] = [
   { to: '/terminal', label: 'Feed', key: 'feed' },
+  { to: '/signals', label: 'Signals', key: 'signals' },
   { to: '/watchlist', label: 'Watchlist', key: 'watchlist' },
   { to: '/universe', label: 'Universe', key: 'universe' },
 ];

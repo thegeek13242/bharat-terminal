@@ -55,7 +55,7 @@ export function Login() {
             minWidth: 0,
           }}
         >
-          <Logo size={24} />
+          <Logo size={24} href="https://taperead.trade" />
           <div style={{ maxWidth: 440 }}>
             <div className="mono upper" style={{ fontSize: 10, letterSpacing: '0.2em', color: 'var(--accent)', marginBottom: 22 }}>
               Market Intelligence

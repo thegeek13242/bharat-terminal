@@ -273,7 +273,7 @@ def classify_relevance(news_item: NewsItem) -> RelevanceResult:
         )
 
     headline = (news_item.headline or "").strip()
-    body = (news_item.body or "")[:RELEVANCE_BODY_CHARS].strip()
+    body = (news_item.full_body or news_item.body or "")[:RELEVANCE_BODY_CHARS].strip()
 
     if not headline:
         return RelevanceResult(

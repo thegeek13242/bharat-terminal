@@ -68,9 +68,9 @@ def stage1_node(state: PipelineState) -> PipelineState:
     }
 
 
-def stage2_node(state: PipelineState) -> PipelineState:
+async def stage2_node(state: PipelineState) -> PipelineState:
     """Stage 2: Entity/sector extraction."""
-    result = extract_entities(state["news_item"])
+    result = await extract_entities(state["news_item"])
     return {
         **state,
         "macro_theme": result["macro_theme"],
@@ -110,9 +110,9 @@ async def stage4_node(state: PipelineState) -> PipelineState:
     return {**state, "all_impacts": all_impacts}
 
 
-def stage5_node(state: PipelineState) -> PipelineState:
+async def stage5_node(state: PipelineState) -> PipelineState:
     """Stage 5: Trade signal generation."""
-    signals = generate_signals(
+    signals = await generate_signals(
         state["news_item"],
         state["all_impacts"],
         state["macro_theme"],

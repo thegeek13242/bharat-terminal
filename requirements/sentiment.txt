@@ -6,3 +6,9 @@ aiokafka==0.10.0
 sqlalchemy[asyncio]==2.0.30
 asyncpg==0.29.0
 pgvector>=0.2,<1
+# The Polymarket->impact bridge runs analysis.signal_gates, which resolves
+# tickers via the kb-service over HTTP (httpx) and dedups emitted signals via
+# Redis. Without these the bridge logs "No module named 'httpx'" and drops
+# every candidate signal as unresolvable. Pins match requirements/analysis.txt.
+httpx>=0.27,<1
+redis==5.0.8

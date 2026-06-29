@@ -635,7 +635,15 @@ def main():
         print(f"Result: {result}")
     elif args.command == "monitor":
         from bharat_terminal.kb.sync.monitor import main as monitor_main
-        asyncio.run(monitor_main())
+        try:
+            asyncio.run(monitor_main())
+        except Exception as e:
+            try:
+                from bharat_terminal.alerts import get_monitor
+                get_monitor().alert_now("KB_MONITOR_CRASH", f"kb-monitor crashed: {str(e)[:200]}")
+            except Exception:
+                pass
+            raise
     else:
         parser.print_help()
         sys.exit(1)

@@ -58,4 +58,12 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        try:
+            from bharat_terminal.alerts import get_monitor
+            get_monitor().alert_now("FNO_CRASH", f"fno-engine service crashed: {str(e)[:200]}")
+        except Exception:
+            pass
+        raise
