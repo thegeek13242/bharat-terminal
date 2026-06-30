@@ -33,6 +33,13 @@ class NewsKafkaConsumer:
             auto_commit_interval_ms=1000,
             value_deserializer=lambda v: json.loads(v.decode("utf-8")),
             max_poll_records=10,
+            # Off-hours batches and full-body items block the loop for 50-90s,
+            # which exceeded the default 10s session timeout → the broker evicted
+            # the consumer mid-batch → rebalance storm → stall. Give heartbeats
+            # enough slack to survive a long batch, and a generous poll interval.
+            session_timeout_ms=int(os.getenv("KAFKA_SESSION_TIMEOUT_MS", "120000")),
+            heartbeat_interval_ms=int(os.getenv("KAFKA_HEARTBEAT_INTERVAL_MS", "20000")),
+            max_poll_interval_ms=int(os.getenv("KAFKA_MAX_POLL_INTERVAL_MS", "900000")),
         )
         await self._consumer.start()
         logger.info(f"Consumer connected. Listening on {TOPIC_ENRICHED_NEWS}")

@@ -244,9 +244,12 @@ class Monitor:
     # ── Daily Price Sync ───────────────────────────────────────────────────
 
     async def daily_price_sync(self):
-        """Download bhavcopy after market close (16:30 IST weekdays)."""
+        """Download bhavcopy after NSE publishes it (~18:00 IST). Runs at 19:00
+        IST: the old 16:30 slot fired BEFORE the same-day bhavcopy existed, so
+        every run 404'd on the current day and price_points lagged a full
+        trading day. The backfill loop still catches any missed prior days."""
         while not self._shutdown.is_set():
-            target = self._next_occurrence(hour=16, minute=30)
+            target = self._next_occurrence(hour=19, minute=0)
             while target.weekday() >= 5:
                 target += timedelta(days=1)
 
