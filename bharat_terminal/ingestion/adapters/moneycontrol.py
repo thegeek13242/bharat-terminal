@@ -20,18 +20,17 @@ class MoneyControlAdapter(BaseAdapter):
 
     # Investing.com RSS carries NO <description> — items are headline + link
     # only — and the article pages are Cloudflare-locked, so this is a
-    # headline-only macro feed. We subscribe to the categories most relevant to
-    # the macro-trigger graph: economy, commodities, forex, broad market, and
-    # earnings. (in.investing.com is in ingestion's _SKIP_FETCH_DOMAINS, so no
-    # body-fetch attempts are made for these.)
+    # headline-only MACRO feed. We deliberately keep ONLY the macro categories
+    # that feed the trigger graph (economy, commodities, forex, indicators).
+    # The broad "Stock Market" (news_25) and "Earnings" (news_1062) feeds were
+    # ~80% foreign single-stock noise (US/EU analyst ratings, overseas earnings)
+    # that flooded the feed with India-irrelevant items — dropped.
     RSS_FEEDS = [
         "https://in.investing.com/rss/news_14.rss",    # Economy news
         "https://in.investing.com/rss/news_301.rss",   # India economy
         "https://in.investing.com/rss/news_95.rss",    # Economic indicators
         "https://in.investing.com/rss/news_11.rss",    # Commodities news
         "https://in.investing.com/rss/news_1.rss",     # Forex news
-        "https://in.investing.com/rss/news_25.rss",    # Stock market news
-        "https://in.investing.com/rss/news_1062.rss",  # Earnings reports & whispers
     ]
 
     async def fetch(self) -> AsyncIterator[NewsItem]:
