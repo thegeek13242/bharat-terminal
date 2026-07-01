@@ -4,9 +4,7 @@ Research agent — derives a citation-backed beta for (symbol, trigger).
 Flow per pair:
   1. Pull company context from KB (financial_results + segment data already
      parsed from XBRL by the existing kb-sync pipeline).
-  2. Invoke Claude with three tools:
-       - fetch_bse_filings      (BSE corporate filings index for the symbol)
-       - fetch_bse_xbrl_text    (raw XBRL text of a chosen filing)
+  2. Invoke Claude with these tools:
        - web_search             (Anthropic server-side web search)
      Plus a final structured-output tool the agent MUST call to submit:
        - submit_exposure        (the structured beta + exposure record)
@@ -32,7 +30,7 @@ from typing import Any, Dict, List, Optional
 
 from bharat_terminal import llm
 from bharat_terminal.llm import provider_for_model
-from bharat_terminal.research import bse_xbrl, db
+from bharat_terminal.research import db
 
 logger = logging.getLogger(__name__)
 
@@ -45,47 +43,6 @@ ENABLE_WEB_SEARCH = os.getenv("RESEARCH_ENABLE_WEB_SEARCH", "1") == "1"
 
 
 # ── Tool schemas exposed to Claude ──────────────────────────────────────
-
-TOOL_FETCH_BSE_FILINGS = {
-    "name": "fetch_bse_filings",
-    "description": (
-        "List recent BSE corporate filings for a security (results, annual "
-        "reports, etc). Returns a list with headline, filing_date, pdf_url "
-        "and xbrl_url. Use this to discover which filing to read."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "symbol": {
-                "type": "string",
-                "description": "NSE-style symbol, e.g. RELIANCE, INDIGO, ASIANPAINT",
-            },
-            "category": {
-                "type": "string",
-                "enum": ["Result", "Annual Report", "Corp. Action"],
-                "default": "Result",
-            },
-            "months_back": {"type": "integer", "default": 18, "minimum": 3, "maximum": 36},
-        },
-        "required": ["symbol"],
-    },
-}
-
-TOOL_FETCH_BSE_XBRL_TEXT = {
-    "name": "fetch_bse_xbrl_text",
-    "description": (
-        "Fetch the raw XBRL document text for a previously-listed filing. "
-        "Returns up to 30k chars of textual content (numeric facts preserved, "
-        "XML tags stripped). Use only after fetch_bse_filings to pick a URL."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "xbrl_url": {"type": "string", "description": "URL from fetch_bse_filings"},
-        },
-        "required": ["xbrl_url"],
-    },
-}
 
 TOOL_GET_KB_CONTEXT = {
     "name": "get_kb_company_context",
@@ -172,8 +129,6 @@ TOOL_SUBMIT_EXPOSURE = {
 def _build_tools() -> List[Dict[str, Any]]:
     tools: List[Dict[str, Any]] = [
         TOOL_GET_KB_CONTEXT,
-        TOOL_FETCH_BSE_FILINGS,
-        TOOL_FETCH_BSE_XBRL_TEXT,
         TOOL_SUBMIT_EXPOSURE,
     ]
     if ENABLE_WEB_SEARCH:
@@ -204,22 +159,20 @@ def _build_system_prompt() -> str:
         "trigger — and back every numeric claim with a citation.\n\n"
         "RULES:\n"
         "1. Always start by calling get_kb_company_context to see what we "
-        "   already know about the company.\n"
-        "2. Use fetch_bse_filings + fetch_bse_xbrl_text to read the latest "
-        "   annual report or quarterly result for cost-structure data. "
-        "   This is the ground truth.\n"
-        "3. Use web_search to fill gaps (analyst commentary, segment "
+        "   already know about the company — financials and segment data are "
+        "   already parsed from NSE XBRL into our DB; treat them as ground truth.\n"
+        "2. Use web_search to fill gaps (analyst commentary, segment "
         "   commentary, supplier disclosures). Quote short snippets only.\n"
-        "4. NEVER invent numbers. If filings don't disclose the input cost "
+        "3. NEVER invent numbers. If filings don't disclose the input cost "
         "   you need, set pct_of_total=null and rely on qualitative reasoning "
         "   for a SMALL beta with confidence='low'.\n"
-        "5. End with EXACTLY ONE call to submit_exposure. Every numeric "
+        "4. End with EXACTLY ONE call to submit_exposure. Every numeric "
         "   claim in `rationale`, `mechanism`, `pct_of_total` must appear "
         "   in `citations` with a real URL.\n"
-        "6. Beta sign convention: positive beta = stock moves WITH the "
+        "5. Beta sign convention: positive beta = stock moves WITH the "
         "   trigger; negative = inverse. Producers of a commodity are "
         "   positive to its price; consumers are negative.\n"
-        "7. Realistic absolute beta for most stocks is below 1.0. Pure-play "
+        "6. Realistic absolute beta for most stocks is below 1.0. Pure-play "
         "   producers can reach ~0.9. Reject any reasoning that yields |β|>1.5 "
         "   without overwhelming evidence."
     )
@@ -230,7 +183,7 @@ def _build_user_prompt(symbol: str, trigger_id: str, trigger_label: str) -> str:
         f"Calibrate the beta of {symbol} (NSE) to {trigger_label} "
         f"(trigger_id={trigger_id}).\n\n"
         f"Specifically: by how many percent does {symbol}'s equity return move "
-        f"for a +1% move in {trigger_label}? Use BSE filings (XBRL preferred) "
+        f"for a +1% move in {trigger_label}? Use our KB financials/segment data "
         f"plus web research. Output via submit_exposure."
     )
 
@@ -241,24 +194,6 @@ async def _execute_tool(name: str, args: Dict[str, Any]) -> Any:
     if name == "get_kb_company_context":
         ctx = await db.get_company_context(args["symbol"])
         return ctx or {"error": f"No KB record for {args['symbol']}"}
-
-    if name == "fetch_bse_filings":
-        symbol = args["symbol"]
-        scrip = await bse_xbrl.resolve_security_code(symbol)
-        if not scrip:
-            return {"error": f"Could not resolve BSE security code for {symbol}"}
-        filings = await bse_xbrl.list_filings(
-            scrip,
-            category=args.get("category", "Result"),
-            months_back=int(args.get("months_back", 18)),
-        )
-        return {"security_code": scrip, "filings": filings}
-
-    if name == "fetch_bse_xbrl_text":
-        text = await bse_xbrl.fetch_xbrl_text(args["xbrl_url"])
-        if text is None:
-            return {"error": "Could not fetch XBRL text"}
-        return {"text": text}
 
     return {"error": f"Unknown tool: {name}"}
 

@@ -156,6 +156,10 @@ class AngelOneMCXAdapter:
         self._scrip_refresh_hours = scrip_refresh_hours
         self._reconnect_delay = reconnect_delay_seconds
         self._max_reconnect_delay = max_reconnect_delay_seconds
+        # Re-publish the Redis session token this often while connected, so the
+        # KB live-price (priced-in) check never falls back to stale EOD data
+        # mid-session. Must stay well under the 13h TTL set in _publish_session.
+        self._session_refresh_s = float(os.getenv("ANGELONE_SESSION_REFRESH_S", str(4 * 3600)))
 
         # Resolved on login / token-refresh
         self._jwt_token: Optional[str] = None
@@ -244,6 +248,7 @@ class AngelOneMCXAdapter:
                 # KB price endpoint) can REUSE it for on-demand equity LTP without
                 # a second login (Angel One is single-session). Fail-open.
                 await self._publish_session()
+                last_session_publish = time.time()
 
                 # 2) Refresh scrip master if stale (or first time)
                 now = time.time()
@@ -262,9 +267,13 @@ class AngelOneMCXAdapter:
                 self._connected.clear()
                 self._open_websocket()
 
-                # 4) Wait until disconnected (or shutdown)
+                # 4) Wait until disconnected (or shutdown), refreshing the Redis
+                #    session token periodically so it never expires mid-session.
                 while self._running and self._ws_thread and self._ws_thread.is_alive():
                     await asyncio.sleep(1)
+                    if time.time() - last_session_publish > self._session_refresh_s:
+                        await self._publish_session()
+                        last_session_publish = time.time()
 
                 logger.warning(f"[{self.source_name}] WebSocket loop exited")
                 # Reset backoff after a clean run >5min

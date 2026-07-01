@@ -36,7 +36,7 @@ import httpx
 from bharat_terminal import grounding, llm
 from bharat_terminal.llm import provider_for_model
 
-from bharat_terminal.research import bse_xbrl, db
+from bharat_terminal.research import db
 
 logger = logging.getLogger(__name__)
 
@@ -89,38 +89,6 @@ TOOL_GET_KB_CONTEXT = {
     },
 }
 
-TOOL_FETCH_BSE_FILINGS = {
-    "name": "fetch_bse_filings",
-    "description": (
-        "List recent BSE corporate filings. Use category='Result' for "
-        "quarterly results, 'Annual Report' for AR. Returns headline + "
-        "filing_date + xbrl_url + pdf_url for each."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "symbol": {"type": "string"},
-            "category": {"type": "string", "enum": ["Result", "Annual Report", "Investor Presentation", "All"]},
-            "months_back": {"type": "integer", "minimum": 1, "maximum": 36, "default": 18},
-        },
-        "required": ["symbol"],
-    },
-}
-
-TOOL_FETCH_BSE_XBRL_TEXT = {
-    "name": "fetch_bse_xbrl_text",
-    "description": (
-        "Fetch the raw XBRL text for a previously-listed filing. Returns up "
-        "to 30k chars (numeric facts preserved). Use to read management "
-        "discussion, segment breakdown, key risks."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {"xbrl_url": {"type": "string"}},
-        "required": ["xbrl_url"],
-    },
-}
-
 TOOL_LIST_TRIGGERS = {
     "name": "list_triggers",
     "description": (
@@ -149,7 +117,7 @@ TOOL_GET_FINANCIALS = {
         "This is parsed from NSE filings into our own database and is "
         "AUTHORITATIVE — use it for every reported financial figure and cite it "
         "via the returned `provenance` (source NSE_DB, period_end, nse_filing_id). "
-        "Do NOT call web_search or fetch_bse_xbrl_text to re-source these numbers."
+        "Do NOT call web_search to re-source these numbers."
     ),
     "input_schema": {
         "type": "object",
@@ -508,8 +476,6 @@ def _build_tools() -> List[Dict[str, Any]]:
         TOOL_GET_PRICE_RETURNS,
         TOOL_GET_SHAREHOLDING,
         TOOL_GET_CORPORATE_ACTIONS,
-        TOOL_FETCH_BSE_FILINGS,
-        TOOL_FETCH_BSE_XBRL_TEXT,
         TOOL_LIST_TRIGGERS,
         TOOL_SUBMIT_DOSSIER,
     ]
@@ -542,16 +508,15 @@ def _build_system_prompt(refresh_kind: str) -> str:
         "5. Call get_corporate_actions for dividend / buyback / bonus / split "
         "history (authoritative, from NSE).\n"
         "6. Call list_triggers to see the catalog of macro/commodity variables.\n"
-        "7. Optionally call fetch_bse_filings / fetch_bse_xbrl_text for segment "
-        "detail, mgmt commentary and risk factors not in our parsed financials. "
-        "NEVER use these (or web_search) to re-source a REPORTED financial figure "
-        "that get_financials already returns — that data is in our database.\n"
-        "8. Use web_search ONLY to fill remaining gaps our data cannot cover: "
-        "peer market shares, customer/supplier concentration, broker targets, "
-        "forward guidance. Our DB already has financials, prices, SHAREHOLDING "
-        "(promoter/FII/DII), and CORPORATE ACTIONS (dividends/buybacks) — do NOT "
-        "web_search for any of those. Cite web source URLs it returns.\n"
-        "9. End with EXACTLY ONE call to submit_dossier containing the full "
+        "7. Use web_search ONLY to fill remaining gaps our data cannot cover: "
+        "segment detail, mgmt commentary, risk factors, peer market shares, "
+        "customer/supplier concentration, broker targets, forward guidance. "
+        "NEVER use web_search to re-source a REPORTED financial figure that "
+        "get_financials already returns — that data is in our database. Our DB "
+        "already has financials, prices, SHAREHOLDING (promoter/FII/DII), and "
+        "CORPORATE ACTIONS (dividends/buybacks) — do NOT web_search for any of "
+        "those. Cite web source URLs it returns.\n"
+        "8. End with EXACTLY ONE call to submit_dossier containing the full "
         "structured payload.\n\n"
 
         "QUALITY RULES (non-negotiable):\n"
@@ -642,24 +607,6 @@ async def _execute_tool(name: str, args: Dict[str, Any]) -> Any:
         # Pull from DB so the agent sees exactly what's in the triggers table.
         rows = await db.list_triggers()
         return {"triggers": rows}
-
-    if name == "fetch_bse_filings":
-        symbol = args["symbol"]
-        scrip = await bse_xbrl.resolve_security_code(symbol)
-        if not scrip:
-            return {"error": f"Could not resolve BSE security code for {symbol}"}
-        filings = await bse_xbrl.list_filings(
-            scrip,
-            category=args.get("category", "Result"),
-            months_back=int(args.get("months_back", 18)),
-        )
-        return {"security_code": scrip, "filings": filings}
-
-    if name == "fetch_bse_xbrl_text":
-        text = await bse_xbrl.fetch_xbrl_text(args["xbrl_url"])
-        if text is None:
-            return {"error": "Could not fetch XBRL text"}
-        return {"text": text[:30000]}  # truncate to context budget
 
     return {"error": f"Unknown tool: {name}"}
 

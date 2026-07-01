@@ -1,6 +1,8 @@
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 aiokafka==0.10.0
+cramjam==2.8.3  # codec backend aiokafka uses for snappy/lz4/zstd; without it the
+                # relay cannot decode non-gzip messages and stalls the consumer
 redis[asyncio]==5.0.4
 httpx==0.27.0
 pydantic==2.6.3

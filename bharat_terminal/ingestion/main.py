@@ -11,7 +11,6 @@ from bharat_terminal.ingestion.kafka_producer import NewsKafkaProducer
 from bharat_terminal.ingestion.dedup import DedupFilter
 from bharat_terminal.ingestion.article_fetcher import ArticleFetcher
 from bharat_terminal.ingestion.adapters.nse_filings import NSEFilingsAdapter
-from bharat_terminal.ingestion.adapters.bse_filings import BSEFilingsAdapter
 from bharat_terminal.ingestion.adapters.economic_times import EconomicTimesAdapter
 from bharat_terminal.ingestion.adapters.mint import MintAdapter
 from bharat_terminal.ingestion.adapters.ndtv_profit import NDTVProfitAdapter
@@ -35,11 +34,16 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 #     Downstream can resolve these separately if they become important.
 #   • NSE/BSE announcement pages — these are symbol lookup pages, not articles;
 #     useful text lives in the PDF attachment referenced by the filing.
+#   • in.investing.com — article pages sit behind a Cloudflare JS challenge that
+#     hard-403s every server-side fetch, so body extraction is impossible. The
+#     RSS feeds carry no <description> either, so Investing.com is a headline-only
+#     macro source; don't waste fetch attempts on it.
 _SKIP_FETCH_DOMAINS = {
     "news.google.com",
     "www.google.com",
     "www.nseindia.com",
     "www.bseindia.com",
+    "in.investing.com",
 }
 
 
@@ -165,12 +169,26 @@ async def main():
 
         await producer.publish(item)
 
+        # Every item must reach raw.news.enriched.in — that is the stream the
+        # analysis pipeline consumes. Items eligible for body extraction go via
+        # the ArticleFetcher (which publishes the enriched copy on success AND
+        # failure, and a body-less copy if its queue is saturated). Everything
+        # else — filings, sentiment, no-URL, skip-fetch domains, or when the
+        # fetcher is disabled — is published body-less here so it is still
+        # analysed (on its headline + RSS summary).
         if fetcher and _should_fetch_body(item):
             await fetcher.enqueue(item)
+        else:
+            enriched = item.model_copy(update={
+                "full_body": None,
+                "body_word_count": 0,
+                "body_fetch_status": "skipped",
+                "body_extraction_method": item.body_extraction_method or "rss",
+            })
+            await producer.publish_enriched(enriched)
 
     adapters = [
         NSEFilingsAdapter(redis_client=redis_client),
-        BSEFilingsAdapter(redis_client=redis_client),
         EconomicTimesAdapter(redis_client=redis_client),
         MintAdapter(redis_client=redis_client),
         NDTVProfitAdapter(redis_client=redis_client),
@@ -195,6 +213,15 @@ async def main():
         except asyncio.CancelledError:
             pass
         except Exception as e:
+            # A crashed adapter stops a news source entirely — critical.
+            try:
+                from bharat_terminal.alerts import get_monitor
+                get_monitor().alert_now(
+                    "INGESTION_ADAPTER_CRASH",
+                    f"adapter {adapter.source_name} crashed: {str(e)[:200]}",
+                )
+            except Exception:
+                pass
             logger.error(
                 f"Adapter {adapter.source_name} crashed: {e}", exc_info=True
             )
@@ -233,4 +260,12 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        try:
+            from bharat_terminal.alerts import get_monitor
+            get_monitor().alert_now("INGESTION_CRASH", f"ingestion service crashed: {str(e)[:200]}")
+        except Exception:
+            pass
+        raise

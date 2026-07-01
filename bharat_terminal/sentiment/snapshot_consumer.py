@@ -74,6 +74,11 @@ class SentimentImpactBridgeConsumer:
             try:
                 report = await build_impact_report_from_sentiment(snap)
             except Exception as e:
+                try:
+                    from bharat_terminal.alerts import get_monitor
+                    get_monitor().record_breach("SENTIMENT_BRIDGE_ERROR", str(e)[:200])
+                except Exception:
+                    pass
                 logger.error(f"[SENTIMENT-BRIDGE] bridge error for {snap.macro_theme}: {e}", exc_info=True)
                 continue
             if report is None or not report.company_impacts:

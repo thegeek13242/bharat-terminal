@@ -31,6 +31,7 @@ from bharat_terminal.api.routes import (
     websocket,
     sentiment,
     signal_accuracy,
+    signals_report,
 )
 from bharat_terminal.api.ws_manager import manager
 
@@ -95,6 +96,7 @@ app.include_router(graph.router, dependencies=_auth)
 app.include_router(watchlist.router, dependencies=_auth)
 app.include_router(sentiment.router, dependencies=_auth)
 app.include_router(signal_accuracy.router, dependencies=_auth)
+app.include_router(signals_report.router, dependencies=_auth)
 app.include_router(websocket.router)
 
 

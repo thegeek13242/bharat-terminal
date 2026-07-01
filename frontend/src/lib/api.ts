@@ -159,6 +159,14 @@ export const api = {
   getDossierTriggers: () =>
     request<{ count: number; items: any[] }>(`/dossier/triggers/`),
 
+  // ── Daily signal reports ─────────────────────────────────────────────
+  /** Current actionable trading day (live), or a specific date's report. */
+  getSignalReport: (date?: string) =>
+    request<any>(date ? `/signals/daily-report/${date}` : `/signals/daily-report`),
+
+  getSignalReportDates: (limit = 120) =>
+    request<{ dates: any[] }>(`/signals/report-dates?limit=${limit}`),
+
   // ── DB Explorer ──────────────────────────────────────────────────────
   listDbTables: () => request<{ tables: any[] }>(`/db/tables`),
 

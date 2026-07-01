@@ -35,6 +35,10 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration ────────────────────────────────────────────────────────
 
+# Body chars shown to the relevance judge. Accuracy over latency: 200 chars can
+# mis-gate a filing whose material point is past the first line (a false-negative
+# here drops the item from the WHOLE pipeline), so give the judge more context.
+RELEVANCE_BODY_CHARS = int(os.getenv("RELEVANCE_BODY_CHARS", "1500"))
 RELEVANCE_BACKEND = os.getenv("RELEVANCE_BACKEND", "local").lower()
 RELEVANCE_MODEL = os.getenv(
     "RELEVANCE_MODEL", "MoritzLaurer/deberta-v3-base-zeroshot-v2.0"
@@ -269,7 +273,7 @@ def classify_relevance(news_item: NewsItem) -> RelevanceResult:
         )
 
     headline = (news_item.headline or "").strip()
-    body = (news_item.body or "")[:200].strip()
+    body = (news_item.full_body or news_item.body or "")[:RELEVANCE_BODY_CHARS].strip()
 
     if not headline:
         return RelevanceResult(

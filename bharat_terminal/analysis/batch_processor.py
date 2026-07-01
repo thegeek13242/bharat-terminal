@@ -37,8 +37,15 @@ BATCH_MAX_SIZE  = int(os.getenv("BATCH_MAX_SIZE",  "20"))   # articles per call
 BATCH_WINDOW_S  = int(os.getenv("BATCH_WINDOW_S",  "300"))  # 5-min window
 # Max strong items escalated from batch triage to the full pipeline per batch.
 BATCH_ESCALATE_MAX = int(os.getenv("BATCH_ESCALATE_MAX", "5"))
-# Body truncation per article to keep prompt small
-_BODY_CHARS = 300
+# Off-hours batch TRIAGE snippet. This path packs up to BATCH_MAX_SIZE items
+# into ONE LLM call, so the per-item budget is multiplied by the batch size —
+# a large value here (e.g. a full article) produces a multi-hundred-K-char
+# prompt that runs 85-110s and can hang the consumer. Triage only needs enough
+# context to decide relevance + which items to escalate; the escalated items go
+# through the full RT pipeline, which DOES read the complete full_body (120k).
+# So keep this small. (Was briefly raised to 12000 and overloaded the batch
+# call — do not feed full_body here.)
+_BODY_CHARS = int(os.getenv("BATCH_BODY_CHARS", "3000"))
 
 _BATCH_TOOL = {
     "name": "batch_analyze_news",
@@ -120,7 +127,7 @@ def _build_prompt(items: List[NewsItem]) -> str:
         "Return one result per article in the same order.\n"
     ]
     for i, item in enumerate(items):
-        body_snippet = (item.body or "")[:_BODY_CHARS]
+        body_snippet = (item.full_body or item.body or "")[:_BODY_CHARS]
         lines.append(
             f"--- Article {i} ---\n"
             f"Headline: {item.headline}\n"

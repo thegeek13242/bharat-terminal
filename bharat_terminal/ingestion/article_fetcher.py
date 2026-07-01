@@ -145,13 +145,31 @@ class ArticleFetcher:
         logger.info("ArticleFetcher stopped")
 
     async def enqueue(self, item: NewsItem) -> None:
-        """Enqueue an item for body fetching. Non-blocking if queue has space."""
+        """Enqueue an item for body fetching. Non-blocking if queue has space.
+
+        If the queue is saturated we must NOT silently drop the item: analysis
+        consumes the enriched topic, so a dropped item would never be analysed.
+        Instead publish a body-less enriched copy so it is still processed on
+        its headline + RSS summary.
+        """
         try:
             self._queue.put_nowait(item)
         except asyncio.QueueFull:
             logger.warning(
-                f"ArticleFetcher queue full, dropping fetch for {item.url[:80]}"
+                f"ArticleFetcher queue full; publishing {item.url[:80]} body-less"
             )
+            fallback = item.model_copy(update={
+                "full_body": None,
+                "body_word_count": 0,
+                "body_fetch_status": "skipped",
+                "body_extraction_method": None,
+            })
+            try:
+                await self._publish(fallback)
+            except Exception as e:
+                logger.error(
+                    f"Failed to publish body-less fallback for {item.id}: {e}"
+                )
 
     async def _worker(self, wid: int) -> None:
         logger.debug(f"ArticleFetcher worker {wid} started")

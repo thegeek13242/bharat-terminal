@@ -55,6 +55,13 @@ class LLMCallLogger:
         self._total_cost_usd += record.cost_usd
         self._call_count += 1
 
+        # Feed the rolling-hour cost guardrail (alerts if spend exceeds budget).
+        try:
+            from bharat_terminal.analysis.guardrails import get_monitor
+            get_monitor().record_cost(record.cost_usd)
+        except Exception:
+            pass  # guardrails must never break logging
+
         logger.info(
             f"LLM[{record.stage}] model={record.model} "
             f"tokens={record.prompt_tokens}+{record.completion_tokens} "

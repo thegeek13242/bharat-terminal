@@ -9,6 +9,7 @@ Persistence strategy:
   PostgreSQL — news_items table, impact_reports table (INSERT … ON CONFLICT DO NOTHING)
 """
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ from sqlalchemy import text
 
 from bharat_terminal.api.ws_manager import manager
 from bharat_terminal.api.db import get_session_factory
+from bharat_terminal.alerts import get_monitor
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,7 @@ async def _relay_loop():
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                get_monitor().record_breach("API_RELAY_ERROR", str(e)[:200])
                 logger.error(f"Relay error: {e}", exc_info=True)
 
     except asyncio.CancelledError:
@@ -129,6 +132,9 @@ async def _handle_report(report: dict):
     try:
         await _persist_to_db(report, news_item, news_id)
     except Exception as e:
+        # Repeated persist failures = the feed is silently not being stored
+        # (DB down / schema drift). Alert when it happens consistently.
+        get_monitor().record_breach("API_DB_PERSIST", str(e)[:200])
         logger.warning(f"DB persist failed (continuing): {e}")
 
     # ── 4. WebSocket broadcast ────────────────────────────────────────────
@@ -199,6 +205,66 @@ async def _persist_to_db(report: dict, news_item: dict, news_id: str):
                 },
             )
 
+        # ── Immutable compliance/audit record (append-only) ───────────────
+        # One self-contained row per analysis event capturing the EXACT model
+        # input (full_body, not the RSS summary), the full analysis output and
+        # model provenance. Keyed by impact-report id so re-processing the same
+        # report never overwrites history. Provenance fields are read from the
+        # report dict for forward-compatibility: they are NULL until the
+        # analysis pipeline starts emitting them, then auto-populate here.
+        report_id = report.get("id", "")
+        if report_id:
+            await session.execute(
+                text("""
+                    INSERT INTO analysis_audit
+                        (id, news_id, source, headline, url, published_at,
+                         full_body, body_word_count, body_fetch_status,
+                         body_extraction_method, relevant, confidence,
+                         macro_theme, affected_sectors, company_impacts,
+                         trade_signals, model_id, provider, prompt_version,
+                         input_tokens, output_tokens, pipeline_mode,
+                         processing_latency_ms, content_hash, analysis_created_at)
+                    VALUES
+                        (:id, :news_id, :source, :headline, :url, :published_at,
+                         :full_body, :body_word_count, :body_fetch_status,
+                         :body_extraction_method, :relevant, :confidence,
+                         :macro_theme, CAST(:affected_sectors AS jsonb),
+                         CAST(:company_impacts AS jsonb), CAST(:trade_signals AS jsonb),
+                         :model_id, :provider, :prompt_version, :input_tokens,
+                         :output_tokens, :pipeline_mode, :processing_latency_ms,
+                         :content_hash, :analysis_created_at)
+                    ON CONFLICT (id) DO NOTHING
+                """),
+                {
+                    "id": report_id,
+                    "news_id": news_id,
+                    "source": news_item.get("source"),
+                    "headline": news_item.get("headline"),
+                    "url": news_item.get("url"),
+                    "published_at": _parse_dt(news_item.get("timestamp_utc")),
+                    "full_body": news_item.get("full_body"),
+                    "body_word_count": news_item.get("body_word_count"),
+                    "body_fetch_status": news_item.get("body_fetch_status"),
+                    "body_extraction_method": news_item.get("body_extraction_method"),
+                    "relevant": report.get("relevant", False),
+                    "confidence": report.get("confidence", 0.0),
+                    "macro_theme": report.get("macro_theme"),
+                    "affected_sectors": json.dumps(report.get("affected_sectors", [])),
+                    "company_impacts": json.dumps(report.get("company_impacts", [])),
+                    "trade_signals": json.dumps(report.get("trade_signals", [])),
+                    # provenance — present only once the pipeline emits them
+                    "model_id": report.get("model_id"),
+                    "provider": report.get("provider"),
+                    "prompt_version": report.get("prompt_version"),
+                    "input_tokens": report.get("input_tokens"),
+                    "output_tokens": report.get("output_tokens"),
+                    "pipeline_mode": report.get("pipeline_mode"),
+                    "processing_latency_ms": report.get("processing_latency_ms", 0.0),
+                    "content_hash": _audit_content_hash(news_item, report),
+                    "analysis_created_at": _parse_dt(report.get("created_at")),
+                },
+            )
+
         await session.commit()
 
 
@@ -211,3 +277,26 @@ def _parse_dt(value) -> datetime:
         return datetime.fromisoformat(str(value))
     except (ValueError, TypeError):
         return datetime.utcnow()
+
+
+def _audit_content_hash(news_item: dict, report: dict) -> str:
+    """SHA-256 over the canonical (input + output) of an analysis event.
+
+    Lets a compliance reviewer verify a stored audit row was not altered after
+    the fact: re-hash the input snapshot + analysis output and compare.
+    """
+    payload = {
+        "news_id": report.get("news_id"),
+        "source": news_item.get("source"),
+        "headline": news_item.get("headline"),
+        "url": news_item.get("url"),
+        "full_body": news_item.get("full_body"),
+        "relevant": report.get("relevant"),
+        "confidence": report.get("confidence"),
+        "macro_theme": report.get("macro_theme"),
+        "affected_sectors": report.get("affected_sectors"),
+        "company_impacts": report.get("company_impacts"),
+        "trade_signals": report.get("trade_signals"),
+    }
+    canonical = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
