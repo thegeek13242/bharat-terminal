@@ -13,11 +13,15 @@ from datetime import datetime
 import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, text
 
 from bharat_terminal.kb.models import Company, CompanyRelationship
 from bharat_terminal.kb.company_memory import build_company_memory
+from bharat_terminal.kb.memory.sector import build_sector_memory
+from bharat_terminal.kb.memory.market import build_market_memory
+from bharat_terminal.kb.memory import core as memory_core
 from bharat_terminal.grounding.queries import get_price_returns
 from bharat_terminal.kb.live_price import get_current_ltps
 
@@ -27,6 +31,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://bharat:bharat@pos
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 CACHE_TTL = 6 * 3600  # 6 hours
 MEMORY_CACHE_TTL = 15 * 60  # 15 min — memory shifts as fresh news flows
+MEMORY_SEMANTIC_ENABLED = os.getenv("MEMORY_SEMANTIC_ENABLED", "1") == "1"
 PRICE_RETURNS_CACHE_TTL = 15 * 60  # prices are EOD-daily; short cache is plenty
 
 app = FastAPI(title="Bharat Terminal KB API", version="1.0.0")
@@ -140,6 +145,93 @@ async def get_company_memory(symbol: str):
             logger.warning(f"Redis write failed for memory:{symbol}: {e}")
 
     return data
+
+
+# ── Sector / market / combined event-memory tiers ────────────────────────────
+class MemoryContextQuery(BaseModel):
+    """The current news context, used to relevance-rank memory retrieval."""
+    headline: Optional[str] = None
+    macro_theme: Optional[str] = None
+    sectors: Optional[list] = None
+    symbols: Optional[list] = None
+    include_company: bool = True
+
+
+async def _fetch_digest(session, scope_type: str, scope_key: str):
+    """Attach the cached LLM narrative digest if one exists (else None)."""
+    row = (await session.execute(text(
+        "SELECT digest_text, net_tilt, generated_at FROM memory_digests "
+        "WHERE scope_type = :t AND scope_key = :k"
+    ), {"t": scope_type, "k": scope_key})).first()
+    if not row or not row.digest_text:
+        return None
+    return {"text": row.digest_text, "net_tilt": row.net_tilt,
+            "generated_at": row.generated_at.isoformat() if row.generated_at else None}
+
+
+async def _embed_context(headline: Optional[str], macro_theme: Optional[str]):
+    """Embed the incoming news once (server-side) for relevance retrieval.
+    Fail-soft: returns None (→ recency/importance ranking) if disabled or erroring."""
+    if not MEMORY_SEMANTIC_ENABLED:
+        return None
+    q = memory_core.embed_text_for(headline, macro_theme, None)
+    if not q:
+        return None
+    try:
+        from bharat_terminal.llm.embeddings import embed_query
+        return await embed_query(q)
+    except Exception as e:
+        logger.warning(f"memory context embed failed: {e}")
+        return None
+
+
+@app.get("/sector/{sector}/memory")
+async def get_sector_memory(sector: str):
+    """Sector-tier event memory (no relevance ranking — debug/manual use)."""
+    async with AsyncSessionLocal() as session:
+        data = await build_sector_memory(session, sector)
+        data["digest"] = await _fetch_digest(session, "sector", sector.strip().upper())
+    return data
+
+
+@app.get("/market/memory")
+async def get_market_memory():
+    """Market-tier event memory (no relevance ranking — debug/manual use)."""
+    async with AsyncSessionLocal() as session:
+        data = await build_market_memory(session)
+        data["digest"] = await _fetch_digest(session, "market", "MARKET")
+    return data
+
+
+@app.post("/memory/context")
+async def memory_context(q: MemoryContextQuery):
+    """Combined market + sector + company memory for one news item, relevance-
+    ranked to the supplied context. Embeds the news ONCE and fans out to every
+    tier, so the analysis pipeline needs a single round-trip per item."""
+    qvec = await _embed_context(q.headline, q.macro_theme)
+    sectors = [s.strip().upper() for s in (q.sectors or []) if s and s.strip()]
+    symbols = [s.strip().upper() for s in (q.symbols or []) if s and s.strip()]
+    async with AsyncSessionLocal() as session:
+        market = await build_market_memory(
+            session, query_embedding=qvec, query_theme=q.macro_theme, query_sectors=sectors)
+        market["digest"] = await _fetch_digest(session, "market", "MARKET")
+
+        sec_out = {}
+        for sec in sectors[:6]:
+            m = await build_sector_memory(
+                session, sec, query_embedding=qvec, query_theme=q.macro_theme)
+            m["digest"] = await _fetch_digest(session, "sector", sec)
+            sec_out[sec] = m
+
+        comp_out = {}
+        if q.include_company:
+            for sym in symbols[:8]:
+                comp_out[sym] = await build_company_memory(
+                    session, sym, query_embedding=qvec,
+                    query_theme=q.macro_theme, query_sectors=sectors)
+
+    return {"market": market, "sectors": sec_out, "companies": comp_out,
+            "semantic": qvec is not None}
 
 
 @app.get("/company/{symbol}/price-returns")

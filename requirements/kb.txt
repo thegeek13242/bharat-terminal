@@ -15,3 +15,8 @@ beautifulsoup4==4.12.3
 smartapi-python==1.5.5
 logzero==1.7.0
 websocket-client==1.8.0
+# Event-memory index: Vertex embeddings (llm/embeddings.py) + Gemini digest
+# synthesis (kb/memory/digest.py) run inside the kb / kb-monitor services.
+# [vertex] pulls google-auth for ADC. Digest defaults to a Gemini model, so only
+# google-genai is needed (a Claude digest model would also need anthropic[vertex]).
+google-genai>=0.3,<2
