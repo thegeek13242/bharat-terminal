@@ -26,7 +26,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from bharat_terminal import llm
 from bharat_terminal.research.db import session_scope
 from bharat_terminal.kb.models import MemoryDigest
-from bharat_terminal.kb.memory.market import build_market_memory, WINDOW_DAYS as MARKET_WINDOW
+from bharat_terminal.kb.memory.market import build_market_memory
 from bharat_terminal.kb.memory.sector import build_sector_memory, WINDOW_DAYS as SECTOR_WINDOW
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -156,7 +156,8 @@ async def refresh_all(dry_run: bool = False) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(prog="memory_digest")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    rp = sub.add_parser("refresh"); rp.add_argument("--dry-run", action="store_true")
+    rp = sub.add_parser("refresh")
+    rp.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     if args.cmd == "refresh":
         asyncio.run(refresh_all(args.dry_run))

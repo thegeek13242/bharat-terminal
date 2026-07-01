@@ -161,7 +161,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(prog="memory_index")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("rebuild")
-    rp = sub.add_parser("refresh"); rp.add_argument("--days", type=int, default=REFRESH_DAYS)
+    rp = sub.add_parser("refresh")
+    rp.add_argument("--days", type=int, default=REFRESH_DAYS)
     sub.add_parser("prune")
     args = ap.parse_args()
     if args.cmd == "rebuild":
