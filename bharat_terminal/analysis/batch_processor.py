@@ -17,7 +17,6 @@ from datetime import datetime, timezone
 from typing import List
 
 from bharat_terminal import llm
-from bharat_terminal.llm import provider_for_model
 
 from bharat_terminal.types import NewsItem, ImpactReport, CompanyImpact, TradeSignal
 from bharat_terminal.analysis.stages.stage1_relevance import classify_relevance

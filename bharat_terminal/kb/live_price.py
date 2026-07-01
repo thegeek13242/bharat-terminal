@@ -16,9 +16,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import httpx
 

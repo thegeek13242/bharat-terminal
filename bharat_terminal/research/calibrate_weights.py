@@ -45,7 +45,7 @@ import asyncio
 import logging
 import math
 import re
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 from sqlalchemy import text
 

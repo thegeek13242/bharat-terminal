@@ -19,7 +19,6 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
