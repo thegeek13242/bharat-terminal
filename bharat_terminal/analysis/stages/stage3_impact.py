@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 LLM_MODEL = os.getenv("IMPACT_MODEL", "gemini-2.5-flash")
 KNOWLEDGE_BASE_URL = os.getenv("KNOWLEDGE_BASE_URL", "http://kb-service:8001")
+# Combined market/sector/company memory context (relevance-ranked). When off,
+# falls back to per-symbol recency-only company memory (legacy behaviour).
+MEMORY_CONTEXT_ENABLED = os.getenv("ANALYSIS_MEMORY_CONTEXT_ENABLED", "1") == "1"
 # Body budget for the impact assessment. Accuracy over latency: feed the full
 # filing/article (filings carry full attachment text), not a clipped first page.
 # Bounded only by the PDF extraction cap (FILING_PDF_TEXT_MAX_CHARS).
@@ -103,8 +106,10 @@ def build_impact_prompt(
     symbols: List[str],
     company_contexts: dict,
     company_memories: Optional[dict] = None,
+    market_sector_backdrop: str = "",
 ) -> str:
-    """Build the impact scoring prompt with company context + recent-event memory."""
+    """Build the impact scoring prompt with market/sector backdrop + company
+    context + recent-event memory."""
 
     company_memories = company_memories or {}
     context_sections = []
@@ -134,6 +139,12 @@ Revenue Segments: {json.dumps(ctx.get('business', {}).get('revenue_segments', []
 
     company_ctx_text = "\n".join(context_sections) if context_sections else "No company context available."
 
+    backdrop_section = (
+        f"MARKET & SECTOR BACKDROP (recent event regime — use to calibrate, not to "
+        f"override, the direct read of THIS news):\n{market_sector_backdrop}\n\n"
+        if market_sector_backdrop else ""
+    )
+
     return f"""You are an Indian equity market analyst. Assess the financial impact of this news on each affected company.
 
 NEWS:
@@ -141,7 +152,7 @@ Headline: {news_item.headline}
 Body: {(news_item.full_body or news_item.body or '')[:IMPACT_BODY_CHARS]}
 Source: {news_item.source}
 
-COMPANY PROFILES:
+{backdrop_section}COMPANY PROFILES:
 {company_ctx_text}
 
 Score the impact for each company based on:
@@ -154,6 +165,10 @@ Score the impact for each company based on:
    an event already captured. If the memory shows the same event was already
    assessed, lower the magnitude (it is largely priced in / already counted) and
    say so in the explanation. Do NOT double-count the same event.
+6. MARKET & SECTOR BACKDROP (if shown): use the prevailing regime to calibrate
+   conviction — a company-positive read in a sector under sustained pressure (or
+   vice-versa) warrants more caution. Do NOT let the backdrop override a clear,
+   material, company-specific signal in the news itself.
 
 Be precise. If impact is unclear, use magnitude 1-2 with "neutral" sentiment."""
 
@@ -162,6 +177,7 @@ async def score_impacts(
     news_item: NewsItem,
     symbols: List[str],
     macro_theme: str,
+    affected_sectors: Optional[List[str]] = None,
 ) -> List[CompanyImpact]:
     """
     Score impact of news on each company symbol.
@@ -178,20 +194,38 @@ async def score_impacts(
 
     contexts = {}
     memories = {}
+    backdrop = ""
     if KNOWLEDGE_BASE_URL:
-        # Fetch profile + recent-event memory for each company in parallel.
         context_tasks = [fetch_company_context(sym) for sym in symbols_to_score]
-        memory_tasks = [fetch_company_memory(sym) for sym in symbols_to_score]
-        context_results, memory_results = await asyncio.gather(
-            asyncio.gather(*context_tasks, return_exceptions=True),
-            asyncio.gather(*memory_tasks, return_exceptions=True),
-        )
+        if MEMORY_CONTEXT_ENABLED:
+            # One combined, relevance-ranked fetch: company memories (replacing the
+            # recency-only per-symbol path) + market/sector backdrop. Fail-soft.
+            from bharat_terminal.analysis import memory_client
+            context_results, mem_context = await asyncio.gather(
+                asyncio.gather(*context_tasks, return_exceptions=True),
+                memory_client.fetch_memory_context(
+                    headline=news_item.headline, macro_theme=macro_theme,
+                    sectors=affected_sectors, symbols=symbols_to_score),
+            )
+            if mem_context:
+                backdrop = memory_client.market_and_sector_backdrop(mem_context)
+                comp_mem = mem_context.get("companies") or {}
+                for sym in symbols_to_score:
+                    if isinstance(comp_mem.get(sym), dict):
+                        memories[sym] = comp_mem[sym]
+        else:
+            # Legacy path: per-symbol recency-only company memory.
+            memory_tasks = [fetch_company_memory(sym) for sym in symbols_to_score]
+            context_results, memory_results = await asyncio.gather(
+                asyncio.gather(*context_tasks, return_exceptions=True),
+                asyncio.gather(*memory_tasks, return_exceptions=True),
+            )
+            for sym, mem in zip(symbols_to_score, memory_results):
+                if isinstance(mem, dict):
+                    memories[sym] = mem
         for sym, ctx in zip(symbols_to_score, context_results):
             if isinstance(ctx, dict):
                 contexts[sym] = ctx
-        for sym, mem in zip(symbols_to_score, memory_results):
-            if isinstance(mem, dict):
-                memories[sym] = mem
 
     if provider_for_model(LLM_MODEL) == "anthropic" and not ANTHROPIC_API_KEY:
         # latency tracking skipped on degraded path
@@ -210,7 +244,8 @@ async def score_impacts(
             for sym in symbols_to_score
         ]
 
-    prompt = build_impact_prompt(news_item, symbols_to_score, contexts, memories)
+    prompt = build_impact_prompt(news_item, symbols_to_score, contexts, memories,
+                                 market_sector_backdrop=backdrop)
 
     llm_start = time.time()
     try:

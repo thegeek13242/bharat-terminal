@@ -9,7 +9,7 @@ from sqlalchemy import (
     String, Integer, BigInteger, Float, Numeric, Boolean, DateTime, Date, Text,
     ForeignKey, UniqueConstraint, Index,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, ARRAY
 from sqlalchemy.orm import DeclarativeBase, relationship, Mapped, mapped_column
 from sqlalchemy.sql import func
 from pgvector.sqlalchemy import Vector
@@ -802,3 +802,51 @@ class SyncLog(Base):
     records_failed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     metadata_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+
+class MemoryItem(Base):
+    """Distilled, embedded, DERIVED event-memory index (migration 015).
+
+    One row per consolidated real-world event, materialised from impact_reports
+    (near-duplicate coverage collapsed). Rebuildable from source, so it cannot
+    drift; retrieval ranks by relevance (embedding) + recency + importance.
+    """
+    __tablename__ = "memory_items"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_key: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    sentiment: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    magnitude: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    time_horizon: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    macro_theme: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    symbols: Mapped[Optional[List[str]]] = mapped_column(ARRAY(Text), nullable=True)
+    sectors: Mapped[Optional[List[str]]] = mapped_column(ARRAY(Text), nullable=True)
+    trigger_ids: Mapped[Optional[List[str]]] = mapped_column(ARRAY(Text), nullable=True)
+    event_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    importance: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
+    source_news_ids: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    source_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    embedding: Mapped[Optional[List[float]]] = mapped_column(Vector(768), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class MemoryDigest(Base):
+    """Overwrite-cached sector/market narrative digest (migration 015).
+
+    One row per (scope_type, scope_key) — e.g. ('sector','BANKING') or
+    ('market','MARKET') — overwritten on each refresh, so it is bounded by
+    construction (~25 rows) and needs no eviction job.
+    """
+    __tablename__ = "memory_digests"
+
+    scope_type: Mapped[str] = mapped_column(String(10), primary_key=True)  # 'sector' | 'market'
+    scope_key: Mapped[str] = mapped_column(String(120), primary_key=True)  # sector code | 'MARKET'
+    digest_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    net_tilt: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    event_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    source_window_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    input_hash: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    model_used: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

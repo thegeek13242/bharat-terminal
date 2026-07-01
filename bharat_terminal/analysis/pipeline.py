@@ -86,6 +86,7 @@ async def stage3_node(state: PipelineState) -> PipelineState:
         state["news_item"],
         state["resolved_symbols"],
         state["macro_theme"],
+        affected_sectors=state.get("affected_sectors", []),
     )
     return {**state, "direct_impacts": impacts}
 
@@ -116,6 +117,7 @@ async def stage5_node(state: PipelineState) -> PipelineState:
         state["news_item"],
         state["all_impacts"],
         state["macro_theme"],
+        affected_sectors=state.get("affected_sectors", []),
     )
     return {**state, "trade_signals": signals}
 

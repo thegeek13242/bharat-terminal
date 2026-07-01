@@ -12,6 +12,7 @@ Handles graceful shutdown via SIGINT/SIGTERM.
 """
 import asyncio
 import logging
+import os
 import signal
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -407,6 +408,39 @@ class Monitor:
                 except Exception as e:
                     logger.error(f"[signal_eval] Failed: {e}", exc_info=True)
 
+    async def memory_index_refresh(self):
+        """Keep the derived `memory_items` event index fresh: incremental refresh
+        of the recent window (embeds only new/changed events) + a retention prune.
+        Runs on a fixed interval (MEMORY_INDEX_REFRESH_MINUTES) rather than a clock
+        time — news flows all day, so the memory should track it continuously."""
+        interval = int(os.getenv("MEMORY_INDEX_REFRESH_MINUTES", "20")) * 60
+        from bharat_terminal.kb.memory import index as memory_index
+        while not self._shutdown.is_set():
+            try:
+                await memory_index.refresh()
+                await memory_index.prune()
+            except Exception as e:
+                logger.error(f"[memory_index] refresh failed: {e}", exc_info=True)
+            if not await self._sleep_seconds(interval):
+                break
+
+    async def memory_digest_refresh(self):
+        """Rebuild the sector/market narrative digests on an interval
+        (MEMORY_DIGEST_REFRESH_HOURS). Skips scopes whose aggregate is unchanged,
+        so steady-state cost is near zero. Gated by MEMORY_DIGEST_ENABLED."""
+        if os.getenv("MEMORY_DIGEST_ENABLED", "1") != "1":
+            logger.info("[memory_digest] disabled (MEMORY_DIGEST_ENABLED=0)")
+            return
+        interval = int(os.getenv("MEMORY_DIGEST_REFRESH_HOURS", "3")) * 3600
+        from bharat_terminal.kb.memory import digest
+        while not self._shutdown.is_set():
+            try:
+                await digest.refresh_all()
+            except Exception as e:
+                logger.error(f"[memory_digest] refresh failed: {e}", exc_info=True)
+            if not await self._sleep_seconds(interval):
+                break
+
     async def run(self):
         """Run all monitor tasks concurrently."""
         loop = asyncio.get_running_loop()
@@ -439,6 +473,8 @@ class Monitor:
             asyncio.create_task(self.weekly_sweep(),           name="weekly_sweep"),
             asyncio.create_task(self.weekly_shareholding_sweep(), name="shp_sweep"),
             asyncio.create_task(self.daily_signal_eval(),      name="signal_eval"),
+            asyncio.create_task(self.memory_index_refresh(),   name="memory_index"),
+            asyncio.create_task(self.memory_digest_refresh(),  name="memory_digest"),
         ]
 
         await self._shutdown.wait()

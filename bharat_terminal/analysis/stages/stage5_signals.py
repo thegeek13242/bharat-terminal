@@ -7,7 +7,7 @@ import time
 import logging
 import os
 import uuid
-from typing import List
+from typing import List, Optional
 from bharat_terminal import llm
 from bharat_terminal.llm import provider_for_model
 from bharat_terminal.types import CompanyImpact, TradeSignal, NewsItem
@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 LLM_MODEL = os.getenv("SIGNALS_MODEL", "gemini-3.1-pro-preview")
+MEMORY_CONTEXT_ENABLED = os.getenv("ANALYSIS_MEMORY_CONTEXT_ENABLED", "1") == "1"
 
 SIGNAL_TOOL = {
     "name": "generate_trade_signals",
@@ -54,6 +55,7 @@ async def generate_signals(
     news_item: NewsItem,
     company_impacts: List[CompanyImpact],
     macro_theme: str,
+    affected_sectors: Optional[List[str]] = None,
 ) -> List[TradeSignal]:
     """
     Generate trade signals for high-impact direct companies (hop_distance=0, magnitude≥3).
@@ -107,18 +109,34 @@ async def generate_signals(
         for imp in signal_candidates
     ])
 
+    # Market/sector regime backdrop (fail-soft, gated). Company-specific memory was
+    # already folded into the impact magnitudes at Stage 3, so fetch regime only.
+    backdrop = ""
+    if MEMORY_CONTEXT_ENABLED:
+        from bharat_terminal.analysis import memory_client
+        mem_context = await memory_client.fetch_memory_context(
+            headline=news_item.headline, macro_theme=macro_theme,
+            sectors=affected_sectors,
+            symbols=[imp.symbol for imp in signal_candidates],
+            include_company=False)
+        if mem_context:
+            backdrop = memory_client.market_and_sector_backdrop(mem_context)
+    backdrop_section = f"\nMARKET & SECTOR BACKDROP:\n{backdrop}\n" if backdrop else ""
+
     prompt = f"""You are an Indian equity market trading advisor. Generate trade signals based on the following analysis.
 
 NEWS TRIGGER:
 {news_item.headline}
 
 MACRO THEME: {macro_theme}
-
+{backdrop_section}
 COMPANY IMPACTS (direct exposures only):
 {impact_summaries}
 
 INSTRUCTIONS:
 - Generate signals only for companies with clear, material impact (magnitude ≥ 3)
+- Weigh the MARKET & SECTOR BACKDROP (if shown): temper conviction when a signal
+  fights the prevailing regime; a supportive regime can reinforce it
 - For HIGH conviction: news has large, unambiguous directional impact
 - For MEDIUM conviction: impact is clear but market may partially price it in
 - For LOW conviction: impact is real but uncertain in magnitude or timing
