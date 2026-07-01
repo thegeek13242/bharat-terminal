@@ -41,6 +41,10 @@ IST = ZoneInfo("Asia/Kolkata")
 class Monitor:
     def __init__(self):
         self._shutdown = asyncio.Event()
+        # IST date of the most recent successful daily_price_sync. Used by
+        # daily_signal_eval to gate on real sync completion instead of a fixed
+        # clock offset — see daily_signal_eval.
+        self._price_sync_date: date | None = None
 
     def _handle_signal(self, sig):
         logger.info(f"Received {signal.Signals(sig).name}, initiating graceful shutdown")
@@ -260,6 +264,10 @@ class Monitor:
             try:
                 logger.info("[price_sync] Starting daily price sync")
                 result = await sync_prices(days=2)
+                # Record completion so daily_signal_eval can gate on it. Only
+                # set on success: a failed sync must NOT unblock signal scoring
+                # against stale prices.
+                self._price_sync_date = datetime.now(IST).date()
                 logger.info(f"[price_sync] Complete: {result}")
             except Exception as e:
                 logger.error(f"[price_sync] Failed: {e}")
@@ -341,6 +349,64 @@ class Monitor:
 
     # ── Main ───────────────────────────────────────────────────────────────
 
+    # Fallback if daily_price_sync never confirms completion (crash / hang):
+    # how long after 19:00 IST signal_eval waits before giving up for the night.
+    _SIGNAL_EVAL_MAX_WAIT_MIN = 120
+    _SIGNAL_EVAL_POLL_SEC = 60
+
+    async def daily_signal_eval(self):
+        """Score trade-signal forward returns nightly (weekdays) — runs only
+        AFTER daily_price_sync has CONFIRMED completion for the current IST day,
+        so it always scores against that day's fresh EOD prices even if the
+        bhavcopy download runs long. This replaces the old fixed 19:30 offset,
+        which silently scored against stale prices whenever the 19:00 sync
+        overran 30 minutes.
+
+        Ingests new signals from impact_reports and evaluates realised 1/5/10/20
+        trading-day returns into signal_outcomes. Replaces the fragile host-cron
+        job that the VM's crontab never fired.
+
+        If the price sync is not confirmed within _SIGNAL_EVAL_MAX_WAIT_MIN of
+        19:00 IST, it SKIPS tonight rather than scoring against stale prices —
+        evaluate is idempotent and re-runnable, so the next successful run
+        recovers any skipped signals with no data loss."""
+        while not self._shutdown.is_set():
+            target = self._next_occurrence(hour=19, minute=0)
+            while target.weekday() >= 5:
+                target += timedelta(days=1)
+            logger.info(f"[signal_eval] Next run at {target.isoformat()} "
+                        f"(gated on daily_price_sync completion)")
+            if not await self._sleep_until(target):
+                break
+
+            # Wait for daily_price_sync to record success for this IST day.
+            run_day = target.date()
+            deadline = target + timedelta(minutes=self._SIGNAL_EVAL_MAX_WAIT_MIN)
+            while self._price_sync_date != run_day:
+                if datetime.now(IST) >= deadline:
+                    logger.warning(
+                        f"[signal_eval] price sync for {run_day} not confirmed "
+                        f"within {self._SIGNAL_EVAL_MAX_WAIT_MIN} min of 19:00 "
+                        f"IST — skipping tonight (evaluate is idempotent; the "
+                        f"next successful run will catch up)"
+                    )
+                    break
+                logger.info("[signal_eval] waiting for daily_price_sync to "
+                            "complete before scoring...")
+                if not await self._sleep_seconds(self._SIGNAL_EVAL_POLL_SEC):
+                    return  # shutdown requested during the wait
+            else:
+                # Loop exited normally → price sync confirmed for run_day.
+                try:
+                    from bharat_terminal.research.score_signals import ingest, evaluate
+                    logger.info(f"[signal_eval] price sync confirmed for "
+                                f"{run_day}; scoring signals")
+                    await ingest(since_days=30, dry_run=False)
+                    await evaluate(dry_run=False)
+                    logger.info("[signal_eval] Done")
+                except Exception as e:
+                    logger.error(f"[signal_eval] Failed: {e}", exc_info=True)
+
     async def run(self):
         """Run all monitor tasks concurrently."""
         loop = asyncio.get_running_loop()
@@ -372,6 +438,7 @@ class Monitor:
             asyncio.create_task(self.daily_participant_oi(),   name="participant_oi"),
             asyncio.create_task(self.weekly_sweep(),           name="weekly_sweep"),
             asyncio.create_task(self.weekly_shareholding_sweep(), name="shp_sweep"),
+            asyncio.create_task(self.daily_signal_eval(),      name="signal_eval"),
         ]
 
         await self._shutdown.wait()
