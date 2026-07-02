@@ -201,13 +201,22 @@ async def extract_entities(news_item: NewsItem) -> ExtractionResult:
             resolved_symbols=resolved,
         )
 
-    prompt = f"""Analyze this Indian financial news and extract structured market intelligence.
+    prompt = f"""You are a research associate on an Indian equity fund's desk, tagging a news item for the analysis pipeline. Precision beats recall: a wrong tag here poisons every downstream stage.
 
 Headline: {news_item.headline}
 Body: {(news_item.full_body or news_item.body or '')[:EXTRACTION_BODY_CHARS]}
 Source: {news_item.source}
 
-Extract all relevant market entities, sectors, and the macro theme."""
+Tagging rules:
+- named_companies: only companies materially involved in the event — the subject
+  ("direct") or clearly affected parties ("indirect"). Skip passing mentions,
+  index-constituent lists, and companies cited only for context or comparison.
+- probable_symbol: fill ONLY when you are confident of the exact NSE symbol;
+  otherwise omit it. A guessed symbol corrupts company lookups downstream.
+- affected_bse_sectors: only sectors whose fundamentals this event actually
+  touches, not sectors merely mentioned in passing.
+- macro_theme: the single dominant driver of the event.
+- sentiment_direction: the net read-through for Indian equities overall."""
 
     llm_start = time.time()
     try:

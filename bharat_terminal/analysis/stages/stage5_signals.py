@@ -123,7 +123,7 @@ async def generate_signals(
             backdrop = memory_client.market_and_sector_backdrop(mem_context)
     backdrop_section = f"\nMARKET & SECTOR BACKDROP:\n{backdrop}\n" if backdrop else ""
 
-    prompt = f"""You are an Indian equity market trading advisor. Generate trade signals based on the following analysis.
+    prompt = f"""You are a proprietary trading analyst at an Indian AIF equity desk. Your single objective is maximizing the fund's risk-adjusted returns. Every signal you emit is paper-traded and scored against realized 1/5/10/20-day forward returns NET of costs (~0.7% round trip, worse for illiquid midcaps). You are judged on net P&L, not on activity.
 
 NEWS TRIGGER:
 {news_item.headline}
@@ -133,17 +133,29 @@ MACRO THEME: {macro_theme}
 COMPANY IMPACTS (direct exposures only):
 {impact_summaries}
 
-INSTRUCTIONS:
-- Generate signals only for companies with clear, material impact (magnitude ≥ 3)
-- Weigh the MARKET & SECTOR BACKDROP (if shown): temper conviction when a signal
-  fights the prevailing regime; a supportive regime can reinforce it
-- For HIGH conviction: news has large, unambiguous directional impact
-- For MEDIUM conviction: impact is clear but market may partially price it in
-- For LOW conviction: impact is real but uncertain in magnitude or timing
-- Position size: HIGH conviction max 5%, MEDIUM max 3%, LOW max 1.5%
-- DO NOT suggest specific price targets or specific option strikes
-- For options: describe the rationale (e.g., "ATM call for near-term momentum play with defined risk")
-- Stop loss must reference a logical framework (support levels, volatility bands, event re-rating)"""
+DESK RULES:
+- NO-SIGNAL IS A POSITION. Most events do not clear the cost hurdle — emit a
+  signal only when you expect the move to exceed ~1.5% over the horizon. An
+  empty signals list is the correct output for marginal setups; a mediocre
+  signal loses the fund money with certainty (costs) for an uncertain gain.
+- Think in expected value: how much of this is already priced in (the impact
+  notes flag recent moves), and is the surprise genuinely new information?
+  Trading stale or consensus information is negative-EV after costs.
+- Weigh the MARKET & SECTOR BACKDROP (if shown): temper conviction when a
+  signal fights the prevailing regime; a supportive regime can reinforce it.
+- Conviction calibration:
+  HIGH = quantified material surprise + clear transmission channel + not yet
+  priced. MEDIUM = clear impact but partially priced or timing uncertain.
+  LOW = real but small edge, worth only minimal size.
+- Position size: HIGH conviction max 5%, MEDIUM max 3%, LOW max 1.5%.
+- Shorts must be implementable: multi-day shorts require the name to trade in
+  F&O. For a negative view on a name unlikely to be in F&O, use direction
+  "neutral" with instrument "avoid" instead of an untradeable short.
+- DO NOT suggest specific price targets or specific option strikes.
+- For options: describe the rationale (e.g., "ATM call for near-term momentum
+  play with defined risk").
+- Stop loss must reference a logical framework (support levels, volatility
+  bands, event re-rating)."""
 
     llm_start = time.time()
     try:

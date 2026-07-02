@@ -195,6 +195,8 @@ IRRELEVANT (output relevant=false):
 - AI-prompt articles ("I asked ChatGPT", "Gemini said")
 - Listicles and pure explainers: "5 ways to", "What happens if", "Rules explained"
 - Human-interest stories unrelated to listed companies
+- Routine procedural notices with no financial substance: AGM/record-date
+  intimations, trading-window closures, investor-meet schedules
 
 Respond with EXACTLY this JSON, no other text:
 {"relevant": true|false, "reason": "<5-12 word justification>"}"""
