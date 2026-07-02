@@ -46,10 +46,18 @@ export function AssessmentPanel({ report }: { report: ImpactReport | null }) {
     return <EmptyState title="Select an event" sub="Its structured assessment appears here." />;
   }
 
+  // One entry per distinct explanation, attributed to its company. Legacy
+  // propagated impacts (pre linkage-aware Stage 4) duplicated the source
+  // company's text verbatim — the dedupe collapses those to a single entry.
+  const seenExplanations = new Set<string>();
   const reasoning = (report.company_impacts ?? [])
-    .map((c) => c.explanation)
-    .filter(Boolean)
-    .slice(0, 6) as string[];
+    .filter((c) => {
+      if (!c.explanation || seenExplanations.has(c.explanation)) return false;
+      seenExplanations.add(c.explanation);
+      return true;
+    })
+    .slice(0, 6)
+    .map((c) => `${c.symbol}${c.hop_distance > 0 ? ` (indirect · hop ${c.hop_distance})` : ''} — ${c.explanation}`);
 
   return (
     <div style={{ height: '100%', overflow: 'auto', display: 'flex', flexDirection: 'column', minHeight: 0 }}>

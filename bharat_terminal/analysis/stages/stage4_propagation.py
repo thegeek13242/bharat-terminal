@@ -33,13 +33,34 @@ async def fetch_company_relationships(symbol: str) -> List[dict]:
     return []
 
 
-def apply_decay(impact: CompanyImpact, hop: int, weight: float | None = None) -> CompanyImpact:
+def _first_sentence(text: str, cap: int = 240) -> str:
+    """One-sentence reference to the source impact (avoid re-pasting it all)."""
+    if not text:
+        return ""
+    head = text.split(". ", 1)[0].strip()
+    if len(head) > cap:
+        head = head[: cap - 1].rstrip() + "…"
+    return head if head.endswith((".", "…")) else head + "."
+
+
+def apply_decay(
+    impact: CompanyImpact,
+    hop: int,
+    weight: float | None = None,
+    rel_type: str | None = None,
+) -> CompanyImpact:
     """Apply decay for graph propagation.
 
     Decay = the edge's calibrated weight (price-calibrated transmitted
     co-movement, or real NSE ownership stake) when present — so a 56%
     parent-subsidiary edge propagates far more than a 0.2 sector peer.
     Falls back to the legacy flat constants only for weightless edges.
+
+    The explanation names the LINKAGE (relationship type, source company,
+    transmission weight) and references the source impact in one sentence —
+    it must not just duplicate the source company's reasoning onto the
+    neighbor (that was the pre-2026-07 behaviour and read as a copy-paste
+    bug in the UI).
     """
     if weight is not None and weight > 0:
         decay = max(0.1, min(0.9, float(weight)))
@@ -49,6 +70,17 @@ def apply_decay(impact: CompanyImpact, hop: int, weight: float | None = None) ->
     # Decay the magnitude (but keep minimum at 1)
     new_magnitude = max(1, round(impact.magnitude * decay))
 
+    if rel_type:
+        # impact here is the SOURCE company's impact; the caller re-keys the
+        # returned object to the neighbor symbol.
+        explanation = (
+            f"Indirect exposure via {rel_type.replace('_', ' ')} relationship "
+            f"with {impact.symbol} (transmission {decay:.2f}x). "
+            f"{impact.symbol} impact: {_first_sentence(impact.explanation)}"
+        )
+    else:
+        explanation = f"[Hop {hop} indirect exposure, decay {decay}x] {impact.explanation}"
+
     return CompanyImpact(
         symbol=impact.symbol,
         company_name=impact.company_name,
@@ -56,7 +88,7 @@ def apply_decay(impact: CompanyImpact, hop: int, weight: float | None = None) ->
         magnitude=new_magnitude,
         time_horizon="medium_term" if hop == 1 else "long_term",
         affected_line_items=impact.affected_line_items,
-        explanation=f"[Hop {hop} indirect exposure, decay {decay}x] {impact.explanation}",
+        explanation=explanation,
         hop_distance=hop,
         decay_factor=decay,
     )
@@ -101,7 +133,7 @@ async def propagate_impacts(
             if w is not None and w < MIN_EDGE_WEIGHT:
                 continue
 
-            indirect = apply_decay(impact, hop=1, weight=w)
+            indirect = apply_decay(impact, hop=1, weight=w, rel_type=edge.get("relationship_type"))
             # Override symbol/name for the neighbor
             propagated = CompanyImpact(
                 symbol=neighbor_symbol,
@@ -148,7 +180,7 @@ async def propagate_impacts(
 
                 # hop-1 magnitude is already weight-decayed, so applying this
                 # edge's weight compounds transmission naturally (w1 x w2).
-                indirect = apply_decay(hop1_impact, hop=2, weight=w)
+                indirect = apply_decay(hop1_impact, hop=2, weight=w, rel_type=edge.get("relationship_type"))
                 propagated = CompanyImpact(
                     symbol=neighbor_symbol,
                     company_name=edge.get("target_name", neighbor_symbol),
