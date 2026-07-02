@@ -141,9 +141,12 @@ async def _handle_report(report: dict):
     if not relevant:
         return  # Don't clutter the feed with irrelevant noise
 
+    # Trade signals are internal eval telemetry — persisted above, but never
+    # broadcast to browsers (SEBI RA scope).
+    public_report = {k: v for k, v in report.items() if k != "trade_signals"}
     event = {
         "type": "impact_report",
-        "data": report,
+        "data": public_report,
         "timestamp": datetime.utcnow().isoformat(),
     }
     await manager.broadcast(event)

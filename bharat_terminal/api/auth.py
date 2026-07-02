@@ -121,6 +121,18 @@ async def record_login(user_id: int, idinfo: dict) -> None:
         await s.commit()
 
 
+# ── Internal research allowlist ─────────────────────────────────────────────
+# Comma-separated emails allowed to hit internal research surfaces (signal
+# reports, accuracy metrics). Empty (default) = nobody: those endpoints are
+# never customer-facing — recommendation content must not reach client
+# accounts (SEBI RA scope).
+INTERNAL_RESEARCH_EMAILS = {
+    e.strip().lower()
+    for e in os.getenv("INTERNAL_RESEARCH_EMAILS", "").split(",")
+    if e.strip()
+}
+
+
 # ── FastAPI dependency: require an authenticated user ──────────────────────
 async def get_current_user(request: Request) -> dict:
     token = request.cookies.get(SESSION_COOKIE)
@@ -137,6 +149,12 @@ async def get_current_user(request: Request) -> dict:
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_session"
         )
     return {"id": payload.get("sub"), "email": payload.get("email")}
+
+
+async def require_internal_user(user: dict = Depends(get_current_user)) -> dict:
+    if (user.get("email") or "").lower() not in INTERNAL_RESEARCH_EMAILS:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="internal_only")
+    return user
 
 
 def user_from_session_cookie(cookies: dict) -> Optional[dict]:
