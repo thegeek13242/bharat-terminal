@@ -132,6 +132,10 @@ class ImpactReport(BaseModel):
     affected_sectors: List[str] = Field(default_factory=list)
     company_impacts: List["CompanyImpact"] = Field(default_factory=list)
     trade_signals: List["TradeSignal"] = Field(default_factory=list)
+    # How the event transmits through the relationship graph (stage-3
+    # classification; gates stage-4 propagation): company_specific |
+    # supply_chain | sector_wide | macro. None on pre-scope reports.
+    event_scope: Optional[str] = None
     processing_latency_ms: float
     created_at: datetime
 

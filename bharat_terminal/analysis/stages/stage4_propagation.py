@@ -20,6 +20,42 @@ MIN_EDGE_WEIGHT = float(os.getenv("PROPAGATION_MIN_EDGE_WEIGHT", "0.15"))
 MAX_HOPS = 2
 KNOWLEDGE_BASE_URL = os.getenv("KNOWLEDGE_BASE_URL", "http://kb-service:8001")
 
+# ── Event-scope gating ───────────────────────────────────────────────────────
+# Not every event transmits through every edge. A company-specific event
+# (litigation settlement, fraud, management exit, one-off writeoff) moves the
+# value of an ownership stake in that company, but does NOT make competitors
+# or sector peers exposed — propagating it through competition edges fabricates
+# inferences (e.g. a BANKBARODA settlement "impacting" PNB/SBIN/HDFCBANK).
+# Stage 3 classifies the event's scope; edges transmit only on allowed channels.
+CHANNEL_BY_REL = {
+    "shareholder": "ownership",
+    "subsidiary": "ownership",
+    "parent": "ownership",
+    "promoter": "ownership",
+    "jv": "ownership",
+    "competitor": "competition",
+    "sector_peer": "competition",
+    "customer": "supply_chain",
+    "supplier": "supply_chain",
+}
+ALLOWED_CHANNELS = {
+    "company_specific": {"ownership"},
+    "supply_chain": {"ownership", "supply_chain"},
+    "sector_wide": {"ownership", "competition"},
+    "macro": {"ownership", "competition", "supply_chain"},
+}
+# Conservative default (parse-failure over wrong data): an unclassified event
+# propagates only through ownership edges.
+DEFAULT_SCOPE = "company_specific"
+
+
+def _edge_allowed(edge: dict, scope: str) -> bool:
+    allowed = ALLOWED_CHANNELS.get(scope, ALLOWED_CHANNELS[DEFAULT_SCOPE])
+    # Unknown relationship types are treated as competition-like: blocked for
+    # localized events, transmitting for sector/macro ones.
+    channel = CHANNEL_BY_REL.get((edge.get("relationship_type") or "").lower(), "competition")
+    return channel in allowed
+
 
 async def fetch_company_relationships(symbol: str) -> List[dict]:
     """Fetch company relationship edges from knowledge base."""
@@ -33,14 +69,13 @@ async def fetch_company_relationships(symbol: str) -> List[dict]:
     return []
 
 
-def _first_sentence(text: str, cap: int = 240) -> str:
-    """One-sentence reference to the source impact (avoid re-pasting it all)."""
-    if not text:
-        return ""
-    head = text.split(". ", 1)[0].strip()
-    if len(head) > cap:
-        head = head[: cap - 1].rstrip() + "…"
-    return head if head.endswith((".", "…")) else head + "."
+def _brief(text: str, cap: int = 240) -> str:
+    """Compact reference to the source impact. Word-boundary cap — naive
+    sentence splitting truncated on abbreviations ("approx.", "Rs.")."""
+    text = (text or "").strip()
+    if len(text) <= cap:
+        return text
+    return text[:cap].rsplit(" ", 1)[0].rstrip(",;: ") + "…"
 
 
 def apply_decay(
@@ -76,7 +111,7 @@ def apply_decay(
         explanation = (
             f"Indirect exposure via {rel_type.replace('_', ' ')} relationship "
             f"with {impact.symbol} (transmission {decay:.2f}x). "
-            f"{impact.symbol} impact: {_first_sentence(impact.explanation)}"
+            f"{impact.symbol} impact: {_brief(impact.explanation)}"
         )
     else:
         explanation = f"[Hop {hop} indirect exposure, decay {decay}x] {impact.explanation}"
@@ -96,16 +131,27 @@ def apply_decay(
 
 async def propagate_impacts(
     direct_impacts: List[CompanyImpact],
+    event_scope: str = DEFAULT_SCOPE,
 ) -> List[CompanyImpact]:
     """
     Propagate impact scores through company relationship graph up to 2 hops.
     Returns combined list of direct + indirect impacts (deduped, keeping highest magnitude).
+
+    `event_scope` (from Stage 3) gates WHICH edges transmit — company-specific
+    events stay on ownership edges only; sector/macro events also flow through
+    competition (and supply-chain) edges. Callers that cannot classify the
+    event (batch triage) get the conservative default.
     SLA: ≤500ms
     """
     start_time = time.time()
 
     if not direct_impacts:
         return []
+
+    if event_scope not in ALLOWED_CHANNELS:
+        logger.warning(f"Stage 4: unknown event_scope {event_scope!r} — using {DEFAULT_SCOPE}")
+        event_scope = DEFAULT_SCOPE
+    blocked_edges = 0
 
     all_impacts: Dict[str, CompanyImpact] = {
         imp.symbol: imp for imp in direct_impacts
@@ -131,6 +177,9 @@ async def propagate_impacts(
                 continue
             w = edge.get("weight")
             if w is not None and w < MIN_EDGE_WEIGHT:
+                continue
+            if not _edge_allowed(edge, event_scope):
+                blocked_edges += 1
                 continue
 
             indirect = apply_decay(impact, hop=1, weight=w, rel_type=edge.get("relationship_type"))
@@ -177,6 +226,9 @@ async def propagate_impacts(
                 w = edge.get("weight")
                 if w is not None and w < MIN_EDGE_WEIGHT:
                     continue
+                if not _edge_allowed(edge, event_scope):
+                    blocked_edges += 1
+                    continue
 
                 # hop-1 magnitude is already weight-decayed, so applying this
                 # edge's weight compounds transmission naturally (w1 x w2).
@@ -197,5 +249,11 @@ async def propagate_impacts(
     latency_ms = (time.time() - start_time) * 1000
     if latency_ms > 500:
         logger.warning(f"Stage 4 SLA breach: {latency_ms:.0f}ms > 500ms")
+
+    if blocked_edges:
+        logger.info(
+            f"Stage 4 scope gating: scope={event_scope}, blocked {blocked_edges} "
+            f"edge(s), propagated {len(all_impacts) - len(direct_impacts)}"
+        )
 
     return list(all_impacts.values())

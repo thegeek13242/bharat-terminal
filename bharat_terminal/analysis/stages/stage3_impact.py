@@ -34,6 +34,21 @@ IMPACT_TOOL = {
     "input_schema": {
         "type": "object",
         "properties": {
+            "event_scope": {
+                "type": "string",
+                "enum": ["company_specific", "supply_chain", "sector_wide", "macro"],
+                "description": (
+                    "How this event transmits beyond the directly named companies. "
+                    "company_specific: idiosyncratic — litigation/settlements, fraud, "
+                    "penalties, management changes, one-off writeoffs, buybacks, "
+                    "pledges, company ratings actions; does NOT affect competitors or "
+                    "sector peers. supply_chain: transmits along customer/supplier "
+                    "links — order wins/losses, capacity changes, production cuts. "
+                    "sector_wide: affects the whole sector — regulation, sector demand "
+                    "or pricing shifts, sector-relevant commodity moves. macro: "
+                    "economy-wide — rates, FX, budget, geopolitics."
+                ),
+            },
             "impacts": {
                 "type": "array",
                 "items": {
@@ -54,9 +69,14 @@ IMPACT_TOOL = {
                 }
             }
         },
-        "required": ["impacts"]
+        "required": ["impacts", "event_scope"]
     }
 }
+
+VALID_SCOPES = {"company_specific", "supply_chain", "sector_wide", "macro"}
+# Conservative default: an unclassified event does not fan out through the
+# relationship graph beyond ownership edges (see stage4 gating).
+DEFAULT_SCOPE = "company_specific"
 
 
 async def fetch_company_memory(symbol: str) -> Optional[dict]:
@@ -170,6 +190,15 @@ Score the impact for each company based on:
    vice-versa) warrants more caution. Do NOT let the backdrop override a clear,
    material, company-specific signal in the news itself.
 
+Also classify event_scope — does this event transmit beyond the directly named
+companies? Be strict: a litigation settlement, penalty, fraud, management exit,
+or one-off cash outflow at one company is company_specific — it does NOT make
+competitors or sector peers exposed (e.g. a bank paying to settle its own
+lawsuit says nothing about other banks). Use sector_wide only when the CAUSE
+itself is sector-level (regulation, sector demand/pricing, input costs for the
+whole sector), supply_chain when the effect travels through named customers or
+suppliers, and macro for economy-wide drivers.
+
 Be precise. If impact is unclear, use magnitude 1-2 with "neutral" sentiment."""
 
 
@@ -178,13 +207,15 @@ async def score_impacts(
     symbols: List[str],
     macro_theme: str,
     affected_sectors: Optional[List[str]] = None,
-) -> List[CompanyImpact]:
+) -> tuple[List[CompanyImpact], str]:
     """
-    Score impact of news on each company symbol.
+    Score impact of news on each company symbol, and classify the event's
+    transmission scope (gates Stage-4 propagation).
+    Returns (impacts, event_scope).
     SLA: ≤1.5s
     """
     if not symbols:
-        return []
+        return [], DEFAULT_SCOPE
 
     start_time = time.time()
     llm_logger = get_llm_logger()
@@ -242,7 +273,7 @@ async def score_impacts(
                 decay_factor=1.0,
             )
             for sym in symbols_to_score
-        ]
+        ], DEFAULT_SCOPE
 
     prompt = build_impact_prompt(news_item, symbols_to_score, contexts, memories,
                                  market_sector_backdrop=backdrop)
@@ -301,7 +332,12 @@ async def score_impacts(
                 decay_factor=1.0,
             ))
 
-        return impacts
+        event_scope = tool_result.get("event_scope")
+        if event_scope not in VALID_SCOPES:
+            logger.warning(f"Stage 3: invalid event_scope {event_scope!r} — using {DEFAULT_SCOPE}")
+            event_scope = DEFAULT_SCOPE
+
+        return impacts, event_scope
 
     except Exception as e:
         llm_latency = (time.time() - llm_start) * 1000
@@ -315,4 +351,4 @@ async def score_impacts(
         )
         llm_logger.log(record)
         logger.error(f"Stage 3 error: {e}")
-        return []
+        return [], DEFAULT_SCOPE

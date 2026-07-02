@@ -40,6 +40,8 @@ class PipelineState(TypedDict):
 
     # Stage 3 outputs
     direct_impacts: List[CompanyImpact]
+    # How the event transmits through the graph (gates stage-4 propagation).
+    event_scope: str
 
     # Priced-in adjustments (observability; see priced_in.py)
     priced_in_adjustments: List[dict]
@@ -81,14 +83,14 @@ async def stage2_node(state: PipelineState) -> PipelineState:
 
 
 async def stage3_node(state: PipelineState) -> PipelineState:
-    """Stage 3: Impact scoring."""
-    impacts = await score_impacts(
+    """Stage 3: Impact scoring + event-scope classification."""
+    impacts, event_scope = await score_impacts(
         state["news_item"],
         state["resolved_symbols"],
         state["macro_theme"],
         affected_sectors=state.get("affected_sectors", []),
     )
-    return {**state, "direct_impacts": impacts}
+    return {**state, "direct_impacts": impacts, "event_scope": event_scope}
 
 
 async def priced_in_node(state: PipelineState) -> PipelineState:
@@ -106,8 +108,11 @@ async def priced_in_node(state: PipelineState) -> PipelineState:
 
 
 async def stage4_node(state: PipelineState) -> PipelineState:
-    """Stage 4: Graph propagation."""
-    all_impacts = await propagate_impacts(state["direct_impacts"])
+    """Stage 4: Graph propagation, gated by the event's transmission scope."""
+    all_impacts = await propagate_impacts(
+        state["direct_impacts"],
+        event_scope=state.get("event_scope", "company_specific"),
+    )
     return {**state, "all_impacts": all_impacts}
 
 
@@ -141,6 +146,7 @@ def finalize_node(state: PipelineState) -> PipelineState:
         affected_sectors=state.get("affected_sectors", []),
         company_impacts=state.get("all_impacts", []),
         trade_signals=state.get("trade_signals", []),
+        event_scope=state.get("event_scope"),
         processing_latency_ms=elapsed_ms,
         created_at=datetime.now(timezone.utc),
     )
@@ -229,6 +235,7 @@ async def process_news_item(news_item: NewsItem) -> ImpactReport:
         resolved_symbols=[],
         extraction_sentiment="neutral",
         direct_impacts=[],
+        event_scope="company_specific",
         priced_in_adjustments=[],
         all_impacts=[],
         trade_signals=[],
