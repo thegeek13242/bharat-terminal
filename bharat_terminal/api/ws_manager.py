@@ -33,7 +33,10 @@ class ConnectionManager:
         data = json.dumps(message, default=str)
         dead = []
 
-        for client_id, ws in self._connections.items():
+        # Snapshot the connection map: awaiting a send yields control and a
+        # concurrent connect/disconnect could mutate the live dict mid-loop
+        # ("dict changed size during iteration").
+        for client_id, ws in list(self._connections.items()):
             try:
                 await ws.send_text(data)
             except Exception:
@@ -51,7 +54,9 @@ class ConnectionManager:
         data = json.dumps(message, default=str)
         dead = []
 
-        for client_id in client_ids:
+        # Snapshot to a list: sends await, so the subscription set / connection
+        # map may be mutated concurrently mid-loop.
+        for client_id in list(client_ids):
             ws = self._connections.get(client_id)
             if ws:
                 try:

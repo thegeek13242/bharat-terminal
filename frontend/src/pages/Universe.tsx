@@ -3,7 +3,7 @@ import { api } from '@/lib/api';
 import { CompanySummary } from '@/types';
 import { NavSidebar } from '@/components/NavSidebar';
 import { DossierModal } from '@/components/DossierModal';
-import { TextInput } from '@/components/ds';
+import { TextInput, EmptyState } from '@/components/ds';
 import { num, dash, DASH } from '@/lib/format';
 
 function Chip({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
@@ -12,7 +12,7 @@ function Chip({ label, active, onClick }: { label: string; active: boolean; onCl
       onClick={onClick}
       className="mono upper"
       style={{
-        fontSize: 9,
+        fontSize: 10,
         letterSpacing: '0.08em',
         padding: '4px 9px',
         borderRadius: 3,
@@ -40,12 +40,15 @@ export function Universe() {
   const [openSymbol, setOpenSymbol] = useState<string | null>(null);
   const debounce = useRef<ReturnType<typeof setTimeout>>();
 
-  // One-time: stable sector chip options + coverage counts.
+  const PAGE = 200;
+
+  // One-time: sector chip options (from the largest sample the API allows) +
+  // coverage counts. The API caps limit at 500, so chips reflect the first 500
+  // names ordered dossier-first, alphabetical — a stable, representative set.
   useEffect(() => {
-    api.listCompanies({ limit: 500 }).then(({ items, total }) => {
+    api.listCompanies({ limit: 500 }).then(({ items }) => {
       const secs = [...new Set(items.map((i: CompanySummary) => i.sector).filter(Boolean))] as string[];
-      setSectorOptions(secs.sort().slice(0, 8));
-      setTotal(total);
+      setSectorOptions(secs.sort());
     });
     api.listCompanies({ has_dossier: true, limit: 1 }).then(({ total: withDossier }) =>
       api.listCompanies({ limit: 1 }).then(({ total }) => setCoverage({ withDossier, total })),
@@ -57,7 +60,7 @@ export function Universe() {
     clearTimeout(debounce.current);
     debounce.current = setTimeout(() => {
       api
-        .listCompanies({ q: q || undefined, sector: sector || undefined, limit: 200 })
+        .listCompanies({ q: q || undefined, sector: sector || undefined, limit: PAGE })
         .then(({ items, total }) => {
           setItems(items as CompanySummary[]);
           setTotal(total);
@@ -68,15 +71,18 @@ export function Universe() {
   }, [q, sector]);
 
   const displayed = items;
+  // Honest label: the server returns at most PAGE rows; if more match, say so
+  // rather than implying the whole set is on screen.
+  const truncated = total > displayed.length;
 
   return (
     <div style={{ height: '100vh', display: 'grid', gridTemplateColumns: 'var(--sidebar-w, 184px) 1fr', overflow: 'hidden' }}>
-      <NavSidebar connected statusLabel="CONNECTED · NSE">
+      <NavSidebar staticStatus="DATA · DAILY EOD">
         <div style={{ padding: '12px 4px' }}>
-          <div className="mono upper" style={{ fontSize: 8.5, letterSpacing: '0.16em', color: 'var(--ink-dim)', marginBottom: 8 }}>
+          <div className="mono upper" style={{ fontSize: 10, letterSpacing: '0.16em', color: 'var(--ink-dim)', marginBottom: 8 }}>
             Coverage
           </div>
-          <div className="mono" style={{ fontSize: 10.5, color: 'var(--ink-dim)', lineHeight: 1.6 }}>
+          <div className="mono" style={{ fontSize: 10, color: 'var(--ink-dim)', lineHeight: 1.6 }}>
             NSE listed
             <br />
             Dossiers pre-computed for{' '}
@@ -103,14 +109,16 @@ export function Universe() {
           <div style={{ flex: 1, maxWidth: 520 }}>
             <TextInput placeholder="Search by symbol or company name…" value={q} onChange={setQ} />
           </div>
-          <span className="mono" style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--ink-mute)' }}>
-            {displayed.length} / {total} companies
+          <span className="mono" style={{ marginLeft: 'auto', fontSize: 11.5, color: 'var(--ink-mute)' }}>
+            {truncated
+              ? `showing first ${displayed.length} of ${total} — refine your search`
+              : `${displayed.length} companies`}
           </span>
         </div>
 
         {/* Filter chips */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 24px', borderBottom: '1px solid var(--border)', flexWrap: 'wrap' }}>
-          <span className="mono upper" style={{ fontSize: 8.5, letterSpacing: '0.1em', color: 'var(--ink-dim)' }}>Sector</span>
+          <span className="mono upper" style={{ fontSize: 10, letterSpacing: '0.1em', color: 'var(--ink-dim)' }}>Sector</span>
           {sectorOptions.map((s) => (
             <Chip key={s} label={s} active={sector === s} onClick={() => setSector(sector === s ? null : s)} />
           ))}
@@ -130,7 +138,7 @@ export function Universe() {
                 top: 0,
                 background: 'var(--bg-elev)',
                 borderBottom: '1px solid var(--border)',
-                fontSize: 8.5,
+                fontSize: 10,
                 letterSpacing: '0.1em',
                 color: 'var(--ink-dim)',
                 zIndex: 1,
@@ -145,20 +153,14 @@ export function Universe() {
             </div>
 
             {displayed.length === 0 ? (
-              <div style={{ padding: '60px 24px', textAlign: 'center', color: 'var(--ink-mute)' }}>
-                <div className="mono" style={{ fontSize: 13, color: 'var(--ink-dim)', marginBottom: 8 }}>
-                  No companies match these filters
-                </div>
-                <div style={{ fontSize: 12 }}>Clear the search or filter chips.</div>
-              </div>
+              <EmptyState title="No companies match these filters" sub="Clear the search or filter chips." fill={false} />
             ) : (
               displayed.map((c) => (
                 <div
                   key={c.symbol}
                   onClick={() => setOpenSymbol(c.symbol)}
+                  className="row-hover"
                   style={{ display: 'grid', gridTemplateColumns: GRID, gap: 14, padding: '12px 24px', borderBottom: '1px solid var(--border)', cursor: 'pointer', alignItems: 'center' }}
-                  onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--bg-elev-2)')}
-                  onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
                 >
                   <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
                     <span
@@ -171,12 +173,12 @@ export function Universe() {
                         border: c.dossier_at ? 'none' : '1.5px solid var(--ink-faint)',
                       }}
                     />
-                    <span className="mono" style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink)' }}>{c.symbol}</span>
+                    <span className="mono" style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--ink)' }}>{c.symbol}</span>
                   </span>
-                  <span style={{ fontSize: 12.5, color: 'var(--ink-2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  <span style={{ fontSize: 13, color: 'var(--ink-2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {c.company_name}
                   </span>
-                  <span className="mono" style={{ fontSize: 11, color: 'var(--ink-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  <span className="mono" style={{ fontSize: 11.5, color: 'var(--ink-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {dash(c.sector)}
                   </span>
                   <span className="num" style={{ fontSize: 11.5, color: 'var(--ink-2)', textAlign: 'right' }}>{num(c.ltp, 1)}</span>

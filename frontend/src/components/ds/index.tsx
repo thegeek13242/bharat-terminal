@@ -158,8 +158,8 @@ export function Tag({
         display: 'inline-flex',
         alignItems: 'center',
         gap: 5,
-        fontSize: size === 'sm' ? 8.5 : 10,
-        letterSpacing: '0.1em',
+        fontSize: 10,
+        letterSpacing: '0.08em',
         color,
         border: `1px solid ${isAccentish ? 'var(--accent-line)' : 'var(--border-hi)'}`,
         background: variant === 'accent' ? 'var(--accent-dim)' : 'transparent',
@@ -287,6 +287,40 @@ export function SectionLabel({ children, style }: { children: ReactNode; style?:
     >
       <span style={{ width: 6, height: 6, borderRadius: 1, background: 'var(--accent)' }} />
       {children}
+    </div>
+  );
+}
+
+// ── EmptyState ────────────────────────────────────────────────────────────
+// One shared empty/placeholder block: dashed icon-box + title + sub. Used by
+// FeedList, AssessmentPanel, Universe and DossierModal so the empty states stay
+// visually consistent.
+export function EmptyState({
+  title,
+  sub,
+  fill = true,
+}: {
+  title: string;
+  sub?: string;
+  fill?: boolean;
+}) {
+  return (
+    <div
+      style={{
+        height: fill ? '100%' : undefined,
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 12,
+        color: 'var(--ink-mute)',
+        textAlign: 'center',
+        padding: 24,
+      }}
+    >
+      <span style={{ width: 36, height: 36, border: '1px dashed var(--ink-faint)', borderRadius: 5 }} />
+      <div className="mono" style={{ fontSize: 13, color: 'var(--ink-dim)' }}>{title}</div>
+      {sub && <div style={{ fontSize: 11.5, color: 'var(--ink-mute)' }}>{sub}</div>}
     </div>
   );
 }

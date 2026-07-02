@@ -13,8 +13,11 @@ router = APIRouter()
 async def websocket_feed(websocket: WebSocket):
     """
     Stream ImpactReport events to the client.
-    Client can send JSON messages to filter by sector:
-    {"action": "subscribe_sector", "sector": "BANKING"}
+
+    All connected clients receive every relevant ImpactReport broadcast.
+    The client sends periodic keepalive frames ({"action": "ping"} → {"type":
+    "pong"}) so Cloudflare does not close the socket as idle. Sector filtering
+    is NOT implemented server-side; the frontend filters locally.
     """
     # Authenticate from the session cookie sent during the handshake.
     user = user_from_session_cookie(websocket.cookies)
@@ -34,15 +37,27 @@ async def websocket_feed(websocket: WebSocket):
 
     try:
         while True:
-            # Listen for client messages (subscription control)
-            data = await websocket.receive_json()
-            action = data.get("action")
+            # Listen for client messages (keepalive control).
+            # Tolerate malformed frames: a non-JSON frame raises inside
+            # receive_json — we log-and-continue rather than tearing down a
+            # healthy socket over one bad frame.
+            try:
+                data = await websocket.receive_json()
+            except WebSocketDisconnect:
+                raise
+            except Exception:
+                # Malformed / non-JSON frame — ignore and keep the socket open.
+                continue
 
-            if action == "ping":
+            if not isinstance(data, dict):
+                continue
+
+            if data.get("action") == "ping":
                 await websocket.send_json({"type": "pong"})
-            elif action == "subscribe_sector":
-                sector = data.get("sector", "").upper()
-                logger.info(f"Client {client_id} subscribed to sector {sector}")
 
     except WebSocketDisconnect:
+        pass
+    finally:
+        # Always clean up connection state, regardless of how the loop exits
+        # (disconnect, send error on a dead socket, etc.).
         manager.disconnect(client_id)

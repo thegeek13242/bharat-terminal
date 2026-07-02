@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { CompanyDetail, ImpactReport } from '@/types';
 import { api } from '@/lib/api';
-import { LiveDot } from './ds';
+import { EmptyState } from './ds';
 import { SectionHeader, KpiCard, DirectionPill, ReasoningList } from './panel-parts';
 import {
   primaryImpact,
@@ -43,43 +43,24 @@ export function AssessmentPanel({ report }: { report: ImpactReport | null }) {
   }, [symbol]);
 
   if (!report || !imp) {
-    return (
-      <div
-        style={{
-          height: '100%',
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          justifyContent: 'center',
-          gap: 12,
-          color: 'var(--ink-mute)',
-          textAlign: 'center',
-          padding: 24,
-        }}
-      >
-        <span style={{ width: 38, height: 38, border: '1px dashed var(--ink-faint)', borderRadius: 4 }} />
-        <div className="mono" style={{ fontSize: 12, color: 'var(--ink-dim)' }}>Select an event</div>
-        <div style={{ fontSize: 12 }}>Its structured assessment appears here.</div>
-      </div>
-    );
+    return <EmptyState title="Select an event" sub="Its structured assessment appears here." />;
   }
 
-  const sig = report.trade_signals?.[0];
-  const reasoning = [
-    ...(report.company_impacts ?? []).map((c) => c.explanation).filter(Boolean),
-    ...(report.trade_signals ?? []).map((s) => s.reasoning).filter(Boolean),
-  ].slice(0, 6) as string[];
+  const reasoning = (report.company_impacts ?? [])
+    .map((c) => c.explanation)
+    .filter(Boolean)
+    .slice(0, 6) as string[];
 
   return (
     <div style={{ height: '100%', overflow: 'auto', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
       {/* Company header */}
       <div style={{ background: 'var(--bg-elev)', padding: '18px 24px', borderBottom: '1px solid var(--border)' }}>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
-          <span className="mono" style={{ fontSize: 22, fontWeight: 600, color: 'var(--ink)' }}>{imp.symbol}</span>
-          <span className="mono upper" style={{ fontSize: 9.5, letterSpacing: '0.14em', color: 'var(--ink-mute)' }}>NSE · EQ</span>
+          <span className="mono" style={{ fontSize: 18, fontWeight: 600, color: 'var(--ink)' }}>{imp.symbol}</span>
+          <span className="mono upper" style={{ fontSize: 10, letterSpacing: '0.14em', color: 'var(--ink-mute)' }}>NSE · EQ</span>
           <span style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 7 }}>
             <span style={{ width: 7, height: 7, borderRadius: '50%', background: SENTIMENT_DOT[imp.sentiment] }} />
-            <span className="mono upper" style={{ fontSize: 9.5, letterSpacing: '0.1em', color: SENTIMENT_DOT[imp.sentiment] }}>
+            <span className="mono upper" style={{ fontSize: 10, letterSpacing: '0.1em', color: SENTIMENT_DOT[imp.sentiment] }}>
               {SENTIMENT_WORD[imp.sentiment]}
             </span>
           </span>
@@ -120,13 +101,13 @@ export function AssessmentPanel({ report }: { report: ImpactReport | null }) {
           gridTemplateColumns: '88px 1fr 110px 64px',
           gap: 10,
           padding: '7px 24px',
-          fontSize: 8,
-          letterSpacing: '0.1em',
+          fontSize: 10,
+          letterSpacing: '0.08em',
           color: 'var(--ink-dim)',
         }}
       >
         <span>Symbol</span>
-        <span>Channel</span>
+        <span>Affected lines</span>
         <span>Direction</span>
         <span style={{ textAlign: 'right' }}>Horizon</span>
       </div>
@@ -142,12 +123,12 @@ export function AssessmentPanel({ report }: { report: ImpactReport | null }) {
             alignItems: 'center',
           }}
         >
-          <span className="mono" style={{ fontSize: 12, color: 'var(--ink)' }}>{c.symbol}</span>
+          <span className="mono" style={{ fontSize: 11.5, color: 'var(--ink)' }}>{c.symbol}</span>
           <span style={{ fontSize: 11.5, color: 'var(--ink-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {(c.affected_line_items ?? []).join(', ') || dash(null)}
           </span>
           <DirectionPill direction={sentimentToDirection(c.sentiment)} />
-          <span className="num" style={{ fontSize: 11, color: 'var(--ink-dim)', textAlign: 'right' }}>
+          <span className="num" style={{ fontSize: 11.5, color: 'var(--ink-dim)', textAlign: 'right' }}>
             {horizonLabel(c.time_horizon)}
           </span>
         </div>
@@ -158,28 +139,6 @@ export function AssessmentPanel({ report }: { report: ImpactReport | null }) {
       <ReasoningList items={reasoning} />
 
       <div style={{ flex: 1 }} />
-
-      {/* Verdict */}
-      {sig && (
-        <div
-          style={{
-            background: 'var(--accent-dim)',
-            borderTop: '1px solid var(--accent-line)',
-            padding: '16px 24px',
-          }}
-        >
-          <div className="mono upper" style={{ fontSize: 9, letterSpacing: '0.18em', color: 'var(--accent)' }}>Assessment</div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginTop: 8 }}>
-            <LiveDot color="accent" />
-            <span className="mono" style={{ fontSize: 15, fontWeight: 600, color: 'var(--ink)' }}>
-              Consider: {sig.direction} · {sig.symbol}
-            </span>
-          </div>
-          <div className="mono upper" style={{ fontSize: 9, letterSpacing: '0.12em', color: 'var(--ink-dim)', marginTop: 8 }}>
-            Conviction&nbsp;·&nbsp;<span style={{ color: 'var(--ink-2)' }}>{sig.conviction}</span>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

@@ -48,6 +48,44 @@ export function clockTime(iso: string | null | undefined): string {
   }
 }
 
+/** Short date for the FeedList day-divider: "TODAY" or "01 JUL". */
+export function dayLabel(iso: string | null | undefined): string {
+  if (!iso) return DASH;
+  try {
+    const d = new Date(iso);
+    const now = new Date();
+    const sameDay =
+      d.getFullYear() === now.getFullYear() &&
+      d.getMonth() === now.getMonth() &&
+      d.getDate() === now.getDate();
+    if (sameDay) return 'TODAY';
+    return d
+      .toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })
+      .toUpperCase();
+  } catch {
+    return DASH;
+  }
+}
+
+/** Stable per-day key ("2026-07-01") for grouping feed rows. */
+export function dayKey(iso: string | null | undefined): string {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleDateString('en-CA'); // YYYY-MM-DD, local
+  } catch {
+    return '';
+  }
+}
+
+/** "312 events · since 09:15" derived from the oldest loaded event. Honest — no
+ * fabricated windows. */
+export function feedRangeMeta(count: number, oldestIso: string | null | undefined): string {
+  const noun = count === 1 ? 'EVENT' : 'EVENTS';
+  if (!count || !oldestIso) return `${count} ${noun}`;
+  const t = clockTime(oldestIso);
+  return t === DASH ? `${count} ${noun}` : `${count} ${noun} · SINCE ${t}`;
+}
+
 // ── Fundamental-effect direction (color + glyph, double-encoded) ───────────
 export type Direction = 'tailwind' | 'headwind' | 'neutral';
 

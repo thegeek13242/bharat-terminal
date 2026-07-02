@@ -12,7 +12,7 @@ export function SectionHeader({ children, style }: { children: ReactNode; style?
         borderTop: '1px solid var(--border)',
         borderBottom: '1px solid var(--border)',
         padding: '8px 24px',
-        fontSize: 9.5,
+        fontSize: 10,
         letterSpacing: '0.18em',
         color: 'var(--ink-dim)',
         ...style,
@@ -37,14 +37,14 @@ export function KpiCard({
 }) {
   return (
     <Card style={{ padding: '13px 15px' }}>
-      <div className="mono upper" style={{ fontSize: 8.5, letterSpacing: '0.12em', color: 'var(--ink-dim)' }}>
+      <div className="mono upper" style={{ fontSize: 10, letterSpacing: '0.12em', color: 'var(--ink-dim)' }}>
         {label}
       </div>
       <div className="num" style={{ fontSize: 18, fontWeight: 600, color: 'var(--ink)', marginTop: 6 }}>
         {value}
       </div>
       {sub && (
-        <div className="mono" style={{ fontSize: 10.5, color: subColor ?? 'var(--ink-mute)', marginTop: 4 }}>
+        <div className="mono" style={{ fontSize: 10, color: subColor ?? 'var(--ink-mute)', marginTop: 4 }}>
           {sub}
         </div>
       )}
@@ -57,7 +57,7 @@ export function DirectionPill({ direction }: { direction: Direction }) {
   return (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}>
       <span style={{ width: 6, height: 6, borderRadius: '50%', background: DIRECTION_VAR[direction] }} />
-      <span className="mono upper" style={{ fontSize: 9, letterSpacing: '0.1em', color: DIRECTION_VAR[direction] }}>
+      <span className="mono upper" style={{ fontSize: 10, letterSpacing: '0.1em', color: DIRECTION_VAR[direction] }}>
         {DIRECTION_LABEL[direction]}
       </span>
     </span>
@@ -68,7 +68,7 @@ export function DirectionPill({ direction }: { direction: Direction }) {
 export function ReasoningList({ items }: { items: string[] }) {
   if (items.length === 0) {
     return (
-      <div style={{ padding: '14px 24px', fontSize: 12.5, color: 'var(--ink-mute)' }}>
+      <div style={{ padding: '14px 24px', fontSize: 13, color: 'var(--ink-mute)' }}>
         No reasoning recorded for this event.
       </div>
     );
@@ -77,7 +77,7 @@ export function ReasoningList({ items }: { items: string[] }) {
     <div style={{ padding: '14px 24px', display: 'flex', flexDirection: 'column', gap: 12 }}>
       {items.map((text, i) => (
         <div key={i} style={{ display: 'grid', gridTemplateColumns: '26px 1fr', gap: 8 }}>
-          <span className="mono" style={{ fontSize: 12, color: 'var(--accent)' }}>
+          <span className="mono" style={{ fontSize: 11.5, color: 'var(--accent)' }}>
             {String(i + 1).padStart(2, '0')}.
           </span>
           <span style={{ fontSize: 13, lineHeight: 1.5, color: 'var(--ink-2)' }}>{text}</span>
