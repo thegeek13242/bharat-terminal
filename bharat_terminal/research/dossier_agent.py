@@ -32,7 +32,6 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-import httpx
 from bharat_terminal import grounding, llm
 from bharat_terminal.llm import provider_for_model
 
