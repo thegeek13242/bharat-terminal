@@ -14,8 +14,7 @@ the KB REST service, never asyncpg):
   (caller applies NO downgrade — fail-open).
 
 We use the EQUITY cash price on purpose: the priced-in judgment needs the stock's
-own price, not derivatives (the `derivative_ticks`/fno-engine path is unrelated
-and not used here).
+own price, not a derivatives feed.
 """
 from __future__ import annotations
 

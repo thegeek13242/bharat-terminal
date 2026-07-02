@@ -724,54 +724,9 @@ class DossierLinkage(Base):
     )
 
 
-# ── Derivatives layer (migration 008) ───────────────────────────────────
-
-
-class DerivativeTickRow(Base):
-    """
-    Selectively-persisted intraday F&O tick. Populated by the fno-engine
-    consumer reading raw.fno.in — only OI-significant events (|Δ OI| ≥
-    threshold) plus periodic heartbeats land here, to keep volume bounded.
-    """
-    __tablename__ = "derivative_ticks"
-
-    timestamp_utc:   Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
-    symbol:          Mapped[str]      = mapped_column(String(20), primary_key=True)
-    instrument_type: Mapped[str]      = mapped_column(String(10), primary_key=True)
-    expiry:          Mapped[date]     = mapped_column(Date, primary_key=True)
-    strike:          Mapped[Optional[float]] = mapped_column(Numeric(10, 2), primary_key=True, nullable=True)
-    token:           Mapped[str]      = mapped_column(String(20), nullable=False)
-    ltp:             Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
-    open_interest:   Mapped[Optional[int]]   = mapped_column(BigInteger, nullable=True)
-    change_in_oi:    Mapped[Optional[int]]   = mapped_column(BigInteger, nullable=True)
-    volume_day:      Mapped[Optional[int]]   = mapped_column(BigInteger, nullable=True)
-    iv:              Mapped[Optional[float]] = mapped_column(Numeric(6, 2), nullable=True)
-    total_buy_qty:   Mapped[Optional[int]]   = mapped_column(BigInteger, nullable=True)
-    total_sell_qty:  Mapped[Optional[int]]   = mapped_column(BigInteger, nullable=True)
-    trigger_reason:  Mapped[Optional[str]]   = mapped_column(String(20), nullable=True)
-
-
-class DerivativeEod(Base):
-    """End-of-day snapshot of every traded contract. Populated by daily NSE pull."""
-    __tablename__ = "derivatives_eod"
-
-    date:            Mapped[date]    = mapped_column(Date, primary_key=True)
-    symbol:          Mapped[str]     = mapped_column(String(20), primary_key=True)
-    instrument_type: Mapped[str]     = mapped_column(String(10), primary_key=True)
-    expiry:          Mapped[date]    = mapped_column(Date, primary_key=True)
-    strike:          Mapped[Optional[float]] = mapped_column(Numeric(10, 2), primary_key=True, nullable=True)
-    close:           Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
-    settle_price:    Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
-    open_interest:   Mapped[Optional[int]]   = mapped_column(BigInteger, nullable=True)
-    change_in_oi:    Mapped[Optional[int]]   = mapped_column(BigInteger, nullable=True)
-    volume_day:      Mapped[Optional[int]]   = mapped_column(BigInteger, nullable=True)
-    iv:              Mapped[Optional[float]] = mapped_column(Numeric(6, 2), nullable=True)
-    delta:           Mapped[Optional[float]] = mapped_column(Numeric(6, 4), nullable=True)
-    gamma:           Mapped[Optional[float]] = mapped_column(Numeric(8, 6), nullable=True)
-    theta:           Mapped[Optional[float]] = mapped_column(Numeric(10, 2), nullable=True)
-    vega:            Mapped[Optional[float]] = mapped_column(Numeric(10, 2), nullable=True)
-    source:          Mapped[str]     = mapped_column(String(20), nullable=False, server_default="nse_option_chain")
-    created_at:      Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+# ── Derivatives layer ────────────────────────────────────────────────────
+# derivative_ticks + derivatives_eod were dropped in migration 016 (unused —
+# no downstream consumer; the live F&O dataset is participant_oi below).
 
 
 class ParticipantOI(Base):
