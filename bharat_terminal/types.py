@@ -171,56 +171,6 @@ class CommodityTick(BaseModel):
     tier: Literal["commodity"] = "commodity"
 
 
-class DerivativeTick(BaseModel):
-    """
-    Single F&O tick — SnapQuote-mode observation for an NSE F&O contract
-    (stock future, index future, or option) from Angel One SmartWebSocketV2.
-
-    Emitted onto raw.fno.in. The fno-engine consumer downstream filters
-    these to "OI-significant" events (|Δ OI| >= threshold) plus periodic
-    heartbeats before persisting — raw tick rate is ~5M/day across 60+
-    contracts, too high to store unfiltered.
-
-    Channel semantics:
-      Open interest CHANGE is the real signal (informed flow direction).
-      Absolute OI matters only as a sanity check on liquidity.
-    """
-    model_config = {"frozen": True}
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    source: str = "ANGELONE_NFO"
-    timestamp_utc: datetime
-    exchange_timestamp_ms: Optional[int] = None
-
-    symbol: str                                     # Underlying: RELIANCE, NIFTY, BANKNIFTY, …
-    instrument_type: Literal["FUT", "CE", "PE"]
-    contract_symbol: str                            # e.g. "RELIANCE25MAY26FUT" / "NIFTY15MAY2625000CE"
-    token: str                                      # Angel One scrip token
-    expiry: Optional[str] = None                    # "DDMMMYYYY"
-    strike: Optional[float] = None                  # None for futures
-
-    last_price: float
-    open_price: Optional[float] = None
-    high_price: Optional[float] = None
-    low_price: Optional[float] = None
-    prev_close: Optional[float] = None
-
-    last_quantity: Optional[int] = None
-    avg_price: Optional[float] = None
-
-    # The OI fields are the whole point of subscribing in SnapQuote mode
-    open_interest: Optional[int] = None
-    change_in_oi: Optional[int] = None              # vs previous day's close
-    volume_day: Optional[int] = None
-
-    total_buy_qty: Optional[float] = None
-    total_sell_qty: Optional[float] = None
-
-    iv: Optional[float] = None                      # Implied vol for options
-
-    ingest_latency_ms: float = 0.0
-    tier: Literal["derivative"] = "derivative"
-
-
 class CommodityShock(BaseModel):
     """
     Anomaly event: commodity price moved enough vs. its rolling baseline that

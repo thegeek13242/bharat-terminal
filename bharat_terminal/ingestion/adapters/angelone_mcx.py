@@ -56,7 +56,7 @@ except ImportError as _e:  # pragma: no cover
     # "smartapi-python is not installed".
     _SMARTAPI_IMPORT_ERROR = _e
 
-from bharat_terminal.types import CommodityTick, DerivativeTick
+from bharat_terminal.types import CommodityTick
 
 logger = logging.getLogger(__name__)
 
@@ -80,34 +80,13 @@ MCX_UNIVERSE: Dict[str, str] = {
 
 # SmartWebSocketV2 constants (https://smartapi.angelone.in/docs/MarketData)
 EXCHANGE_TYPE_NSE = 1
-EXCHANGE_TYPE_NFO = 2
 EXCHANGE_TYPE_MCX = 5
 
 SUBSCRIPTION_MODE_LTP        = 1   # last-traded-price only
 SUBSCRIPTION_MODE_QUOTE      = 2   # OHLC + LTP + volume + buy/sell qty
-SUBSCRIPTION_MODE_SNAP_QUOTE = 3   # QUOTE + open_interest + IV (NFO only). Required for F&O.
+SUBSCRIPTION_MODE_SNAP_QUOTE = 3   # QUOTE + volume + buy/sell qty
 
-DEFAULT_PRICE_DIVISOR = 100.0  # MCX + NFO prices come in paise
-
-# ── NFO universe (F&O contracts we subscribe to) ────────────────────────
-# Stock futures — NIFTY 50 names. The list lives here as a stable snapshot
-# of NSE-listed F&O names rather than importing research.universe to avoid
-# the ingestion service depending on research code.
-NFO_STOCK_FUTURES: tuple[str, ...] = (
-    "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS",
-    "BHARTIARTL", "ITC", "LT", "AXISBANK", "KOTAKBANK",
-    "SBIN", "HINDUNILVR", "BAJFINANCE", "ASIANPAINT", "MARUTI",
-    "M&M", "SUNPHARMA", "TITAN", "ULTRACEMCO", "ONGC",
-    "WIPRO", "NTPC", "POWERGRID", "TATAMOTORS", "HCLTECH",
-    "JSWSTEEL", "COALINDIA", "BAJAJFINSV", "ADANIENT", "ADANIPORTS",
-    "TATASTEEL", "GRASIM", "DRREDDY", "HINDALCO", "BPCL",
-    "TECHM", "BRITANNIA", "CIPLA", "EICHERMOT", "NESTLEIND",
-    "INDUSINDBK", "DIVISLAB", "TATACONSUM", "HEROMOTOCO", "APOLLOHOSP",
-    "BAJAJ-AUTO", "UPL", "SBILIFE", "HDFCLIFE", "LTIM",
-)
-
-# Index futures
-NFO_INDEX_FUTURES: tuple[str, ...] = ("NIFTY", "BANKNIFTY", "FINNIFTY")
+DEFAULT_PRICE_DIVISOR = 100.0  # MCX prices come in paise
 
 
 def _parse_expiry(expiry_str: str) -> Optional[datetime]:
@@ -136,23 +115,13 @@ class AngelOneMCXAdapter:
         scrip_refresh_hours: int = 12,
         reconnect_delay_seconds: float = 5.0,
         max_reconnect_delay_seconds: float = 60.0,
-        # ── NFO additions ──────────────────────────────────────────────
-        # If publish_derivative_callback is set, the adapter ALSO resolves NFO
-        # tokens for the configured stock + index futures universe and emits
-        # DerivativeTick events alongside MCX ticks (single WS subscription).
-        publish_derivative_callback: Optional[Callable[[DerivativeTick], Awaitable[bool]]] = None,
-        nfo_stock_universe: Optional[tuple] = None,
-        nfo_index_universe: Optional[tuple] = None,
     ):
         self._publish = publish_callback
-        self._publish_derivative = publish_derivative_callback
         self._api_key = api_key or os.getenv("ANGEL_ONE_API_KEY", "")
         self._client_code = client_code or os.getenv("ANGEL_ONE_CLIENT_CODE", "")
         self._password = password or os.getenv("ANGEL_ONE_PASSWORD", "")
         self._totp_secret = totp_secret or os.getenv("ANGEL_ONE_TOTP_SECRET", "")
         self._universe = universe or dict(MCX_UNIVERSE)
-        self._nfo_stock_universe = tuple(nfo_stock_universe) if nfo_stock_universe is not None else NFO_STOCK_FUTURES
-        self._nfo_index_universe = tuple(nfo_index_universe) if nfo_index_universe is not None else NFO_INDEX_FUTURES
         self._scrip_refresh_hours = scrip_refresh_hours
         self._reconnect_delay = reconnect_delay_seconds
         self._max_reconnect_delay = max_reconnect_delay_seconds
@@ -165,10 +134,8 @@ class AngelOneMCXAdapter:
         self._jwt_token: Optional[str] = None
         self._refresh_token: Optional[str] = None
         self._feed_token: Optional[str] = None
-        # token (str) → metadata dict. Now polymorphic across exchanges:
+        # token (str) → metadata dict.
         #   MCX: {"exch": "MCX", "commodity": str, "symbol": str, "expiry": str, "divisor": float}
-        #   NFO: {"exch": "NFO", "underlying": str, "instrument_type": "FUT"|"CE"|"PE",
-        #         "contract_symbol": str, "expiry": str, "strike": float|None, "divisor": float}
         self._token_metadata: Dict[str, Dict] = {}
 
         # WS thread + bridge
@@ -340,12 +307,9 @@ class AngelOneMCXAdapter:
         Fetch the OpenAPI scrip master once and resolve tokens for:
 
           MCX: nearest-non-expired FUTCOM for each commodity in MCX_UNIVERSE.
-          NFO: nearest-non-expired FUTSTK for each NIFTY-50 name AND
-               nearest-non-expired FUTIDX for NIFTY/BANKNIFTY/FINNIFTY.
 
-        Both populate the same self._token_metadata dict, tagged by `exch`
-        so `_parse_tick` can route each incoming tick to the correct
-        downstream model (CommodityTick vs DerivativeTick).
+        Populates self._token_metadata (tagged by `exch`) so `_parse_tick`
+        can build a CommodityTick for each incoming tick.
         """
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=60)
@@ -411,82 +375,6 @@ class AngelOneMCXAdapter:
             + (f" | missing: {mcx_missing}" if mcx_missing else "")
         )
 
-        # ── 2) NFO FUTSTK + FUTIDX (only if a derivative callback is set) ──
-        nfo_resolved: List[str] = []
-        nfo_missing: List[str] = []
-        if self._publish_derivative is not None:
-            stock_set = set(self._nfo_stock_universe)
-            index_set = set(self._nfo_index_universe)
-            stock_candidates: Dict[str, List] = {n: [] for n in stock_set}
-            index_candidates: Dict[str, List] = {n: [] for n in index_set}
-
-            for row in scrip_list:
-                if not isinstance(row, dict):
-                    continue
-                if row.get("exch_seg") != "NFO":
-                    continue
-                instr = row.get("instrumenttype")
-                if instr not in ("FUTSTK", "FUTIDX"):
-                    continue
-                name = row.get("name") or ""
-                exp = _parse_expiry(row.get("expiry") or "")
-                if exp is None or exp < now_utc:
-                    continue
-                if instr == "FUTSTK" and name in stock_set:
-                    stock_candidates[name].append((exp, row))
-                elif instr == "FUTIDX" and name in index_set:
-                    index_candidates[name].append((exp, row))
-
-            for name in stock_set:
-                rows = stock_candidates.get(name) or []
-                if not rows:
-                    nfo_missing.append(f"FUTSTK:{name}")
-                    continue
-                rows.sort(key=lambda r: r[0])
-                _exp_dt, near = rows[0]
-                token = str(near.get("token") or "").strip()
-                if not token:
-                    continue
-                new_metadata[token] = {
-                    "exch": "NFO",
-                    "underlying": name,
-                    "instrument_type": "FUT",
-                    "contract_symbol": near.get("symbol") or "",
-                    "expiry": near.get("expiry") or "",
-                    "strike": None,
-                    "divisor": DEFAULT_PRICE_DIVISOR,
-                }
-                nfo_resolved.append(f"{name}=FUTSTK")
-
-            for name in index_set:
-                rows = index_candidates.get(name) or []
-                if not rows:
-                    nfo_missing.append(f"FUTIDX:{name}")
-                    continue
-                rows.sort(key=lambda r: r[0])
-                _exp_dt, near = rows[0]
-                token = str(near.get("token") or "").strip()
-                if not token:
-                    continue
-                new_metadata[token] = {
-                    "exch": "NFO",
-                    "underlying": name,
-                    "instrument_type": "FUT",
-                    "contract_symbol": near.get("symbol") or "",
-                    "expiry": near.get("expiry") or "",
-                    "strike": None,
-                    "divisor": DEFAULT_PRICE_DIVISOR,
-                }
-                nfo_resolved.append(f"{name}=FUTIDX")
-
-            logger.info(
-                f"[{self.source_name}] Resolved {len(nfo_resolved)} NFO futures "
-                f"({sum(1 for r in nfo_resolved if 'FUTSTK' in r)} stock + "
-                f"{sum(1 for r in nfo_resolved if 'FUTIDX' in r)} index)"
-                + (f" | missing: {nfo_missing[:10]}" + ("…" if len(nfo_missing) > 10 else "")
-                   if nfo_missing else "")
-            )
-
         self._token_metadata = new_metadata
 
     # ── WebSocket lifecycle ─────────────────────────────────────────────
@@ -533,28 +421,22 @@ class AngelOneMCXAdapter:
                 pass
             return
 
-        # Group tokens by exchange — single subscribe() call, multiple
-        # exchange entries in the token_list as per SmartAPI docs.
         mcx_tokens = [t for t, m in self._token_metadata.items() if m.get("exch") == "MCX"]
-        nfo_tokens = [t for t, m in self._token_metadata.items() if m.get("exch") == "NFO"]
 
         token_list: List[Dict] = []
         if mcx_tokens:
             token_list.append({"exchangeType": EXCHANGE_TYPE_MCX, "tokens": mcx_tokens})
-        if nfo_tokens:
-            token_list.append({"exchangeType": EXCHANGE_TYPE_NFO, "tokens": nfo_tokens})
 
         try:
             assert self._ws is not None, "ws not constructed before on_open"
-            # Mode 3 (SnapQuote) is a superset of mode 2 (Quote) — it adds the
-            # OI fields we need for F&O. MCX has no real OI but the extra fields
-            # are nulled so it's harmless to use SnapQuote across the board.
+            # Mode 3 (SnapQuote) is a superset of mode 2 (Quote); MCX has no OI so
+            # the extra fields are nulled — harmless.
             self._ws.subscribe(
                 "bharat-derivs-1", SUBSCRIPTION_MODE_SNAP_QUOTE, token_list
             )
             logger.info(
                 f"[{self.source_name}] Subscribed mode=SNAP_QUOTE to "
-                f"{len(mcx_tokens)} MCX + {len(nfo_tokens)} NFO tokens"
+                f"{len(mcx_tokens)} MCX tokens"
             )
             if self._loop:
                 self._loop.call_soon_threadsafe(self._connected.set)
@@ -564,8 +446,7 @@ class AngelOneMCXAdapter:
     def _on_data(self, wsapp, message) -> None:  # noqa: ARG002
         """
         Bridge SmartWebSocketV2 callback (worker thread) into the asyncio
-        loop. We route the parsed model (CommodityTick or DerivativeTick) to
-        the correct publish callback based on the token's exchange metadata.
+        loop, publishing the parsed CommodityTick.
         """
         try:
             parsed = self._parse_tick(message)
@@ -594,9 +475,7 @@ class AngelOneMCXAdapter:
 
     def _parse_tick(self, message):
         """
-        Translate a SmartWebSocketV2 message into the correct model:
-          • MCX token → CommodityTick (existing path)
-          • NFO token → DerivativeTick (new path, with OI fields)
+        Translate a SmartWebSocketV2 message into a CommodityTick (MCX token).
         Returns None for unknown tokens or malformed messages.
         """
         if not isinstance(message, dict):
@@ -669,44 +548,12 @@ class AngelOneMCXAdapter:
                 ingest_latency_ms=latency_ms,
             )
 
-        if meta.get("exch") == "NFO":
-            # SnapQuote-mode message contains the OI fields. SmartAPI WS docs
-            # describe them as integers; the python SDK normalises field names.
-            return DerivativeTick(
-                timestamp_utc=now_utc,
-                exchange_timestamp_ms=exchange_ts,
-                symbol=meta["underlying"],
-                instrument_type=meta["instrument_type"],
-                contract_symbol=meta.get("contract_symbol") or "",
-                token=token,
-                expiry=meta.get("expiry") or None,
-                strike=meta.get("strike"),
-                last_price=last_price,
-                open_price=_scaled("open_price_of_the_day"),
-                high_price=_scaled("high_price_of_the_day"),
-                low_price=_scaled("low_price_of_the_day"),
-                prev_close=_scaled("closed_price"),
-                last_quantity=_intish("last_traded_quantity"),
-                avg_price=_scaled("average_traded_price"),
-                volume_day=_intish("volume_trade_for_the_day"),
-                total_buy_qty=_floatish("total_buy_quantity"),
-                total_sell_qty=_floatish("total_sell_quantity"),
-                open_interest=_intish("open_interest"),
-                change_in_oi=_intish("open_interest_change_in_percentage"),
-                ingest_latency_ms=latency_ms,
-            )
-
         return None  # unknown exchange tag
 
     async def _dispatch(self, tick) -> None:
-        """Route the parsed tick to the right publish callback."""
+        """Publish the parsed CommodityTick."""
         try:
-            if isinstance(tick, DerivativeTick):
-                if self._publish_derivative is None:
-                    return
-                ok = await self._publish_derivative(tick)
-            else:
-                ok = await self._publish(tick)
+            ok = await self._publish(tick)
             if ok:
                 self._stats["publish_ok"] += 1
             else:
