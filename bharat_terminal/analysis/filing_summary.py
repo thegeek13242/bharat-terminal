@@ -81,6 +81,33 @@ def ungrounded_numbers(summary: str, source: str) -> set[str]:
     return {n for n in _numbers(summary) if n not in src}
 
 
+# ── Currency gate ────────────────────────────────────────────────────────────
+# PDF extraction from Indian annual reports frequently corrupts the rupee
+# glyph: fonts that remapped '$' to draw '₹' extract as a literal '$'
+# (observed: "final dividend of $ 25 per equity share of $10 each" for an
+# NSE-listed company's rupee dividend). A bare '$'/'€'/'£' glyph in extracted
+# filing text is therefore UNTRUSTWORTHY. A foreign-currency marker in the
+# summary is allowed only when the source corroborates it in words
+# ("USD", "US$", "dollar", …) — glyphs alone do not count. Rupee notation
+# (₹/Rs./INR) is never blocked. Residual risk: a filing writing a genuine
+# dollar amount only as a bare '$' loses its summary — fail-safe by design.
+_FOREIGN_CURRENCY_CLASSES = {
+    "dollar": (re.compile(r"\$|\bUSD\b|\bUS\$", re.I), re.compile(r"\bUSD\b|US\$|\bdollars?\b", re.I)),
+    "euro": (re.compile(r"€|\bEUR\b", re.I), re.compile(r"\bEUR\b|\beuros?\b", re.I)),
+    "pound": (re.compile(r"£|\bGBP\b", re.I), re.compile(r"\bGBP\b|\bpounds?\b|\bsterling\b", re.I)),
+}
+
+
+def uncorroborated_currencies(summary: str, source: str) -> set[str]:
+    """Foreign-currency classes used in the summary that the source does not
+    corroborate in WORD form. Non-empty result fails the accuracy gate."""
+    out = set()
+    for name, (in_summary, word_form_in_source) in _FOREIGN_CURRENCY_CLASSES.items():
+        if in_summary.search(summary) and not word_form_in_source.search(source):
+            out.add(name)
+    return out
+
+
 def _build_prompt(headline: str, body: str) -> str:
     return f"""You are an equity desk analyst summarizing an exchange filing for a market terminal. Below is the filing headline and the full text of its attachment.
 
@@ -90,6 +117,10 @@ STRICT RULES:
 - Copy every figure EXACTLY as it appears in the document — same units, same
   digits. Do NOT convert units, compute totals, growth rates, or differences.
   A figure you cannot quote verbatim must be left out.
+- CURRENCY: the extracted text often corrupts the rupee symbol '₹' into '$'.
+  Amounts in Indian exchange filings are rupee-denominated unless the document
+  says USD/US$/dollar IN WORDS. Write rupee amounts as '₹' or 'Rs.'; never
+  write '$' based on the symbol alone.
 - 2-4 sentences: what kind of filing this is, the material facts (parties,
   amounts, dates, quantities), and any stated purpose or reason.
 - If the document is purely procedural with no material content, set
@@ -150,11 +181,21 @@ async def summarize_filing(headline: str, body: Optional[str], source: str) -> O
             return None
 
         # ── Accuracy gate: every number must exist verbatim in the source ──
-        missing = ungrounded_numbers(summary, headline + "\n" + text_body)
+        source_text = headline + "\n" + text_body
+        missing = ungrounded_numbers(summary, source_text)
         if missing:
             logger.warning(
                 f"[filing_summary] REJECTED ungrounded numbers {sorted(missing)[:5]} "
                 f"for headline {headline[:60]!r}"
+            )
+            return None
+
+        # ── Currency gate: foreign symbols need word-form corroboration ──
+        bad_currencies = uncorroborated_currencies(summary, source_text)
+        if bad_currencies:
+            logger.warning(
+                f"[filing_summary] REJECTED uncorroborated currency {sorted(bad_currencies)} "
+                f"(likely a corrupted rupee glyph) for headline {headline[:60]!r}"
             )
             return None
 
