@@ -2,7 +2,8 @@
 import uuid
 import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
-from bharat_terminal.api.auth import user_from_session_cookie
+from bharat_terminal.api.auth import user_from_session_cookie, INTERNAL_RESEARCH_EMAILS
+from bharat_terminal.api import ltp_relay
 from bharat_terminal.api.ws_manager import manager
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,10 @@ async def websocket_feed(websocket: WebSocket):
     if not user:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
+
+    # Internal accounts may additionally stream live LTP (Angel One data is
+    # personal-use licensed — never available to customer accounts).
+    is_internal = (user.get("email") or "").lower() in INTERNAL_RESEARCH_EMAILS
 
     client_id = str(uuid.uuid4())
     await manager.connect(websocket, client_id)
@@ -52,8 +57,23 @@ async def websocket_feed(websocket: WebSocket):
             if not isinstance(data, dict):
                 continue
 
-            if data.get("action") == "ping":
+            action = data.get("action")
+            if action == "ping":
                 await websocket.send_json({"type": "pong"})
+
+            elif action == "subscribe_ltp" and is_internal:
+                sym = str(data.get("symbol") or "").upper().strip()
+                if sym:
+                    manager.subscribe_ltp(client_id, sym)
+                    await ltp_relay.note_demand(sym)
+                    # Instant snapshot while the first live tick arrives.
+                    cached = await ltp_relay.cached_ltp(sym)
+                    if cached:
+                        await websocket.send_json({"type": "ltp", **cached})
+
+            elif action == "unsubscribe_ltp":
+                manager.unsubscribe_ltp(client_id)
+            # Non-internal subscribe_ltp frames are silently ignored.
 
     except WebSocketDisconnect:
         pass

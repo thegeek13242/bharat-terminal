@@ -79,5 +79,5 @@ export function useImpactFeed() {
     }
   }, [reports, loadingOlder, hasMore]);
 
-  return { reports, wsStatus: status, send, loadOlder, loadingOlder, hasMore };
+  return { reports, wsStatus: status, send, lastMessage, loadOlder, loadingOlder, hasMore };
 }

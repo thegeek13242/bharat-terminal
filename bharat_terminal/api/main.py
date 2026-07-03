@@ -13,6 +13,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 
 from bharat_terminal.api.auth import get_current_user, require_internal_user
 from bharat_terminal.api.kafka_relay import start_kafka_relay, stop_kafka_relay
+from bharat_terminal.api.ltp_relay import start_ltp_relay, stop_ltp_relay
 from bharat_terminal.api.sentiment_relay import (
     start_sentiment_relay,
     stop_sentiment_relay,
@@ -50,10 +51,12 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Bharat Terminal API...")
     await start_kafka_relay()
     await start_sentiment_relay()
+    await start_ltp_relay()
     yield
     # Shutdown
     await stop_kafka_relay()
     await stop_sentiment_relay()
+    await stop_ltp_relay()
     await close_engine()
     logger.info("API shutdown complete")
 

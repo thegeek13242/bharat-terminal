@@ -25,12 +25,47 @@ const SENTIMENT_WORD: Record<string, string> = {
   neutral: 'Neutral',
 };
 
-export function AssessmentPanel({ report }: { report: ImpactReport | null }) {
+interface LtpWs {
+  send: (data: object) => void;
+  lastMessage: any;
+  connected: boolean;
+}
+
+export function AssessmentPanel({ report, ltpWs }: { report: ImpactReport | null; ltpWs?: LtpWs }) {
   const [detail, setDetail] = useState<CompanyDetail | null>(null);
   const imp = report ? primaryImpact(report) : undefined;
   const symbol = imp?.symbol;
   // Renders only for internal-allowlist accounts (endpoint 403s otherwise).
   const ltp = useInternalLtp(symbol);
+
+  // Live tick stream over the existing feed WS (internal accounts only —
+  // the server silently ignores subscribe_ltp from anyone else). The REST
+  // hook stays as bootstrap + EOD fallback; a fresh tick wins the display.
+  const [tick, setTick] = useState<{ ltp: number; at: number } | null>(null);
+  const internalOk = ltp != null; // REST succeeded → account is internal
+  const ltpSend = ltpWs?.send;
+  const ltpConnected = ltpWs?.connected ?? false;
+
+  useEffect(() => {
+    setTick(null);
+  }, [symbol]);
+
+  useEffect(() => {
+    if (!ltpSend || !ltpConnected || !symbol || !internalOk) return;
+    ltpSend({ action: 'subscribe_ltp', symbol });
+    return () => ltpSend({ action: 'unsubscribe_ltp' });
+  }, [ltpSend, ltpConnected, symbol, internalOk]);
+
+  useEffect(() => {
+    const m = ltpWs?.lastMessage;
+    if (m?.type === 'ltp' && m.symbol === symbol && typeof m.ltp === 'number') {
+      setTick({ ltp: m.ltp, at: Date.now() });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ltpWs?.lastMessage, symbol]);
+
+  // Prefer a recent live tick; fall back to the REST value between ticks.
+  const liveLtp = tick && Date.now() - tick.at < 15000 ? tick.ltp : ltp?.ltp;
 
   useEffect(() => {
     let cancelled = false;
@@ -69,9 +104,9 @@ export function AssessmentPanel({ report }: { report: ImpactReport | null }) {
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
           <span className="mono" style={{ fontSize: 18, fontWeight: 600, color: 'var(--ink)' }}>{imp.symbol}</span>
           <span className="mono upper" style={{ fontSize: 10, letterSpacing: '0.14em', color: 'var(--ink-mute)' }}>NSE · EQ</span>
-          {ltp && (ltp.ltp != null ? (
+          {ltp && (liveLtp != null ? (
             <span className="mono" style={{ fontSize: 11.5, color: 'var(--accent)' }}>
-              ₹{num(ltp.ltp, 2)} <span style={{ fontSize: 9, color: 'var(--ink-dim)' }}>LTP</span>
+              ₹{num(liveLtp, 2)} <span style={{ fontSize: 9, color: 'var(--ink-dim)' }}>LTP</span>
             </span>
           ) : ltp.prev_close != null ? (
             <span className="mono" style={{ fontSize: 11.5, color: 'var(--ink-dim)' }}>

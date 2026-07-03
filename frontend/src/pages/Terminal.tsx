@@ -81,7 +81,7 @@ function FilterGroup({ label, children }: { label: string; children: React.React
 }
 
 export function Terminal() {
-  const { reports, wsStatus, loadOlder, loadingOlder, hasMore } = useImpactFeed();
+  const { reports, wsStatus, send, lastMessage, loadOlder, loadingOlder, hasMore } = useImpactFeed();
   const { isStarred, toggleStar, count: starredCount } = useStarred();
   // selectedId + userPinned: when the user explicitly clicks a row we pin it,
   // even if it later scrolls out of the loaded window. Only when nothing is
@@ -316,7 +316,7 @@ export function Terminal() {
         onToggleStar={toggleStar}
       />
 
-      <AssessmentPanel report={selected} />
+      <AssessmentPanel report={selected} ltpWs={{ send, lastMessage, connected }} />
     </div>
   );
 }

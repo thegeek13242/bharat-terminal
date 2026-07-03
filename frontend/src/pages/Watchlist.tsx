@@ -17,7 +17,7 @@ interface Tracked {
 }
 
 export function Watchlist() {
-  const { reports, wsStatus, loadOlder, loadingOlder, hasMore } = useImpactFeed();
+  const { reports, wsStatus, send, lastMessage, loadOlder, loadingOlder, hasMore } = useImpactFeed();
   const { isStarred, toggleStar, count: starredCount } = useStarred();
   const [tracked, setTracked] = useState<Tracked[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -279,7 +279,7 @@ export function Watchlist() {
         onToggleStar={toggleStar}
       />
 
-      <AssessmentPanel report={selected} />
+      <AssessmentPanel report={selected} ltpWs={{ send, lastMessage, connected }} />
     </div>
   );
 }

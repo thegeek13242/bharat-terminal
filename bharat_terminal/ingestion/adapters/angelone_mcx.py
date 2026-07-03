@@ -88,6 +88,21 @@ SUBSCRIPTION_MODE_SNAP_QUOTE = 3   # QUOTE + volume + buy/sell qty
 
 DEFAULT_PRICE_DIVISOR = 100.0  # MCX prices come in paise
 
+# ── Dynamic NSE equity LTP (internal-only terminal feature) ────────────────
+# The api-gateway records demand in a Redis ZSET (symbol → last-request epoch);
+# this adapter subscribes/unsubscribes those symbols on the SAME WebSocket the
+# MCX stream uses (Angel One is single-session — never open a second login),
+# and pushes each tick to Redis: SET ltp:{SYMBOL} + PUBLISH ltp.updates.
+# LICENSING: personal-use data — consumed only by the internal-gated LTP
+# endpoints/WS; never widen to customer surfaces.
+LTP_WANT_KEY = "ltp:want"
+LTP_CHANNEL = "ltp.updates"
+LTP_KEY_TTL_S = 60
+# A symbol stays subscribed while its demand entry is younger than this.
+LTP_DEMAND_WINDOW_S = int(os.getenv("LTP_DEMAND_WINDOW_S", "90"))
+LTP_SUB_POLL_S = float(os.getenv("LTP_SUB_POLL_S", "3"))
+EQUITY_CORRELATION_ID = "bharat-eq-ltp"
+
 
 def _parse_expiry(expiry_str: str) -> Optional[datetime]:
     """Parse Angel One scrip-master expiry, e.g. '21NOV2025' → datetime."""
@@ -145,7 +160,14 @@ class AngelOneMCXAdapter:
         self._main_task: Optional[asyncio.Task] = None
         self._running = False
         self._connected = asyncio.Event()
-        self._stats = {"ticks": 0, "publish_ok": 0, "publish_fail": 0}
+        self._stats = {"ticks": 0, "publish_ok": 0, "publish_fail": 0, "eq_ticks": 0}
+
+        # NSE equity LTP state (demand-driven; see module constants above).
+        self._nse_token_by_symbol: Dict[str, str] = {}
+        self._nse_symbol_by_token: Dict[str, str] = {}
+        self._equity_subscribed: set = set()  # tokens currently subscribed
+        self._eq_task: Optional[asyncio.Task] = None
+        self._redis = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -173,6 +195,9 @@ class AngelOneMCXAdapter:
         self._loop = asyncio.get_running_loop()
         self._running = True
         self._main_task = asyncio.create_task(self._run(), name="angelone-mcx-run")
+        self._eq_task = asyncio.create_task(
+            self._equity_subscription_loop(), name="angelone-eq-ltp"
+        )
         logger.info(
             f"[{self.source_name}] Adapter started "
             f"(universe={list(self._universe.values())})"
@@ -180,6 +205,12 @@ class AngelOneMCXAdapter:
 
     async def stop(self) -> None:
         self._running = False
+        if self._eq_task:
+            self._eq_task.cancel()
+            try:
+                await self._eq_task
+            except asyncio.CancelledError:
+                pass
         if self._ws is not None:
             try:
                 self._ws.close_connection()
@@ -277,17 +308,21 @@ class AngelOneMCXAdapter:
             raise RuntimeError(f"SmartAPI login returned incomplete tokens: {data}")
         logger.info(f"[{self.source_name}] SmartAPI login OK ({self._client_code})")
 
+    async def _get_redis(self):
+        if self._redis is None:
+            import redis.asyncio as _aioredis
+            self._redis = _aioredis.from_url(
+                os.getenv("REDIS_URL", "redis://redis:6379/0"),
+                encoding="utf-8", decode_responses=True,
+            )
+        return self._redis
+
     async def _publish_session(self) -> None:
         """Publish the current session token to Redis (`angelone:session`) so the
         KB service can reuse it for stateless equity LTP lookups. Fail-open."""
         try:
             import json as _json
-            import redis.asyncio as _aioredis
-            if getattr(self, "_redis", None) is None:
-                self._redis = _aioredis.from_url(
-                    os.getenv("REDIS_URL", "redis://redis:6379/0"),
-                    encoding="utf-8", decode_responses=True,
-                )
+            await self._get_redis()
             payload = _json.dumps({
                 "api_key": self._api_key,
                 "access_token": self._jwt_token,
@@ -377,6 +412,28 @@ class AngelOneMCXAdapter:
 
         self._token_metadata = new_metadata
 
+        # ── 2) NSE cash equities (for demand-driven LTP) ──────────────
+        nse_by_symbol: Dict[str, str] = {}
+        nse_by_token: Dict[str, str] = {}
+        for row in scrip_list:
+            if not isinstance(row, dict) or row.get("exch_seg") != "NSE":
+                continue
+            sym = row.get("symbol") or ""
+            if not sym.endswith("-EQ"):
+                continue
+            token = str(row.get("token") or "").strip()
+            if not token:
+                continue
+            base = sym[:-3].upper()
+            nse_by_symbol[base] = token
+            nse_by_token[token] = base
+        self._nse_token_by_symbol = nse_by_symbol
+        self._nse_symbol_by_token = nse_by_token
+        logger.info(
+            f"[{self.source_name}] NSE equity token map loaded "
+            f"({len(nse_by_symbol)} symbols)"
+        )
+
     # ── WebSocket lifecycle ─────────────────────────────────────────────
 
     def _open_websocket(self) -> None:
@@ -438,6 +495,9 @@ class AngelOneMCXAdapter:
                 f"[{self.source_name}] Subscribed mode=SNAP_QUOTE to "
                 f"{len(mcx_tokens)} MCX tokens"
             )
+            # Fresh socket: equity subscriptions must be re-established by the
+            # demand loop (set mutation is GIL-atomic; safe from this thread).
+            self._equity_subscribed = set()
             if self._loop:
                 self._loop.call_soon_threadsafe(self._connected.set)
         except Exception as e:
@@ -446,11 +506,18 @@ class AngelOneMCXAdapter:
     def _on_data(self, wsapp, message) -> None:  # noqa: ARG002
         """
         Bridge SmartWebSocketV2 callback (worker thread) into the asyncio
-        loop, publishing the parsed CommodityTick.
+        loop, publishing the parsed CommodityTick (MCX) or equity LTP payload.
         """
         try:
             parsed = self._parse_tick(message)
             if parsed is None:
+                return
+            if isinstance(parsed, tuple) and parsed[0] == "EQ":
+                self._stats["eq_ticks"] += 1
+                if self._loop and self._running:
+                    asyncio.run_coroutine_threadsafe(
+                        self._dispatch_equity(parsed[1]), self._loop
+                    )
                 return
             self._stats["ticks"] += 1
             if self._loop and self._running:
@@ -485,6 +552,27 @@ class AngelOneMCXAdapter:
             return None
         meta = self._token_metadata.get(token)
         if not meta:
+            # NSE equity tick (demand-driven LTP path)?
+            eq_symbol = self._nse_symbol_by_token.get(token)
+            if eq_symbol:
+                ltp_raw = message.get("last_traded_price")
+                if ltp_raw is None:
+                    return None
+                try:
+                    payload = {
+                        "symbol": eq_symbol,
+                        "ltp": float(ltp_raw) / DEFAULT_PRICE_DIVISOR,
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                    }
+                except (TypeError, ValueError):
+                    return None
+                pc = message.get("closed_price")
+                if pc is not None:
+                    try:
+                        payload["prev_close"] = float(pc) / DEFAULT_PRICE_DIVISOR
+                    except (TypeError, ValueError):
+                        pass
+                return ("EQ", payload)
             return None  # subscription drift — ignore
 
         divisor = float(meta.get("divisor") or DEFAULT_PRICE_DIVISOR)
@@ -549,6 +637,76 @@ class AngelOneMCXAdapter:
             )
 
         return None  # unknown exchange tag
+
+    async def _dispatch_equity(self, payload: Dict) -> None:
+        """Push an equity LTP tick to Redis: keyed value for REST/snapshot
+        reads + pub/sub for the api-gateway's WS fanout. Fail-open."""
+        try:
+            r = await self._get_redis()
+            data = json.dumps(payload)
+            pipe = r.pipeline()
+            pipe.setex(f"ltp:{payload['symbol']}", LTP_KEY_TTL_S, data)
+            pipe.publish(LTP_CHANNEL, data)
+            await pipe.execute()
+        except Exception as e:
+            logger.debug(f"[{self.source_name}] equity ltp dispatch error: {e}")
+
+    # ── Demand-driven equity subscription management ─────────────────────
+
+    async def _equity_subscription_loop(self) -> None:
+        """Every few seconds, align WS equity subscriptions with demand
+        recorded by the api-gateway in the `ltp:want` ZSET. Fail-open: any
+        error skips the cycle; the MCX stream is never affected."""
+        while self._running:
+            try:
+                await asyncio.sleep(LTP_SUB_POLL_S)
+                if not (self._ws and self._connected.is_set()):
+                    continue
+                if not self._nse_token_by_symbol:
+                    continue
+
+                r = await self._get_redis()
+                cutoff = time.time() - LTP_DEMAND_WINDOW_S
+                wanted_syms = await r.zrangebyscore(LTP_WANT_KEY, cutoff, "+inf")
+                # Housekeeping: drop expired demand entries.
+                await r.zremrangebyscore(LTP_WANT_KEY, "-inf", cutoff)
+
+                desired = {
+                    self._nse_token_by_symbol[s.upper()]
+                    for s in wanted_syms
+                    if s and s.upper() in self._nse_token_by_symbol
+                }
+                to_add = desired - self._equity_subscribed
+                to_remove = self._equity_subscribed - desired
+
+                if to_add:
+                    await asyncio.to_thread(
+                        self._ws.subscribe,
+                        EQUITY_CORRELATION_ID,
+                        SUBSCRIPTION_MODE_QUOTE,
+                        [{"exchangeType": EXCHANGE_TYPE_NSE, "tokens": sorted(to_add)}],
+                    )
+                    self._equity_subscribed |= to_add
+                    logger.info(
+                        f"[{self.source_name}] equity LTP subscribed +{len(to_add)} "
+                        f"(total {len(self._equity_subscribed)})"
+                    )
+                if to_remove:
+                    await asyncio.to_thread(
+                        self._ws.unsubscribe,
+                        EQUITY_CORRELATION_ID,
+                        SUBSCRIPTION_MODE_QUOTE,
+                        [{"exchangeType": EXCHANGE_TYPE_NSE, "tokens": sorted(to_remove)}],
+                    )
+                    self._equity_subscribed -= to_remove
+                    logger.info(
+                        f"[{self.source_name}] equity LTP unsubscribed -{len(to_remove)} "
+                        f"(total {len(self._equity_subscribed)})"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"[{self.source_name}] equity subscription loop error: {e}")
 
     async def _dispatch(self, tick) -> None:
         """Publish the parsed CommodityTick."""

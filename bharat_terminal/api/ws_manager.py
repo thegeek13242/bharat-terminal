@@ -13,6 +13,9 @@ class ConnectionManager:
     def __init__(self):
         self._connections: Dict[str, WebSocket] = {}  # client_id → websocket
         self._sector_subscriptions: Dict[str, Set[str]] = {}  # sector → {client_ids}
+        # Internal-only live LTP stream: client_id → symbol (one per client —
+        # the assessment panel shows a single symbol at a time).
+        self._ltp_subs: Dict[str, str] = {}
 
     async def connect(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
@@ -21,9 +24,41 @@ class ConnectionManager:
 
     def disconnect(self, client_id: str):
         self._connections.pop(client_id, None)
+        self._ltp_subs.pop(client_id, None)
         for sector_clients in self._sector_subscriptions.values():
             sector_clients.discard(client_id)
         logger.info(f"WS disconnected: {client_id} (total: {len(self._connections)})")
+
+    # ── Internal-only LTP stream ─────────────────────────────────────────
+
+    def subscribe_ltp(self, client_id: str, symbol: str):
+        self._ltp_subs[client_id] = symbol.upper()
+
+    def unsubscribe_ltp(self, client_id: str):
+        self._ltp_subs.pop(client_id, None)
+
+    def ltp_symbols(self) -> Set[str]:
+        """Symbols with at least one live subscriber (for demand keepalive)."""
+        return set(self._ltp_subs.values())
+
+    async def send_ltp(self, symbol: str, message: dict):
+        """Send an LTP tick to the clients subscribed to that symbol only —
+        never broadcast (internal-gated, personal-use licensed data)."""
+        symbol = symbol.upper()
+        data = json.dumps(message, default=str)
+        dead = []
+        for client_id, sym in list(self._ltp_subs.items()):
+            if sym != symbol:
+                continue
+            ws = self._connections.get(client_id)
+            if ws is None:
+                continue
+            try:
+                await ws.send_text(data)
+            except Exception:
+                dead.append(client_id)
+        for client_id in dead:
+            self.disconnect(client_id)
 
     async def broadcast(self, message: dict):
         """Broadcast to all connected clients."""
