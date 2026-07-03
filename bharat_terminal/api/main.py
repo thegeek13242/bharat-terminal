@@ -33,6 +33,7 @@ from bharat_terminal.api.routes import (
     signal_accuracy,
     signals_report,
     starred,
+    internal_ltp,
 )
 from bharat_terminal.api.ws_manager import manager
 
@@ -105,6 +106,8 @@ app.include_router(websocket.router)
 _internal = [Depends(require_internal_user)]
 app.include_router(signal_accuracy.router, dependencies=_internal)
 app.include_router(signals_report.router, dependencies=_internal)
+# Angel One LTP: personal-use data — internal accounts only (licensing).
+app.include_router(internal_ltp.router, dependencies=_internal)
 
 
 @app.get("/health")

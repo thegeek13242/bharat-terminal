@@ -93,4 +93,8 @@ export const api = {
   // ── Dossier ──────────────────────────────────────────────────────────
   getDossier: (symbol: string) =>
     request<any>(`/dossier/${encodeURIComponent(symbol)}`),
+
+  // ── Internal-only (403 for regular accounts) ─────────────────────────
+  getInternalLtp: (symbol: string) =>
+    request<any>(`/internal/ltp/${encodeURIComponent(symbol)}`),
 };

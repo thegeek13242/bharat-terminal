@@ -3,6 +3,7 @@ import { CompanyDetail, ImpactReport } from '@/types';
 import { api } from '@/lib/api';
 import { EmptyState } from './ds';
 import { SectionHeader, KpiCard, DirectionPill, ReasoningList } from './panel-parts';
+import { useInternalLtp } from '@/hooks/useInternalLtp';
 import {
   primaryImpact,
   sentimentToDirection,
@@ -28,6 +29,8 @@ export function AssessmentPanel({ report }: { report: ImpactReport | null }) {
   const [detail, setDetail] = useState<CompanyDetail | null>(null);
   const imp = report ? primaryImpact(report) : undefined;
   const symbol = imp?.symbol;
+  // Renders only for internal-allowlist accounts (endpoint 403s otherwise).
+  const ltp = useInternalLtp(symbol);
 
   useEffect(() => {
     let cancelled = false;
@@ -66,6 +69,15 @@ export function AssessmentPanel({ report }: { report: ImpactReport | null }) {
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
           <span className="mono" style={{ fontSize: 18, fontWeight: 600, color: 'var(--ink)' }}>{imp.symbol}</span>
           <span className="mono upper" style={{ fontSize: 10, letterSpacing: '0.14em', color: 'var(--ink-mute)' }}>NSE · EQ</span>
+          {ltp && (ltp.ltp != null ? (
+            <span className="mono" style={{ fontSize: 11.5, color: 'var(--accent)' }}>
+              ₹{num(ltp.ltp, 2)} <span style={{ fontSize: 9, color: 'var(--ink-dim)' }}>LTP</span>
+            </span>
+          ) : ltp.prev_close != null ? (
+            <span className="mono" style={{ fontSize: 11.5, color: 'var(--ink-dim)' }}>
+              ₹{num(ltp.prev_close, 2)} <span style={{ fontSize: 9, color: 'var(--ink-mute)' }}>EOD</span>
+            </span>
+          ) : null)}
           <span style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 7 }}>
             <span style={{ width: 7, height: 7, borderRadius: '50%', background: SENTIMENT_DOT[imp.sentiment] }} />
             <span className="mono upper" style={{ fontSize: 10, letterSpacing: '0.1em', color: SENTIMENT_DOT[imp.sentiment] }}>

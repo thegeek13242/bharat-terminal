@@ -69,6 +69,47 @@ async def health():
     return {"status": "ok", "service": "kb-api", "timestamp": datetime.utcnow().isoformat()}
 
 
+@app.get("/ltp/{symbol}")
+async def get_ltp(symbol: str):
+    """Live NSE equity LTP via the shared Angel One session, falling back to
+    the last daily close from the DB when no live session is available.
+
+    LICENSING (do not widen): Angel One data is licensed for the account
+    holder's own use. This endpoint is reachable by customers ONLY through the
+    api-gateway's require_internal_user gate — never expose it on a public
+    route and never fold its output into broadcast/stored reports.
+    """
+    sym = symbol.upper()
+    live = await get_current_ltps([sym], redis_client)
+    info = live.get(sym)
+    if info and info.get("ltp"):
+        return {
+            "symbol": sym,
+            "ltp": info["ltp"],
+            "prev_close": info.get("prev_close"),
+            "source": "angelone_live",
+            "asof": datetime.utcnow().isoformat(),
+        }
+
+    # Fail-open fallback: last daily close (bhavcopy) — honest label, no live.
+    async with AsyncSessionLocal() as session:
+        row = (await session.execute(
+            text("SELECT c.last_price, "
+                 "       (SELECT max(date) FROM price_points p WHERE p.symbol = c.symbol) AS latest_price_date "
+                 "FROM companies c WHERE c.symbol = :s"),
+            {"s": sym},
+        )).first()
+    if not row or row.last_price is None:
+        raise HTTPException(status_code=404, detail=f"No price data for {sym}")
+    return {
+        "symbol": sym,
+        "ltp": None,
+        "prev_close": float(row.last_price),
+        "source": "eod_close",
+        "asof": row.latest_price_date.isoformat() if row.latest_price_date else None,
+    }
+
+
 @app.get("/company/{symbol}")
 async def get_company(symbol: str):
     """
