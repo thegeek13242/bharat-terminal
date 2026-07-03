@@ -1,9 +1,11 @@
+import asyncio
+import os
 import time
 import logging
 import json
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from typing import AsyncIterator
+from typing import AsyncIterator, Awaitable, Callable, Optional
 
 IST = ZoneInfo("Asia/Kolkata")
 from bharat_terminal.types import NewsItem
@@ -11,6 +13,31 @@ from bharat_terminal.ingestion.pdf_fetch import fetch_pdf_text
 from .base import BaseAdapter
 
 logger = logging.getLogger(__name__)
+
+# Bounded-concurrent PDF fetch within a poll cycle. Sequential fetch made a
+# burst of N filings take N x (download+extract) before anything reached
+# Kafka. Kept modest — NSE has 403'd this VM before; don't look like a scraper
+# hammering attachments.
+PDF_FETCH_CONCURRENCY = int(os.getenv("NSE_PDF_FETCH_CONCURRENCY", "4"))
+
+
+async def gather_pdf_texts(
+    attachments: list[Optional[str]],
+    fetch: Callable[[str], Awaitable[Optional[str]]],
+    limit: int = PDF_FETCH_CONCURRENCY,
+) -> list[Optional[str]]:
+    """Fetch attachment texts concurrently, at most `limit` in flight.
+    Order-preserving; any failure/exception yields None for that slot."""
+    sem = asyncio.Semaphore(max(1, limit))
+
+    async def one(url: Optional[str]) -> Optional[str]:
+        if not url:
+            return None
+        async with sem:
+            return await fetch(url)
+
+    results = await asyncio.gather(*(one(a) for a in attachments), return_exceptions=True)
+    return [r if isinstance(r, str) else None for r in results]
 
 
 class NSEFilingsAdapter(BaseAdapter):
@@ -66,6 +93,8 @@ class NSEFilingsAdapter(BaseAdapter):
                     data = json.loads(raw)
                     items = data if isinstance(data, list) else data.get("data", [])
 
+                    # Pass 1: parse + dedupe quickly, collecting the new items.
+                    pending: list[dict] = []
                     for item in (items or [])[:20]:
                         symbol = (
                             item.get(sym_field)
@@ -112,40 +141,51 @@ class NSEFilingsAdapter(BaseAdapter):
                             )
                             ts = now
 
-                        # The filing's real content lives in the PDF attachment
-                        # (attchmntFile); the JSON only carries a truncated
-                        # attchmntText. Fetch + extract it so analysis reads the
-                        # full filing, not a clipped headline. Fail-soft: fall
-                        # back to the truncated text / structured fields.
-                        attachment = item.get("attchmntFile")
-                        pdf_text = (
-                            await fetch_pdf_text(attachment, session)
-                            if attachment
-                            else None
-                        )
+                        pending.append({
+                            "uid": uid, "symbol": symbol, "headline": headline,
+                            "ts": ts, "item": item,
+                            "attachment": item.get("attchmntFile"),
+                        })
+
+                    if not pending:
+                        continue
+
+                    # Pass 2: the filing's real content lives in the PDF
+                    # attachment (attchmntFile); the JSON only carries truncated
+                    # attchmntText. Fetch attachments CONCURRENTLY (bounded) —
+                    # sequential fetch serialized a burst of filings for
+                    # minutes. Fail-soft per item: fall back to the truncated
+                    # text / structured fields.
+                    pdf_texts = await gather_pdf_texts(
+                        [p["attachment"] for p in pending],
+                        lambda url: fetch_pdf_text(url, session),
+                    )
+
+                    # Pass 3: yield in original order.
+                    for p, pdf_text in zip(pending, pdf_texts):
+                        item = p["item"]
                         body = (
                             pdf_text
                             or item.get("bm_desc")
                             or item.get("details")
                             or item.get("attchmntText")
                         )
-
                         ingest_latency = (time.time() - ingest_start) * 1000
 
                         yield NewsItem(
-                            id=uid,
+                            id=p["uid"],
                             source=self.source_name,
-                            timestamp_utc=ts,
-                            headline=headline,
+                            timestamp_utc=p["ts"],
+                            headline=p["headline"],
                             body=body,
                             url=(
                                 f"https://www.nseindia.com/company-info/"
-                                f"corporate-announcements?symbol={symbol}"
+                                f"corporate-announcements?symbol={p['symbol']}"
                             ),
                             raw_html=None,
                             ingest_latency_ms=ingest_latency,
                             category=category,
-                            symbols_mentioned=[symbol] if symbol else [],
+                            symbols_mentioned=[p["symbol"]] if p["symbol"] else [],
                             tier="tier1",
                         )
 

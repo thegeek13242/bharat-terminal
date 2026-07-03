@@ -1,3 +1,4 @@
+import contextvars
 import logging
 import json
 import os
@@ -6,6 +7,30 @@ from typing import Optional
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+
+# Task-local cost bucket. An asyncio task that calls begin_task_cost() gets its
+# own accumulator (contextvars are task-scoped), so CONCURRENT pipeline items
+# attribute LLM spend correctly. The old pattern — delta of the global total —
+# only worked while RT items processed strictly one at a time.
+#
+# The bucket is a MUTABLE single-element list on purpose: child tasks spawned
+# within an item (e.g. the parallel filing-summary task) receive a *copy* of
+# the context, but the copy holds a reference to the same list — so their LLM
+# spend still lands in the parent item's bucket.
+_task_cost: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar(
+    "llm_task_cost", default=None
+)
+
+
+def begin_task_cost() -> None:
+    """Start a fresh cost bucket for the current asyncio task (and children)."""
+    _task_cost.set([0.0])
+
+
+def current_task_cost() -> Optional[float]:
+    """Accumulated LLM cost for the current task (None if never started)."""
+    bucket = _task_cost.get()
+    return bucket[0] if bucket is not None else None
 
 @dataclass
 class LLMCallRecord:
@@ -54,6 +79,12 @@ class LLMCallLogger:
     def log(self, record: LLMCallRecord):
         self._total_cost_usd += record.cost_usd
         self._call_count += 1
+
+        # Attribute to the current task's bucket when one is active. In-place
+        # mutation so spawned child tasks (which share the list) count too.
+        bucket = _task_cost.get()
+        if bucket is not None:
+            bucket[0] += record.cost_usd
 
         # Feed the rolling-hour cost guardrail (alerts if spend exceeds budget).
         try:

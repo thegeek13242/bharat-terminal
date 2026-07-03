@@ -27,6 +27,7 @@ import time
 import logging
 import hashlib
 import json
+import threading
 from typing import TypedDict
 
 from bharat_terminal.types import NewsItem
@@ -129,6 +130,11 @@ def _cache_key(headline: str, body: str) -> str:
 # ── Local backend (zero-shot classifier) ─────────────────────────────────
 
 _zeroshot_pipeline = None
+# HF pipelines are not guaranteed thread-safe for concurrent invocation, and
+# concurrent CPU inference on 2 vCPUs just thrashes. With the pipeline now
+# processing items concurrently (and stage1 running off the event loop),
+# serialize classification itself behind a lock — it is the cheap stage.
+_zeroshot_lock = threading.Lock()
 
 
 def _get_zeroshot():
@@ -155,7 +161,8 @@ def _classify_local(headline: str, body: str) -> tuple[bool, float, str]:
     text = f"{headline}. {body}".strip() if body else headline
 
     # multi_label=False → softmax over labels (probabilities sum to 1)
-    result = pipe(text, candidate_labels=CANDIDATE_LABELS, multi_label=False)
+    with _zeroshot_lock:
+        result = pipe(text, candidate_labels=CANDIDATE_LABELS, multi_label=False)
 
     top_label = result["labels"][0]
     top_score = float(result["scores"][0])

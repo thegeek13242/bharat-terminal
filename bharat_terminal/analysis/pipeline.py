@@ -3,10 +3,11 @@ Main LangGraph analysis pipeline DAG.
 News → Relevance → Extraction → Impact → Propagation → Signals → Publish
 End-to-end SLA: ≤5s at P95
 """
+import asyncio
 import time
 import logging
 import uuid
-from typing import TypedDict, List, Optional
+from typing import Any, TypedDict, List, Optional
 from datetime import datetime, timezone
 
 from langgraph.graph import StateGraph, END
@@ -44,6 +45,10 @@ class PipelineState(TypedDict):
     # How the event transmits through the graph (gates stage-4 propagation).
     event_scope: str
 
+    # In-flight filing-summary task (runs in parallel with stages 2-3;
+    # awaited in finalize). None for non-filing items.
+    summary_task: Optional[Any]
+
     # Priced-in adjustments (observability; see priced_in.py)
     priced_in_adjustments: List[dict]
 
@@ -60,9 +65,14 @@ class PipelineState(TypedDict):
 
 # ─── Stage nodes ─────────────────────────────────────────────────────────────
 
-def stage1_node(state: PipelineState) -> PipelineState:
-    """Stage 1: Relevance classification (sync)."""
-    result = classify_relevance(state["news_item"])
+async def stage1_node(state: PipelineState) -> PipelineState:
+    """Stage 1: Relevance classification.
+
+    classify_relevance is synchronous and CPU/IO-bound (zero-shot model on
+    CPU + sync Redis cache). Run it in a worker thread so it can never block
+    the event loop — with concurrent items in flight, a blocked loop would
+    stall every other pipeline task and the Kafka consumer."""
+    result = await asyncio.to_thread(classify_relevance, state["news_item"])
     return {
         **state,
         "relevant": result["relevant"],
@@ -72,17 +82,23 @@ def stage1_node(state: PipelineState) -> PipelineState:
 
 
 async def filing_summary_node(state: PipelineState) -> PipelineState:
-    """Grounded extractive summary for filing attachments (filing sources only).
+    """Kick off the grounded filing summary WITHOUT awaiting it — the LLM call
+    (1-3s+) runs in parallel with stages 2-3 and is joined in finalize.
 
-    Fail-soft: any rejection/error simply leaves news_item.summary as None —
-    a missing summary is fine, a wrong one is not (accuracy gate inside)."""
+    Fail-soft: any rejection/error yields summary None — a missing summary is
+    fine, a wrong one is not (accuracy gate inside summarize_filing)."""
     ni = state["news_item"]
     if ni.source not in FILING_SOURCES or ni.summary:
         return state
-    summary = await summarize_filing(ni.headline, ni.full_body or ni.body, ni.source)
-    if not summary:
-        return state
-    return {**state, "news_item": ni.model_copy(update={"summary": summary})}
+    task = asyncio.create_task(
+        summarize_filing(ni.headline, ni.full_body or ni.body, ni.source)
+    )
+    return {**state, "summary_task": task}
+
+
+# Never let a slow summary hold the report back longer than this — by finalize
+# time the summary has already had the whole stage-2..5 window to complete.
+SUMMARY_JOIN_TIMEOUT_S = 30.0
 
 
 async def stage2_node(state: PipelineState) -> PipelineState:
@@ -142,8 +158,19 @@ async def stage5_node(state: PipelineState) -> PipelineState:
     return {**state, "trade_signals": signals}
 
 
-def finalize_node(state: PipelineState) -> PipelineState:
-    """Assemble final ImpactReport."""
+async def finalize_node(state: PipelineState) -> PipelineState:
+    """Assemble final ImpactReport (joining the parallel summary task first)."""
+    news_item = state["news_item"]
+    task = state.get("summary_task")
+    if task is not None:
+        try:
+            summary = await asyncio.wait_for(task, timeout=SUMMARY_JOIN_TIMEOUT_S)
+            if summary:
+                news_item = news_item.model_copy(update={"summary": summary})
+        except Exception as e:
+            # Includes TimeoutError (task cancelled by wait_for) — no summary.
+            logger.info(f"[filing_summary] join failed/timed out (no summary): {e}")
+
     elapsed_ms = (time.time() - state["pipeline_start_time"]) * 1000
 
     if elapsed_ms > 5000:
@@ -153,8 +180,8 @@ def finalize_node(state: PipelineState) -> PipelineState:
 
     report = ImpactReport(
         id=str(uuid.uuid4()),
-        news_id=state["news_item"].id,
-        news_item=state["news_item"],
+        news_id=news_item.id,
+        news_item=news_item,
         relevant=state["relevant"],
         confidence=state["relevance_confidence"],
         macro_theme=state.get("macro_theme"),
@@ -253,6 +280,7 @@ async def process_news_item(news_item: NewsItem) -> ImpactReport:
         extraction_sentiment="neutral",
         direct_impacts=[],
         event_scope="company_specific",
+        summary_task=None,
         priced_in_adjustments=[],
         all_impacts=[],
         trade_signals=[],
