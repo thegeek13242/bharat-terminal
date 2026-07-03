@@ -17,3 +17,5 @@ redis==5.0.8
 transformers>=4.40,<5
 # DeBERTa-v3 tokenizer needs sentencepiece.
 sentencepiece>=0.2.0
+# Direct DB access for the admin reanalyze command (no sqlalchemy needed).
+asyncpg>=0.29

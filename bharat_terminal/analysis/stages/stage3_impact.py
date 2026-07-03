@@ -187,12 +187,20 @@ ASSESSMENT DISCIPLINE:
 3. MECHANISM over vibes: name the transmission channel — which line item moves,
    why, and over what horizon. If you cannot name the mechanism, the magnitude
    is 1-2 by definition.
-4. RECENT EVENT MEMORY (if shown): judge whether this news is genuinely NEW, a
+4. SENTIMENT is the direction of THIS EVENT's effect on the company's
+   fundamentals — never the stock's recent performance and never the net of
+   every concurrent overhang. A record-output quarter is POSITIVE even if the
+   stock fell 16% last month amid unrelated worries; a contract loss is
+   NEGATIVE even after a rally. Surrounding negatives/positives belong in
+   magnitude and the explanation text — never flip the sign with them. Use
+   "negative" only when the event itself harms earnings power, the balance
+   sheet, or business prospects.
+5. RECENT EVENT MEMORY (if shown): judge whether this news is genuinely NEW, a
    continuation/escalation of an ongoing situation, or merely repeat coverage of
    an event already captured. If the memory shows the same event was already
    assessed, lower the magnitude (it is largely priced in / already counted) and
    say so in the explanation. Do NOT double-count the same event.
-5. MARKET & SECTOR BACKDROP (if shown): use the prevailing regime to calibrate
+6. MARKET & SECTOR BACKDROP (if shown): use the prevailing regime to calibrate
    conviction — a company-positive read in a sector under sustained pressure (or
    vice-versa) warrants more caution. Do NOT let the backdrop override a clear,
    material, company-specific signal in the news itself.
