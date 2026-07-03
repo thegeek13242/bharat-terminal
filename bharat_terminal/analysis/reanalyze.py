@@ -149,6 +149,16 @@ async def run(news_id: str, apply: bool, allow_irrelevant: bool) -> None:
                 "\nNew analysis says relevant=False — refusing to overwrite a relevant "
                 "report with an empty one. Re-run with --allow-irrelevant to force."
             )
+        # A transient LLM failure (e.g. malformed function call, retries
+        # exhausted) yields relevant=True with ZERO impacts. Overwriting a
+        # populated report with that would erase the analysis — refuse.
+        if old_impacts and not new_impacts and not allow_irrelevant:
+            raise SystemExit(
+                "\nNew analysis produced NO company impacts while the stored report "
+                "has some — this is almost always a transient pipeline/LLM failure, "
+                "not a real result. Nothing written; re-run (or --allow-irrelevant "
+                "to force an intentional wipe)."
+            )
 
         # ── 1. Update the existing report row in place ─────────────────────
         await conn.execute(
