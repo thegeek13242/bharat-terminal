@@ -23,6 +23,9 @@ class NewsItem(BaseModel):
 
     # ── Pillar 2 extensions ───────────────────────────────────────────────
     full_body: Optional[str] = None                # Full article text (post-fetch)
+    # Grounded extractive summary of a filing attachment (filing sources only;
+    # None when rejected by the accuracy gate — see analysis/filing_summary.py).
+    summary: Optional[str] = None
     body_word_count: Optional[int] = None
     body_fetch_status: BodyFetchStatus = "pending"
     body_extraction_method: Optional[str] = None   # "trafilatura" | "readability" | "rss"

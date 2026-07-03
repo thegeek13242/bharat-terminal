@@ -89,6 +89,16 @@ export function AssessmentPanel({ report }: { report: ImpactReport | null }) {
         >
           {report.news_item?.headline}
         </div>
+        {report.news_item?.summary && (
+          <div style={{ marginTop: 12 }}>
+            <div className="mono upper" style={{ fontSize: 10, letterSpacing: '0.12em', color: 'var(--ink-mute)', marginBottom: 5 }}>
+              Filing summary
+            </div>
+            <div style={{ fontFamily: 'var(--sans)', fontSize: 12.5, lineHeight: 1.55, color: 'var(--ink-dim)' }}>
+              {report.news_item.summary}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Fundamentals */}

@@ -18,6 +18,7 @@ from bharat_terminal.analysis.stages.stage3_impact import score_impacts
 from bharat_terminal.analysis.stages.stage4_propagation import propagate_impacts
 from bharat_terminal.analysis.stages.stage5_signals import generate_signals
 from bharat_terminal.analysis.priced_in import apply_priced_in
+from bharat_terminal.analysis.filing_summary import summarize_filing, FILING_SOURCES
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,20 @@ def stage1_node(state: PipelineState) -> PipelineState:
         "relevance_confidence": result["confidence"],
         "relevance_reason": result["reason"],
     }
+
+
+async def filing_summary_node(state: PipelineState) -> PipelineState:
+    """Grounded extractive summary for filing attachments (filing sources only).
+
+    Fail-soft: any rejection/error simply leaves news_item.summary as None —
+    a missing summary is fine, a wrong one is not (accuracy gate inside)."""
+    ni = state["news_item"]
+    if ni.source not in FILING_SOURCES or ni.summary:
+        return state
+    summary = await summarize_filing(ni.headline, ni.full_body or ni.body, ni.source)
+    if not summary:
+        return state
+    return {**state, "news_item": ni.model_copy(update={"summary": summary})}
 
 
 async def stage2_node(state: PipelineState) -> PipelineState:
@@ -184,6 +199,7 @@ def build_pipeline() -> StateGraph:
     graph = StateGraph(PipelineState)
 
     graph.add_node("stage1", stage1_node)
+    graph.add_node("filing_summary", filing_summary_node)
     graph.add_node("stage2", stage2_node)
     graph.add_node("stage3", stage3_node)
     graph.add_node("priced_in", priced_in_node)
@@ -195,10 +211,11 @@ def build_pipeline() -> StateGraph:
     graph.set_entry_point("stage1")
 
     graph.add_conditional_edges("stage1", should_proceed, {
-        "stage2": "stage2",
+        "stage2": "filing_summary",
         "skip": "skip",
     })
 
+    graph.add_edge("filing_summary", "stage2")
     graph.add_edge("stage2", "stage3")
     graph.add_edge("stage3", "priced_in")
     graph.add_edge("priced_in", "stage4")

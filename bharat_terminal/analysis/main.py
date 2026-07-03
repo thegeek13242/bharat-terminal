@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import signal
 import time
 
@@ -87,7 +88,14 @@ async def main():
     async def handle_news(news_item: NewsItem):
         nonlocal _batch_buf, _batch_deadline
 
-        if is_market_hours():
+        # Exchange filings always take the full per-item pipeline, even off
+        # hours: results PDFs land in the evening, and the batch-triage path
+        # produces no grounded filing summary (and shallow impacts). Filings
+        # are the product's tier-1 source — accuracy over batching.
+        filings_full = os.getenv("FILINGS_ALWAYS_FULL_PIPELINE", "1") == "1"
+        is_filing = news_item.source in ("NSE_FILINGS", "BSE_FILINGS")
+
+        if is_market_hours() or (filings_full and is_filing):
             # ── real-time mode ────────────────────────────────────────────────
             # If we're transitioning from off-hours, flush any queued items first
             if _batch_buf:

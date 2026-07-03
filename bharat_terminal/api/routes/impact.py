@@ -88,7 +88,7 @@ async def get_impact_feed(
                         ir.id, ir.news_id, ir.relevant, ir.confidence,
                         ir.macro_theme, ir.affected_sectors, ir.company_impacts,
                         ir.processing_latency_ms, ir.created_at,
-                        ni.source, ni.timestamp_utc, ni.headline, ni.body,
+                        ni.source, ni.timestamp_utc, ni.headline, ni.body, ni.summary,
                         ni.url, ni.ingest_latency_ms, ni.category, ni.symbols_mentioned
                     FROM impact_reports ir
                     LEFT JOIN news_items ni ON ni.id = ir.news_id
@@ -167,7 +167,7 @@ async def get_impact(news_id: str):
                         ir.id, ir.news_id, ir.relevant, ir.confidence,
                         ir.macro_theme, ir.affected_sectors, ir.company_impacts,
                         ir.processing_latency_ms, ir.created_at,
-                        ni.source, ni.timestamp_utc, ni.headline, ni.body,
+                        ni.source, ni.timestamp_utc, ni.headline, ni.body, ni.summary,
                         ni.url, ni.ingest_latency_ms, ni.category, ni.symbols_mentioned
                     FROM impact_reports ir
                     LEFT JOIN news_items ni ON ni.id = ir.news_id
@@ -201,6 +201,7 @@ def _row_to_impact_report(r) -> dict:
             "timestamp_utc": r.timestamp_utc.isoformat() if r.timestamp_utc else None,
             "headline": r.headline,
             "body": r.body,
+            "summary": r.summary,
             "url": r.url or "",
             "ingest_latency_ms": r.ingest_latency_ms or 0.0,
             "category": r.category,

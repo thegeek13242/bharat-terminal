@@ -4,6 +4,8 @@ export interface NewsItem {
   timestamp_utc: string;
   headline: string;
   body?: string;
+  /** Grounded extractive summary of a filing attachment (filings only; absent when the accuracy gate rejected it). */
+  summary?: string | null;
   url: string;
   raw_html?: string;
   ingest_latency_ms: number;
