@@ -3,6 +3,7 @@ import { CompanyDetail, ImpactReport } from '@/types';
 import { api } from '@/lib/api';
 import { EmptyState } from './ds';
 import { SectionHeader, KpiCard, DirectionPill, ReasoningList } from './panel-parts';
+import { TradingViewChart } from './TradingViewChart';
 import {
   primaryImpact,
   sentimentToDirection,
@@ -26,8 +27,15 @@ const SENTIMENT_WORD: Record<string, string> = {
 
 export function AssessmentPanel({ report }: { report: ImpactReport | null }) {
   const [detail, setDetail] = useState<CompanyDetail | null>(null);
+  // Chart symbol: defaults to the primary impact; clicking a row in the
+  // Companies Affected table switches the chart to that company.
+  const [chartSymbol, setChartSymbol] = useState<string | null>(null);
   const imp = report ? primaryImpact(report) : undefined;
   const symbol = imp?.symbol;
+
+  useEffect(() => {
+    setChartSymbol(null); // new event -> chart follows its primary impact again
+  }, [report?.id]);
 
   useEffect(() => {
     let cancelled = false;
@@ -132,6 +140,9 @@ export function AssessmentPanel({ report }: { report: ImpactReport | null }) {
       {(report.company_impacts ?? []).map((c) => (
         <div
           key={c.symbol}
+          onClick={() => setChartSymbol(c.symbol)}
+          className="row-hover"
+          title={`Show ${c.symbol} chart`}
           style={{
             display: 'grid',
             gridTemplateColumns: '88px 1fr 110px 64px',
@@ -139,6 +150,8 @@ export function AssessmentPanel({ report }: { report: ImpactReport | null }) {
             padding: '9px 24px',
             borderTop: '1px solid var(--border)',
             alignItems: 'center',
+            cursor: 'pointer',
+            borderLeft: `2px solid ${(chartSymbol ?? symbol) === c.symbol ? 'var(--accent)' : 'transparent'}`,
           }}
         >
           <span className="mono" style={{ fontSize: 11.5, color: 'var(--ink)' }}>{c.symbol}</span>
@@ -151,6 +164,13 @@ export function AssessmentPanel({ report }: { report: ImpactReport | null }) {
           </span>
         </div>
       ))}
+
+      {/* Price + chart (official TradingView embed: live LTP in market hours,
+          close price off-hours — freshness handled by TradingView) */}
+      <SectionHeader>Price · {chartSymbol ?? symbol}</SectionHeader>
+      <div style={{ padding: '10px 12px 4px' }}>
+        <TradingViewChart symbol={chartSymbol ?? symbol!} />
+      </div>
 
       {/* Reasoning */}
       <SectionHeader>Reasoning</SectionHeader>
