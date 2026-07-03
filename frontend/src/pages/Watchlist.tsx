@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useImpactFeed } from '@/hooks/useImpactFeed';
 import { useStarred } from '@/hooks/useStarred';
 import { api } from '@/lib/api';
-import { ImpactReport } from '@/types';
+import { CompanyImpact, ImpactReport } from '@/types';
 import { NavSidebar } from '@/components/NavSidebar';
 import { FeedList } from '@/components/FeedList';
 import { AssessmentPanel } from '@/components/AssessmentPanel';
@@ -33,13 +33,39 @@ export function Watchlist() {
   }, []);
 
   const symbolSet = useMemo(() => new Set(tracked.map((t) => t.symbol.toUpperCase())), [tracked]);
+  const trackedBySymbol = useMemo(
+    () => new Map(tracked.map((t) => [t.symbol.toUpperCase(), t])),
+    [tracked],
+  );
+
+  // Match rule: DIRECT impacts on a tracked symbol always count; INDIRECT
+  // (graph-propagated) impacts count only at magnitude >= the symbol's
+  // impact_threshold (default 3). Without this, low-magnitude propagated
+  // impacts flooded the feed with events that read as unrelated — measured:
+  // 70 of 87 SBIN matches in a week were indirect and all below magnitude 3.
+  const matchesTracked = useCallback(
+    (c: CompanyImpact) => {
+      const t = trackedBySymbol.get(c.symbol.toUpperCase());
+      if (!t) return false;
+      if ((c.hop_distance ?? 0) === 0) return true;
+      return (c.magnitude ?? 0) >= (t.impact_threshold ?? 3);
+    },
+    [trackedBySymbol],
+  );
 
   const filtered = useMemo(
     () =>
-      reports.filter((r) =>
-        (r.company_impacts ?? []).some((c) => symbolSet.has(c.symbol.toUpperCase())),
-      ),
-    [reports, symbolSet],
+      reports
+        .filter((r) => (r.company_impacts ?? []).some(matchesTracked))
+        .map((r) => ({
+          ...r,
+          // Display order only: the tracked symbols that caused the match come
+          // first, so every row shows WHY it is in the watchlist feed.
+          company_impacts: [...(r.company_impacts ?? [])].sort(
+            (a, b) => Number(matchesTracked(b)) - Number(matchesTracked(a)),
+          ),
+        })),
+    [reports, matchesTracked],
   );
 
   // Latest event per tracked symbol (for the card note + click target).
@@ -47,12 +73,13 @@ export function Watchlist() {
     const m = new Map<string, ImpactReport>();
     for (const r of reports) {
       for (const c of r.company_impacts ?? []) {
+        if (!matchesTracked(c)) continue;
         const k = c.symbol.toUpperCase();
-        if (symbolSet.has(k) && !m.has(k)) m.set(k, r);
+        if (!m.has(k)) m.set(k, r);
       }
     }
     return m;
-  }, [reports, symbolSet]);
+  }, [reports, matchesTracked]);
 
   const select = (r: ImpactReport) => {
     setSelectedId(r.id);
@@ -189,10 +216,10 @@ export function Watchlist() {
         selectedId={selectedId ?? undefined}
         onSelect={select}
         title="Watchlist Feed"
-        meta={`${filtered.length} MATCHES · WITHIN LOADED EVENTS`}
+        meta={`${filtered.length} MATCHES · DIRECT + MATERIAL INDIRECT`}
         streaming={connected}
         emptyTitle="No events for your tracked symbols"
-        emptySubtitle="Matches are drawn from currently-loaded events. Load older events or add symbols."
+        emptySubtitle="Direct events always show; indirect exposure only at magnitude 3+. Load older events or add symbols."
         onLoadOlder={loadOlder}
         loadingOlder={loadingOlder}
         hasMore={hasMore}
