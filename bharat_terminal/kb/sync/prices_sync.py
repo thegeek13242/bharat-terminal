@@ -20,9 +20,10 @@ NSE_BHAVCOPY_URL = (
     "BhavCopy_NSE_CM_0_0_0_{date}_F_0000.csv.zip"
 )
 
-# Fallback: older bhavcopy format
+# Fallback: older bhavcopy format. Host updated 2026-07-04: www1.nseindia.com
+# is dead; nsearchives serves the same legacy files (verified 2018/2021/2024).
 NSE_BHAVCOPY_OLD_URL = (
-    "https://www1.nseindia.com/content/historical/EQUITIES/{year}/{month_abbr}/"
+    "https://nsearchives.nseindia.com/content/historical/EQUITIES/{year}/{month_abbr}/"
     "cm{dd}{month_abbr}{year}bhav.csv.zip"
 )
 
@@ -135,6 +136,106 @@ async def fetch_bhavcopy(for_date: date) -> List[Dict]:
 
         logger.info(f"Parsed {len(prices)} price records for {for_date}")
         return prices
+
+
+# BSE unified bhavcopy (same column layout as NSE's new format; plain CSV,
+# not zipped — verified live 2026-07-03, ~4,950 rows/day).
+BSE_BHAVCOPY_URL = (
+    "https://www.bseindia.com/download/BhavCopy/Equity/"
+    "BhavCopy_BSE_CM_0_0_0_{date}_F_0000.CSV"
+)
+
+BSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    ),
+    "Accept": "application/octet-stream,*/*",
+    "Referer": "https://www.bseindia.com/",
+}
+
+
+async def fetch_bse_bhavcopy(for_date: date) -> List[Dict]:
+    """Download the BSE bhavcopy for a date. Returns dicts with the SAME shape
+    as fetch_bhavcopy PLUS `isin` — BSE rows are matched to companies by ISIN
+    (the bhavcopy ticker may differ from our stored symbol), so no series
+    filter is applied here (BSE series values differ from NSE's EQ/BE; the
+    ISIN→symbol map restricted to exchange='BSE' is the real filter)."""
+    date_str = for_date.strftime("%Y%m%d")
+    url = BSE_BHAVCOPY_URL.format(date=date_str)
+    logger.info(f"Downloading BSE bhavcopy from {url}")
+
+    async with httpx.AsyncClient(timeout=60, headers=BSE_HEADERS, follow_redirects=True) as client:
+        try:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.content
+        except Exception as e:
+            logger.error(f"BSE bhavcopy download failed for {for_date}: {e}")
+            return []
+
+    # Served plain today; sniff the zip magic defensively in case BSE
+    # switches to the zipped variant NSE uses.
+    if data[:2] == b"PK":
+        try:
+            with ZipFile(io.BytesIO(data)) as zf:
+                data = zf.read(zf.namelist()[0])
+        except Exception as e:
+            logger.error(f"Failed to unzip BSE bhavcopy for {for_date}: {e}")
+            return []
+
+    prices = []
+    series_seen: Dict[str, int] = {}
+    try:
+        reader = csv.DictReader(io.StringIO(data.decode("utf-8")))
+        for row in reader:
+            def safe_float(key_candidates):
+                for k in key_candidates:
+                    v = (row.get(k) or "").strip()
+                    if v:
+                        try:
+                            return float(v.replace(",", ""))
+                        except ValueError:
+                            pass
+                return None
+
+            def safe_int(key_candidates):
+                for k in key_candidates:
+                    v = (row.get(k) or "").strip()
+                    if v:
+                        try:
+                            return int(float(v.replace(",", "")))
+                        except ValueError:
+                            pass
+                return None
+
+            isin = (row.get("ISIN") or "").strip()
+            symbol = (row.get("TckrSymb") or "").strip()
+            close = safe_float(["ClsPric", "LastPric"])
+            if not isin or close is None:
+                continue
+            series = (row.get("SctySrs") or "").strip()
+            series_seen[series] = series_seen.get(series, 0) + 1
+
+            prices.append({
+                "symbol": symbol,
+                "isin": isin,
+                "date": for_date,
+                "open": safe_float(["OpnPric"]),
+                "high": safe_float(["HghPric"]),
+                "low": safe_float(["LwPric"]),
+                "close": close,
+                "volume": safe_int(["TtlTradgVol"]),
+            })
+    except Exception as e:
+        logger.error(f"Failed to parse BSE bhavcopy for {for_date}: {e}")
+        return []
+
+    logger.info(
+        f"Parsed {len(prices)} BSE price records for {for_date} "
+        f"(series histogram: {series_seen})"
+    )
+    return prices
 
 
 async def fetch_price_range(

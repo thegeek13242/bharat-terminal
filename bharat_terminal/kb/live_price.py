@@ -1,4 +1,4 @@
-"""On-demand live NSE *equity* LTP via Angel One — for the priced-in check.
+"""On-demand live NSE/BSE *equity* LTP via Angel One — for the priced-in check.
 
 We deliberately use the EQUITY cash price (not derivatives): the priced-in
 judgment only needs the stock's current price + its recent multi-day movement.
@@ -16,9 +16,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import httpx
 
@@ -31,14 +30,18 @@ SCRIP_MASTER_URL = (
 )
 _SCRIP_REFRESH_S = 12 * 3600
 
-# symbol -> NSE equity token, built lazily from the scrip master.
+# symbol -> equity token, built lazily from the scrip master. Two maps: NSE
+# is resolved first so dual-listed symbols keep their existing NSE pricing;
+# the BSE map only ever serves BSE-only universe symbols (companies.symbol ==
+# BSE scrip_id == Angel One's BSE `symbol` field, so name lookup resolves).
 _equity_tokens: Dict[str, str] = {}
+_bse_equity_tokens: Dict[str, str] = {}
 _scrip_loaded_at: float = 0.0
 
 
 async def _ensure_equity_tokens() -> None:
-    """Lazily fetch + cache the NSE equity (symbol -> token) map. Fail-open."""
-    global _equity_tokens, _scrip_loaded_at
+    """Lazily fetch + cache the NSE/BSE equity (symbol -> token) maps. Fail-open."""
+    global _equity_tokens, _bse_equity_tokens, _scrip_loaded_at
     if _equity_tokens and (time.time() - _scrip_loaded_at) < _SCRIP_REFRESH_S:
         return
     try:
@@ -46,17 +49,27 @@ async def _ensure_equity_tokens() -> None:
             resp = await client.get(SCRIP_MASTER_URL)
         rows = resp.json()
         tokens: Dict[str, str] = {}
+        bse_tokens: Dict[str, str] = {}
         for r in rows:
-            if r.get("exch_seg") != "NSE":
-                continue
+            seg = r.get("exch_seg")
             sym = (r.get("symbol") or "")
-            # NSE cash equities are listed as "<NAME>-EQ".
-            if sym.endswith("-EQ"):
-                tokens[sym[:-3].upper()] = str(r.get("token") or "")
+            if seg == "NSE":
+                # NSE cash equities are listed as "<NAME>-EQ".
+                if sym.endswith("-EQ"):
+                    tokens[sym[:-3].upper()] = str(r.get("token") or "")
+            elif seg == "BSE":
+                # BSE cash equities have instrumenttype "" (indices are AMXIDX);
+                # token == the 6-digit BSE scrip code.
+                if sym and not (r.get("instrumenttype") or ""):
+                    bse_tokens[sym.upper()] = str(r.get("token") or "")
         if tokens:
             _equity_tokens = tokens
+            _bse_equity_tokens = bse_tokens
             _scrip_loaded_at = time.time()
-            logger.info(f"[live_price] NSE equity token map loaded ({len(tokens)} symbols)")
+            logger.info(
+                f"[live_price] equity token map loaded "
+                f"(NSE: {len(tokens)}, BSE: {len(bse_tokens)} symbols)"
+            )
     except Exception as e:
         logger.warning(f"[live_price] scrip-master load failed (fail-open): {e}")
 
@@ -88,8 +101,10 @@ def _smartconnect_from_redis(session_json: str):
 
 
 async def get_current_ltps(symbols: List[str], redis_client) -> Dict[str, Dict[str, float]]:
-    """Return {symbol: {"ltp": float, "prev_close": float}} for NSE equities,
-    using the shared Angel One session. Fail-open → {} on any problem."""
+    """Return {symbol: {"ltp": float, "prev_close": float}} for NSE/BSE equities,
+    using the shared Angel One session. NSE resolves first (dual-listed symbols
+    keep NSE pricing); BSE covers the BSE-only universe. Fail-open → {} on any
+    problem."""
     if not symbols or redis_client is None:
         return {}
     try:
@@ -100,14 +115,21 @@ async def get_current_ltps(symbols: List[str], redis_client) -> Dict[str, Dict[s
         return {}  # ingestion hasn't published a live session — daily fallback
 
     await _ensure_equity_tokens()
-    token_to_symbol: Dict[str, str] = {}
-    tokens: List[str] = []
+    # NSE and BSE token spaces are not guaranteed disjoint — key the reverse
+    # map by (exchange, token); getMarketData rows carry an `exchange` field.
+    token_to_symbol: Dict[tuple, str] = {}
+    exchange_tokens: Dict[str, List[str]] = {}
     for s in symbols:
-        tok = _equity_tokens.get((s or "").upper())
+        sym = (s or "").upper()
+        tok = _equity_tokens.get(sym)
+        exch = "NSE"
+        if not tok:
+            tok = _bse_equity_tokens.get(sym)
+            exch = "BSE"
         if tok:
-            tokens.append(tok)
-            token_to_symbol[tok] = s.upper()
-    if not tokens:
+            exchange_tokens.setdefault(exch, []).append(tok)
+            token_to_symbol[(exch, tok)] = sym
+    if not exchange_tokens:
         return {}
 
     sc = _smartconnect_from_redis(session_json)
@@ -116,7 +138,7 @@ async def get_current_ltps(symbols: List[str], redis_client) -> Dict[str, Dict[s
 
     try:
         import asyncio
-        result = await asyncio.to_thread(sc.getMarketData, "OHLC", {"NSE": tokens})
+        result = await asyncio.to_thread(sc.getMarketData, "OHLC", exchange_tokens)
     except Exception as e:
         logger.warning(f"[live_price] getMarketData failed (fail-open): {e}")
         return {}
@@ -126,7 +148,8 @@ async def get_current_ltps(symbols: List[str], redis_client) -> Dict[str, Dict[s
         fetched = ((result or {}).get("data") or {}).get("fetched") or []
         for row in fetched:
             tok = str(row.get("symbolToken") or "")
-            sym = token_to_symbol.get(tok)
+            exch = str(row.get("exchange") or "NSE")
+            sym = token_to_symbol.get((exch, tok))
             ltp = row.get("ltp")
             prev_close = row.get("close")  # Angel One OHLC 'close' = previous close
             if sym and ltp is not None:

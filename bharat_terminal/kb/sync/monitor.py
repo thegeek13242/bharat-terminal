@@ -348,6 +348,81 @@ class Monitor:
             except Exception as e:
                 logger.error(f"[shp_sweep] Failed: {e}")
 
+    # ── BSE-only universe jobs ─────────────────────────────────────────────
+
+    async def bse_daily_price_sync(self):
+        """BSE bhavcopy for the BSE-only universe at 19:15 IST weekdays —
+        after the 19:00 NSE slot so the two downloads don't overlap.
+        Deliberately does NOT set self._price_sync_date: the signal-eval gate
+        stays keyed to the NSE sync, so a BSE failure can neither block nor
+        falsely unblock signal scoring."""
+        from bharat_terminal.kb.sync.pipeline import sync_bse_prices
+        while not self._shutdown.is_set():
+            target = self._next_occurrence(hour=19, minute=15)
+            while target.weekday() >= 5:
+                target += timedelta(days=1)
+
+            logger.info(f"[bse_price_sync] Next run at {target.isoformat()}")
+            if not await self._sleep_until(target):
+                break
+            try:
+                result = await sync_bse_prices(days=2)
+                logger.info(f"[bse_price_sync] Complete: {result}")
+            except Exception as e:
+                logger.error(f"[bse_price_sync] Failed: {e}")
+
+            # Same-day structured results for BSE-only filers: one market-wide
+            # index request (2-day window covers late-evening filings).
+            try:
+                from bharat_terminal.kb.sync.bse_financial_results import run_market_scan
+                logger.info(f"[bse_price_sync] results scan: {await run_market_scan(since_days=2)}")
+            except Exception as e:
+                logger.error(f"[bse_price_sync] results scan failed: {e}")
+
+    async def weekly_bse_sweep(self):
+        """BSE-only universe sweep, Saturday 4:00 AM IST (after the 02:00
+        financials and 03:00 NSE SHP sweeps so BSE traffic doesn't overlap
+        NSE sweeps on the same event loop): corporate actions → shareholding
+        patterns → structured-results safety net. Each step isolated — one
+        source failing must not starve the others."""
+        from bharat_terminal.kb.sync import (
+            bse_corporate_actions_sync,
+            bse_financial_results,
+            bse_shareholding_sync,
+        )
+        from bharat_terminal.kb.sync.bse_sync import bse_universe
+        from bharat_terminal.kb.sync.utils import create_async_session
+
+        while not self._shutdown.is_set():
+            target = self._next_occurrence(hour=4, minute=0, weekday=5)  # Saturday
+            logger.info(f"[bse_sweep] Next run at {target.isoformat()}")
+            if not await self._sleep_until(target):
+                break
+
+            SessionFactory = create_async_session()
+            async with SessionFactory() as session:
+                pairs = await bse_universe(session)
+            if not pairs:
+                logger.info("[bse_sweep] no BSE-only companies onboarded; skipping")
+                continue
+
+            logger.info(f"[bse_sweep] Starting BSE sweep ({len(pairs)} scrips)")
+            try:
+                logger.info(f"[bse_sweep] corporate_actions: "
+                            f"{await bse_corporate_actions_sync.run(pairs)}")
+            except Exception as e:
+                logger.error(f"[bse_sweep] corporate_actions failed: {e}")
+            try:
+                logger.info(f"[bse_sweep] shareholding: "
+                            f"{await bse_shareholding_sync.run(pairs)}")
+            except Exception as e:
+                logger.error(f"[bse_sweep] shareholding failed: {e}")
+            try:
+                logger.info(f"[bse_sweep] financial_results (safety net): "
+                            f"{await bse_financial_results.run(pairs, since_days=10)}")
+            except Exception as e:
+                logger.error(f"[bse_sweep] financial_results failed: {e}")
+
     # ── Main ───────────────────────────────────────────────────────────────
 
     # Fallback if daily_price_sync never confirms completion (crash / hang):
@@ -475,6 +550,8 @@ class Monitor:
             asyncio.create_task(self.daily_signal_eval(),      name="signal_eval"),
             asyncio.create_task(self.memory_index_refresh(),   name="memory_index"),
             asyncio.create_task(self.memory_digest_refresh(),  name="memory_digest"),
+            asyncio.create_task(self.bse_daily_price_sync(),   name="bse_price_sync"),
+            asyncio.create_task(self.weekly_bse_sweep(),       name="bse_weekly_sweep"),
         ]
 
         await self._shutdown.wait()

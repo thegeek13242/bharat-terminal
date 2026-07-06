@@ -588,6 +588,31 @@ def main():
 
     subparsers.add_parser("monitor", help="Start continuous KB update monitor (long-running)")
 
+    # ── BSE-only universe commands ──────────────────────────────────────────
+    bse_co_parser = subparsers.add_parser(
+        "sync-bse-companies",
+        help="Onboard BSE-only companies from the BSE scrip master (dry-run by default)",
+    )
+    bse_co_parser.add_argument(
+        "--execute", action="store_true",
+        help="Actually write to the companies table (default is dry-run + rollback)",
+    )
+
+    bse_price_parser = subparsers.add_parser(
+        "sync-bse-prices", help="Backfill daily OHLCV for BSE-only companies from BSE bhavcopy"
+    )
+    bse_price_parser.add_argument("--days", type=int, default=5, help="Number of days to backfill")
+
+    pead_parser = subparsers.add_parser(
+        "pead-backfill",
+        help="Backfill announced_at + historical earnings surprises (dry-run by default; "
+             "never emits signals)",
+    )
+    pead_parser.add_argument(
+        "--execute", action="store_true",
+        help="Actually write (default is dry-run + rollback)",
+    )
+
     args = parser.parse_args()
 
     if args.command == "refresh-dcf":
@@ -633,6 +658,18 @@ def main():
         from bharat_terminal.kb.sync.pipeline import sync_symbol
         result = asyncio.run(sync_symbol(args.symbol.upper()))
         print(f"Result: {result}")
+    elif args.command == "sync-bse-companies":
+        from bharat_terminal.kb.sync.bse_sync import sync_bse_companies
+        stats = asyncio.run(sync_bse_companies(dry_run=not args.execute))
+        print(f"{'DRY RUN — ' if not args.execute else ''}Result: {stats}")
+    elif args.command == "sync-bse-prices":
+        from bharat_terminal.kb.sync.pipeline import sync_bse_prices
+        result = asyncio.run(sync_bse_prices(days=args.days))
+        print(f"Result: {result}")
+    elif args.command == "pead-backfill":
+        from bharat_terminal.research.pead_signals import backfill
+        stats = asyncio.run(backfill(dry_run=not args.execute))
+        print(f"{'DRY RUN — ' if not args.execute else ''}Result: {stats}")
     elif args.command == "monitor":
         from bharat_terminal.kb.sync.monitor import main as monitor_main
         try:

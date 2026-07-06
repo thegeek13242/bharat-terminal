@@ -516,9 +516,18 @@ async def download_xbrl(
 
 # ── XBRL Parsing ─────────────────────────────────────────────────────────────
 
-def parse_xbrl(xml_bytes: bytes, taxonomy: str = "indas") -> Dict[str, Any]:
+def parse_xbrl(
+    xml_bytes: bytes, taxonomy: str = "indas", force_absolute_inr: bool = False,
+) -> Dict[str, Any]:
     """
     Parse an NSE XBRL XML file and extract financial facts.
+
+    force_absolute_inr: treat every monetary fact as absolute INR (÷1e7 = Cr)
+    even when the filing declares a lakh/million LevelOfRounding. BSE's legacy
+    in-bse-fin instances declare display rounding while their facts are
+    absolute INR (verified 2026-07-03: ASM Technologies 2018/2025 filings,
+    decimals="-3"/"-4" on 9-digit INR values) — honouring the declaration
+    there re-introduces the ÷1e5/÷1e6 scale bug. NSE callers are unchanged.
 
     Returns a dict with:
       - quarter: dict of quarterly P&L fields
@@ -550,17 +559,22 @@ def parse_xbrl(xml_bytes: bytes, taxonomy: str = "indas") -> Dict[str, Any]:
     # Parse metadata
     metadata = _extract_metadata(one_d)
 
+    # The declared rounding drives the divisor via _rounding_divisor; keep the
+    # real declaration in `metadata` for provenance but neutralize it for the
+    # numeric extraction when the caller knows facts are absolute INR.
+    divisor_meta = {**metadata, "rounding": ""} if force_absolute_inr else metadata
+
     # Parse P&L for current quarter
-    quarter = _extract_financials(one_d, metadata, taxonomy)
+    quarter = _extract_financials(one_d, divisor_meta, taxonomy)
 
     # Parse YTD cumulative
-    ytd = _extract_financials(four_d, metadata, taxonomy)
+    ytd = _extract_financials(four_d, divisor_meta, taxonomy)
 
     # Parse segment data
     segment_data = _extract_segments(facts_by_context)
 
     # Sector-specific P&L lines (banks/insurers) that have no generic column.
-    sector_financials = _extract_sector_financials(one_d, one_i, metadata, taxonomy)
+    sector_financials = _extract_sector_financials(one_d, one_i, divisor_meta, taxonomy)
 
     # Monetary facts are absolute INR (÷1e7 = crores), regardless of the taxonomy's
     # display `LevelOfRounding` (e.g. "Lakhs"), which we intentionally ignore. The XBRL

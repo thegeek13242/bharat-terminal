@@ -13,6 +13,9 @@ trafilatura==1.12.2
 readability-lxml==0.8.1
 # NSE filing PDF-attachment text extraction (pure-Python, no poppler/system deps)
 pypdf==6.11.0
+# BSE filings adapter: SCRIP_CD -> symbol universe map is read from Postgres
+# (matches the kb service's pinned asyncpg version)
+asyncpg==0.29.0
 redis==5.0.8
 simhash==2.1.2
 # Angel One SmartAPI — MCX commodity tick stream

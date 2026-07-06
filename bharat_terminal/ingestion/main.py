@@ -11,6 +11,7 @@ from bharat_terminal.ingestion.kafka_producer import NewsKafkaProducer
 from bharat_terminal.ingestion.dedup import DedupFilter
 from bharat_terminal.ingestion.article_fetcher import ArticleFetcher
 from bharat_terminal.ingestion.adapters.nse_filings import NSEFilingsAdapter
+from bharat_terminal.ingestion.adapters.bse_filings import BSEFilingsAdapter
 from bharat_terminal.ingestion.adapters.economic_times import EconomicTimesAdapter
 from bharat_terminal.ingestion.adapters.mint import MintAdapter
 from bharat_terminal.ingestion.adapters.ndtv_profit import NDTVProfitAdapter
@@ -190,6 +191,13 @@ async def main():
         ReutersIndiaAdapter(redis_client=redis_client),
         PTIAdapter(redis_client=redis_client),
     ]
+    # BSE-only universe filings. Env kill switch: every announcement enters the
+    # full LLM pipeline, so a runaway-cost situation must be stoppable with an
+    # env flip + restart, not a rebuild.
+    if os.getenv("BSE_FILINGS_ENABLED", "1") != "0":
+        adapters.append(BSEFilingsAdapter(redis_client=redis_client))
+    else:
+        logger.info("[BSE_FILINGS] disabled via BSE_FILINGS_ENABLED=0")
 
     shutdown_event = asyncio.Event()
 

@@ -79,7 +79,11 @@ MCX_UNIVERSE: Dict[str, str] = {
 }
 
 # SmartWebSocketV2 constants (https://smartapi.angelone.in/docs/MarketData)
+# SDK docstring: 1=nse_cm, 2=nse_fo, 3=bse_cm, 4=bse_fo, 5=mcx_fo. (The SDK's
+# "only exchangeType 1" validation applies to mode 4/depth only — QUOTE mode
+# subscriptions accept any exchange.)
 EXCHANGE_TYPE_NSE = 1
+EXCHANGE_TYPE_BSE = 3
 EXCHANGE_TYPE_MCX = 5
 
 SUBSCRIPTION_MODE_LTP        = 1   # last-traded-price only
@@ -165,7 +169,11 @@ class AngelOneMCXAdapter:
         # NSE equity LTP state (demand-driven; see module constants above).
         self._nse_token_by_symbol: Dict[str, str] = {}
         self._nse_symbol_by_token: Dict[str, str] = {}
-        self._equity_subscribed: set = set()  # tokens currently subscribed
+        self._bse_token_by_symbol: Dict[str, str] = {}
+        self._bse_symbol_by_token: Dict[str, str] = {}
+        # (exchangeType, token) pairs currently subscribed — NSE and BSE token
+        # spaces are not guaranteed disjoint, so bare tokens are ambiguous.
+        self._equity_subscribed: set = set()
         self._eq_task: Optional[asyncio.Task] = None
         self._redis = None
 
@@ -412,26 +420,39 @@ class AngelOneMCXAdapter:
 
         self._token_metadata = new_metadata
 
-        # ── 2) NSE cash equities (for demand-driven LTP) ──────────────
+        # ── 2) NSE + BSE cash equities (for demand-driven LTP) ─────────
         nse_by_symbol: Dict[str, str] = {}
         nse_by_token: Dict[str, str] = {}
+        bse_by_symbol: Dict[str, str] = {}
+        bse_by_token: Dict[str, str] = {}
         for row in scrip_list:
-            if not isinstance(row, dict) or row.get("exch_seg") != "NSE":
+            if not isinstance(row, dict):
                 continue
+            seg = row.get("exch_seg")
             sym = row.get("symbol") or ""
-            if not sym.endswith("-EQ"):
-                continue
             token = str(row.get("token") or "").strip()
             if not token:
                 continue
-            base = sym[:-3].upper()
-            nse_by_symbol[base] = token
-            nse_by_token[token] = base
+            if seg == "NSE":
+                # NSE cash equities are listed as "<NAME>-EQ".
+                if sym.endswith("-EQ"):
+                    base = sym[:-3].upper()
+                    nse_by_symbol[base] = token
+                    nse_by_token[token] = base
+            elif seg == "BSE":
+                # BSE cash equities have instrumenttype "" (indices are
+                # AMXIDX); symbol == BSE scrip_id == our companies.symbol for
+                # BSE-only rows, token == the 6-digit BSE scrip code.
+                if sym and not (row.get("instrumenttype") or ""):
+                    bse_by_symbol[sym.upper()] = token
+                    bse_by_token[token] = sym.upper()
         self._nse_token_by_symbol = nse_by_symbol
         self._nse_symbol_by_token = nse_by_token
+        self._bse_token_by_symbol = bse_by_symbol
+        self._bse_symbol_by_token = bse_by_token
         logger.info(
-            f"[{self.source_name}] NSE equity token map loaded "
-            f"({len(nse_by_symbol)} symbols)"
+            f"[{self.source_name}] equity token map loaded "
+            f"(NSE: {len(nse_by_symbol)}, BSE: {len(bse_by_symbol)} symbols)"
         )
 
     # ── WebSocket lifecycle ─────────────────────────────────────────────
@@ -552,8 +573,19 @@ class AngelOneMCXAdapter:
             return None
         meta = self._token_metadata.get(token)
         if not meta:
-            # NSE equity tick (demand-driven LTP path)?
-            eq_symbol = self._nse_symbol_by_token.get(token)
+            # NSE/BSE equity tick (demand-driven LTP path)? The wire message
+            # carries exchange_type — use it to disambiguate tokens that exist
+            # in both segments; fall back NSE-first when it is absent.
+            exch_type = message.get("exchange_type")
+            if exch_type == EXCHANGE_TYPE_BSE:
+                eq_symbol = self._bse_symbol_by_token.get(token)
+            elif exch_type == EXCHANGE_TYPE_NSE:
+                eq_symbol = self._nse_symbol_by_token.get(token)
+            else:
+                eq_symbol = (
+                    self._nse_symbol_by_token.get(token)
+                    or self._bse_symbol_by_token.get(token)
+                )
             if eq_symbol:
                 ltp_raw = message.get("last_traded_price")
                 if ltp_raw is None:
@@ -671,20 +703,35 @@ class AngelOneMCXAdapter:
                 # Housekeeping: drop expired demand entries.
                 await r.zremrangebyscore(LTP_WANT_KEY, "-inf", cutoff)
 
-                desired = {
-                    self._nse_token_by_symbol[s.upper()]
-                    for s in wanted_syms
-                    if s and s.upper() in self._nse_token_by_symbol
-                }
+                # NSE-first: dual-listed symbols keep their NSE stream; the
+                # BSE map serves the BSE-only universe.
+                desired = set()
+                for s in wanted_syms:
+                    sym = (s or "").upper()
+                    if not sym:
+                        continue
+                    if sym in self._nse_token_by_symbol:
+                        desired.add((EXCHANGE_TYPE_NSE, self._nse_token_by_symbol[sym]))
+                    elif sym in self._bse_token_by_symbol:
+                        desired.add((EXCHANGE_TYPE_BSE, self._bse_token_by_symbol[sym]))
                 to_add = desired - self._equity_subscribed
                 to_remove = self._equity_subscribed - desired
+
+                def _grouped(pairs) -> list:
+                    by_exch: Dict[int, list] = {}
+                    for exch, tok in pairs:
+                        by_exch.setdefault(exch, []).append(tok)
+                    return [
+                        {"exchangeType": exch, "tokens": sorted(toks)}
+                        for exch, toks in sorted(by_exch.items())
+                    ]
 
                 if to_add:
                     await asyncio.to_thread(
                         self._ws.subscribe,
                         EQUITY_CORRELATION_ID,
                         SUBSCRIPTION_MODE_QUOTE,
-                        [{"exchangeType": EXCHANGE_TYPE_NSE, "tokens": sorted(to_add)}],
+                        _grouped(to_add),
                     )
                     self._equity_subscribed |= to_add
                     logger.info(
@@ -696,7 +743,7 @@ class AngelOneMCXAdapter:
                         self._ws.unsubscribe,
                         EQUITY_CORRELATION_ID,
                         SUBSCRIPTION_MODE_QUOTE,
-                        [{"exchangeType": EXCHANGE_TYPE_NSE, "tokens": sorted(to_remove)}],
+                        _grouped(to_remove),
                     )
                     self._equity_subscribed -= to_remove
                     logger.info(
