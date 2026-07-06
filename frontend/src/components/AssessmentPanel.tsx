@@ -4,6 +4,7 @@ import { api } from '@/lib/api';
 import { EmptyState } from './ds';
 import { SectionHeader, KpiCard, DirectionPill, ReasoningList } from './panel-parts';
 import { useInternalLtp } from '@/hooks/useInternalLtp';
+import { Hi, extractPricedIn } from '@/lib/richtext';
 import {
   primaryImpact,
   sentimentToDirection,
@@ -87,6 +88,7 @@ export function AssessmentPanel({ report, ltpWs }: { report: ImpactReport | null
   // One entry per distinct explanation, attributed to its company. Legacy
   // propagated impacts (pre linkage-aware Stage 4) duplicated the source
   // company's text verbatim — the dedupe collapses those to a single entry.
+  // The priced-in bracket tag is lifted out of the prose into a warning pill.
   const seenExplanations = new Set<string>();
   const reasoning = (report.company_impacts ?? [])
     .filter((c) => {
@@ -95,7 +97,15 @@ export function AssessmentPanel({ report, ltpWs }: { report: ImpactReport | null
       return true;
     })
     .slice(0, 6)
-    .map((c) => `${c.symbol}${c.hop_distance > 0 ? ` (indirect · hop ${c.hop_distance})` : ''} — ${c.explanation}`);
+    .map((c) => {
+      const { clean, pricedIn } = extractPricedIn(c.explanation || '');
+      return {
+        symbol: c.symbol,
+        tag: c.hop_distance > 0 ? `indirect · hop ${c.hop_distance}` : undefined,
+        pricedIn,
+        text: clean,
+      };
+    });
 
   return (
     <div style={{ height: '100%', overflow: 'auto', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
@@ -142,7 +152,7 @@ export function AssessmentPanel({ report, ltpWs }: { report: ImpactReport | null
               Filing summary
             </div>
             <div style={{ fontFamily: 'var(--sans)', fontSize: 12.5, lineHeight: 1.55, color: 'var(--ink-dim)' }}>
-              {report.news_item.summary}
+              <Hi text={report.news_item.summary} />
             </div>
           </div>
         )}
