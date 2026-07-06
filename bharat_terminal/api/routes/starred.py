@@ -30,7 +30,7 @@ async def get_starred(user: dict = Depends(get_current_user)):
                     ir.id, ir.news_id, ir.relevant, ir.confidence,
                     ir.macro_theme, ir.affected_sectors, ir.company_impacts,
                     ir.processing_latency_ms, ir.created_at,
-                    ni.source, ni.timestamp_utc, ni.headline, ni.body,
+                    ni.source, ni.timestamp_utc, ni.headline, ni.body, ni.summary,
                     ni.url, ni.ingest_latency_ms, ni.category, ni.symbols_mentioned,
                     se.starred_at
                 FROM starred_events se

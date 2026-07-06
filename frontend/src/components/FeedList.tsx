@@ -1,4 +1,4 @@
-import { Fragment, ReactNode, useEffect, useRef } from 'react';
+import { Fragment, ReactNode, useEffect, useRef, useState } from 'react';
 import { ImpactReport } from '@/types';
 import { Tag, LiveDot, EmptyState } from './ds';
 import {
@@ -70,6 +70,20 @@ export function FeedList({
     io.observe(sentinel);
     return () => io.disconnect();
   }, [onLoadOlder, hasMore, loadingOlder, reports.length]);
+
+  // During an auto-load chain the observer fires page after page, toggling
+  // loadingOlder on every fetch — which made the sentinel text flicker
+  // "Loading… / Load older events" rapidly. Keep the loading presentation
+  // sticky across the brief gap between consecutive fetches.
+  const [showLoading, setShowLoading] = useState(false);
+  useEffect(() => {
+    if (loadingOlder) {
+      setShowLoading(true);
+      return;
+    }
+    const t = setTimeout(() => setShowLoading(false), 400);
+    return () => clearTimeout(t);
+  }, [loadingOlder]);
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, height: '100%', borderRight: '1px solid var(--border)' }}>
       {/* Header bar */}
@@ -237,7 +251,7 @@ export function FeedList({
               <button
                 ref={sentinelRef}
                 onClick={onLoadOlder}
-                disabled={loadingOlder}
+                disabled={showLoading}
                 className="mono upper"
                 style={{
                   width: '100%',
@@ -245,13 +259,13 @@ export function FeedList({
                   background: 'transparent',
                   border: 'none',
                   borderBottom: '1px solid var(--border)',
-                  color: loadingOlder ? 'var(--ink-mute)' : 'var(--ink-dim)',
+                  color: showLoading ? 'var(--ink-mute)' : 'var(--ink-dim)',
                   fontSize: 10,
                   letterSpacing: '0.14em',
-                  cursor: loadingOlder ? 'default' : 'pointer',
+                  cursor: showLoading ? 'default' : 'pointer',
                 }}
               >
-                {loadingOlder ? 'Loading…' : 'Load older events'}
+                {showLoading ? 'Loading…' : 'Load older events'}
               </button>
             )}
             {onLoadOlder && !hasMore && reports.length > 0 && (
