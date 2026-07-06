@@ -11,8 +11,9 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
-from bharat_terminal.api.auth import get_current_user
+from bharat_terminal.api.auth import get_current_user, require_internal_user
 from bharat_terminal.api.kafka_relay import start_kafka_relay, stop_kafka_relay
+from bharat_terminal.api.ltp_relay import start_ltp_relay, stop_ltp_relay
 from bharat_terminal.api.sentiment_relay import (
     start_sentiment_relay,
     stop_sentiment_relay,
@@ -32,6 +33,9 @@ from bharat_terminal.api.routes import (
     sentiment,
     signal_accuracy,
     signals_report,
+    starred,
+    internal_ltp,
+    earnings_surprises,
 )
 from bharat_terminal.api.ws_manager import manager
 
@@ -48,10 +52,12 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Bharat Terminal API...")
     await start_kafka_relay()
     await start_sentiment_relay()
+    await start_ltp_relay()
     yield
     # Shutdown
     await stop_kafka_relay()
     await stop_sentiment_relay()
+    await stop_ltp_relay()
     await close_engine()
     logger.info("API shutdown complete")
 
@@ -94,10 +100,22 @@ app.include_router(dossier.router, dependencies=_auth)
 app.include_router(db_explorer.router, dependencies=_auth)
 app.include_router(graph.router, dependencies=_auth)
 app.include_router(watchlist.router, dependencies=_auth)
+app.include_router(starred.router, dependencies=_auth)
 app.include_router(sentiment.router, dependencies=_auth)
-app.include_router(signal_accuracy.router, dependencies=_auth)
-app.include_router(signals_report.router, dependencies=_auth)
+# Earnings-surprise statistics (PEAD): deterministic, factual-statistical
+# payloads with disclaimer — customer-visible per founder decision 2026-07-04
+# (flagged for RA counsel review; see routes/earnings_surprises.py docstring).
+app.include_router(earnings_surprises.router, dependencies=_auth)
 app.include_router(websocket.router)
+
+# Internal research surfaces (signal reports + hit-rate metrics). These carry
+# recommendation content and performance claims that must never reach customer
+# accounts; gated by the INTERNAL_RESEARCH_EMAILS allowlist (empty = 403 all).
+_internal = [Depends(require_internal_user)]
+app.include_router(signal_accuracy.router, dependencies=_internal)
+app.include_router(signals_report.router, dependencies=_internal)
+# Angel One LTP: personal-use data — internal accounts only (licensing).
+app.include_router(internal_ltp.router, dependencies=_internal)
 
 
 @app.get("/health")

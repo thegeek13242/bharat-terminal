@@ -236,6 +236,10 @@ async def postmortem(limit: int, horizon: str, dry_run: bool) -> None:
             LEFT JOIN news_items n ON n.id = so.news_id
             WHERE so.eval_status='complete' AND so.{col} IS FALSE
               AND so.failure_category IS NULL
+              -- PEAD rows have no news/impact context; the LLM postmortem
+              -- prompt assumes filing text. Their stats live in gate_review /
+              -- signal_accuracy instead.
+              AND so.source IS DISTINCT FROM 'PEAD_SUE'
             ORDER BY so.signal_created_at DESC LIMIT :lim
         """), {"lim": limit})).all()
     logger.info(f"postmortem: {len(rows)} wrong+uncategorized signals (horizon {horizon})")

@@ -1,12 +1,14 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useImpactFeed } from '@/hooks/useImpactFeed';
+import { useStarred } from '@/hooks/useStarred';
 import { api } from '@/lib/api';
-import { ImpactReport } from '@/types';
+import { CompanyImpact, ImpactReport } from '@/types';
 import { NavSidebar } from '@/components/NavSidebar';
 import { FeedList } from '@/components/FeedList';
 import { AssessmentPanel } from '@/components/AssessmentPanel';
 import { SymbolAutocomplete } from '@/components/SymbolAutocomplete';
 import { relTime } from '@/lib/format';
+import { useFeedKeyboardNav } from '@/hooks/useFeedKeyboardNav';
 
 interface Tracked {
   symbol: string;
@@ -15,9 +17,16 @@ interface Tracked {
 }
 
 export function Watchlist() {
-  const { reports, wsStatus } = useImpactFeed();
+  const { reports, wsStatus, send, lastMessage, loadOlder, loadingOlder, hasMore } = useImpactFeed();
+  const { isStarred, toggleStar, count: starredCount } = useStarred();
   const [tracked, setTracked] = useState<Tracked[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [userPinned, setUserPinned] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  // Temporary client-side focus on one tracked symbol (click a sidebar row to
+  // toggle). null = show all tracked symbols.
+  const [symbolFilter, setSymbolFilter] = useState<string | null>(null);
+  const pinnedReport = useRef<ImpactReport | null>(null);
 
   useEffect(() => {
     api
@@ -27,13 +36,45 @@ export function Watchlist() {
   }, []);
 
   const symbolSet = useMemo(() => new Set(tracked.map((t) => t.symbol.toUpperCase())), [tracked]);
+  const trackedBySymbol = useMemo(
+    () => new Map(tracked.map((t) => [t.symbol.toUpperCase(), t])),
+    [tracked],
+  );
+
+  // Match rule: DIRECT impacts on a tracked symbol always count; INDIRECT
+  // (graph-propagated) impacts count only at magnitude >= the symbol's
+  // impact_threshold (default 3). Without this, low-magnitude propagated
+  // impacts flooded the feed with events that read as unrelated — measured:
+  // 70 of 87 SBIN matches in a week were indirect and all below magnitude 3.
+  const matchesTracked = useCallback(
+    (c: CompanyImpact) => {
+      const t = trackedBySymbol.get(c.symbol.toUpperCase());
+      if (!t) return false;
+      if ((c.hop_distance ?? 0) === 0) return true;
+      return (c.magnitude ?? 0) >= (t.impact_threshold ?? 3);
+    },
+    [trackedBySymbol],
+  );
 
   const filtered = useMemo(
     () =>
-      reports.filter((r) =>
-        (r.company_impacts ?? []).some((c) => symbolSet.has(c.symbol.toUpperCase())),
-      ),
-    [reports, symbolSet],
+      reports
+        .filter((r) =>
+          (r.company_impacts ?? []).some(
+            (c) =>
+              matchesTracked(c) &&
+              (symbolFilter === null || c.symbol.toUpperCase() === symbolFilter),
+          ),
+        )
+        .map((r) => ({
+          ...r,
+          // Display order only: the tracked symbols that caused the match come
+          // first, so every row shows WHY it is in the watchlist feed.
+          company_impacts: [...(r.company_impacts ?? [])].sort(
+            (a, b) => Number(matchesTracked(b)) - Number(matchesTracked(a)),
+          ),
+        })),
+    [reports, matchesTracked, symbolFilter],
   );
 
   // Latest event per tracked symbol (for the card note + click target).
@@ -41,28 +82,50 @@ export function Watchlist() {
     const m = new Map<string, ImpactReport>();
     for (const r of reports) {
       for (const c of r.company_impacts ?? []) {
+        if (!matchesTracked(c)) continue;
         const k = c.symbol.toUpperCase();
-        if (symbolSet.has(k) && !m.has(k)) m.set(k, r);
+        if (!m.has(k)) m.set(k, r);
       }
     }
     return m;
-  }, [reports, symbolSet]);
+  }, [reports, matchesTracked]);
+
+  const select = (r: ImpactReport) => {
+    setSelectedId(r.id);
+    setUserPinned(true);
+    pinnedReport.current = r;
+  };
+
+  const clearSelection = () => {
+    setUserPinned(false);
+    pinnedReport.current = null;
+    setSelectedId(filtered[0]?.id ?? null);
+  };
 
   useEffect(() => {
+    if (userPinned) return;
     if (filtered.length && (!selectedId || !filtered.some((r) => r.id === selectedId))) {
       setSelectedId(filtered[0].id);
     }
-  }, [filtered, selectedId]);
+  }, [filtered, selectedId, userPinned]);
 
-  const selected = filtered.find((r) => r.id === selectedId) ?? null;
+  useFeedKeyboardNav({ reports: filtered, selectedId, onSelect: select, onEscape: clearSelection });
+
+  const selected =
+    filtered.find((r) => r.id === selectedId) ??
+    (userPinned && pinnedReport.current?.id === selectedId ? pinnedReport.current : null);
   const connected = wsStatus === 'connected';
 
+  // Optimistic save with rollback + inline error surfacing.
   async function persist(next: Tracked[]) {
+    const prev = tracked;
     setTracked(next);
+    setSaveError(null);
     try {
       await api.saveWatchlist(next);
     } catch {
-      /* surfaced via 401 handler if auth; otherwise keep optimistic */
+      setTracked(prev); // roll back the optimistic update
+      setSaveError('Could not save — changes reverted. Retry.');
     }
   }
 
@@ -73,51 +136,105 @@ export function Watchlist() {
   }
 
   function remove(sym: string) {
+    if (symbolFilter === sym.toUpperCase()) setSymbolFilter(null);
     persist(tracked.filter((t) => t.symbol.toUpperCase() !== sym.toUpperCase()));
+  }
+
+  function toggleSymbolFilter(t: Tracked) {
+    const sym = t.symbol.toUpperCase();
+    setSymbolFilter((prev) => (prev === sym ? null : sym));
+    const ev = latestBySymbol.get(sym);
+    if (ev) select(ev);
   }
 
   return (
     <div style={{ height: '100vh', display: 'grid', gridTemplateColumns: 'var(--sidebar-w, 184px) minmax(0,1.04fr) minmax(0,0.96fr)', overflow: 'hidden' }}>
-      <NavSidebar counts={{ watchlist: tracked.length }} connected={connected}>
+      <NavSidebar counts={{ watchlist: tracked.length, starred: starredCount }} connected={connected}>
         <div style={{ padding: '12px 4px' }}>
-          <div className="mono upper" style={{ fontSize: 8.5, letterSpacing: '0.16em', color: 'var(--ink-dim)', marginBottom: 8 }}>
+          <div className="mono upper" style={{ fontSize: 10, letterSpacing: '0.14em', color: 'var(--ink-dim)', marginBottom: 8 }}>
             Add symbol
           </div>
           <div style={{ marginBottom: 18 }}>
             <SymbolAutocomplete onAdd={addSymbol} />
           </div>
-          <div className="mono upper" style={{ fontSize: 8.5, letterSpacing: '0.16em', color: 'var(--ink-dim)', marginBottom: 10 }}>
-            Tracked · {tracked.length}
+
+          {saveError && (
+            <div
+              className="mono"
+              style={{
+                fontSize: 10,
+                color: 'var(--head)',
+                background: 'rgba(198,132,118,0.10)',
+                border: '1px solid rgba(198,132,118,0.35)',
+                borderRadius: 4,
+                padding: '6px 8px',
+                marginBottom: 12,
+                lineHeight: 1.4,
+              }}
+            >
+              {saveError}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+            <span className="mono upper" style={{ fontSize: 10, letterSpacing: '0.14em', color: 'var(--ink-dim)' }}>
+              Tracked · {tracked.length}
+            </span>
+            {symbolFilter && (
+              <button
+                onClick={() => setSymbolFilter(null)}
+                className="mono upper"
+                title="Show events for all tracked symbols"
+                style={{
+                  marginLeft: 'auto',
+                  fontSize: 9.5,
+                  letterSpacing: '0.06em',
+                  padding: '2px 7px',
+                  borderRadius: 3,
+                  cursor: 'pointer',
+                  color: 'var(--accent)',
+                  background: 'var(--accent-dim)',
+                  border: '1px solid var(--accent-line)',
+                }}
+              >
+                × {symbolFilter} only
+              </button>
+            )}
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 12 }}>
             {tracked.length === 0 && (
-              <div style={{ fontSize: 11, color: 'var(--ink-mute)', padding: '6px 4px' }}>No symbols yet.</div>
+              <div style={{ fontSize: 11.5, color: 'var(--ink-mute)', padding: '6px 4px' }}>No symbols yet.</div>
             )}
             {tracked.map((t) => {
-              const ev = latestBySymbol.get(t.symbol.toUpperCase());
-              const imp = ev?.company_impacts?.find((c) => c.symbol.toUpperCase() === t.symbol.toUpperCase());
+              const sym = t.symbol.toUpperCase();
+              const ev = latestBySymbol.get(sym);
+              const imp = ev?.company_impacts?.find((c) => c.symbol.toUpperCase() === sym);
               const dot =
                 imp?.sentiment === 'positive' ? 'var(--tail)' : imp?.sentiment === 'negative' ? 'var(--head)' : 'var(--ink-faint)';
-              const active = ev && ev.id === selectedId;
+              const filterActive = symbolFilter === sym;
               return (
                 <div
                   key={t.symbol}
-                  onClick={() => ev && setSelectedId(ev.id)}
+                  onClick={() => toggleSymbolFilter(t)}
+                  title={filterActive ? 'Click to show all tracked symbols' : `Click to show only ${sym} events`}
                   style={{
                     display: 'flex',
                     alignItems: 'center',
                     gap: 8,
                     padding: '7px 8px',
                     borderRadius: 4,
-                    cursor: ev ? 'pointer' : 'default',
-                    background: active ? 'var(--accent-dim)' : 'transparent',
-                    borderLeft: `2px solid ${active ? 'var(--accent)' : 'transparent'}`,
+                    cursor: 'pointer',
+                    background: filterActive ? 'var(--accent-dim)' : 'transparent',
+                    borderLeft: `2px solid ${filterActive ? 'var(--accent)' : 'transparent'}`,
+                    opacity: symbolFilter && !filterActive ? 0.45 : 1,
                   }}
                 >
                   <span style={{ width: 7, height: 7, borderRadius: '50%', background: dot, flexShrink: 0 }} />
                   <div style={{ minWidth: 0, flex: 1 }}>
-                    <div className="mono" style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink-2)' }}>{t.symbol}</div>
-                    <div className="mono" style={{ fontSize: 9, color: 'var(--ink-mute)' }}>
+                    <div className="mono" style={{ fontSize: 13, fontWeight: 600, color: filterActive ? 'var(--accent)' : 'var(--ink-2)' }}>
+                      {t.symbol}
+                    </div>
+                    <div className="mono" style={{ fontSize: 10, color: 'var(--ink-mute)' }}>
                       {ev ? relTime(ev.created_at) : 'Quiet'}
                     </div>
                   </div>
@@ -141,15 +258,28 @@ export function Watchlist() {
       <FeedList
         reports={filtered}
         selectedId={selectedId ?? undefined}
-        onSelect={(r) => setSelectedId(r.id)}
+        onSelect={select}
         title="Watchlist Feed"
-        meta={`${filtered.length} EVENTS · ${tracked.length} SYMBOLS`}
+        meta={
+          symbolFilter
+            ? `${filtered.length} MATCHES · ${symbolFilter} ONLY`
+            : `${filtered.length} MATCHES · DIRECT + MATERIAL INDIRECT`
+        }
         streaming={connected}
-        emptyTitle="No events for your tracked symbols"
-        emptySubtitle="Add symbols to see their events here."
+        emptyTitle={symbolFilter ? `No events for ${symbolFilter}` : 'No events for your tracked symbols'}
+        emptySubtitle={
+          symbolFilter
+            ? 'Clear the symbol filter to see all tracked symbols, or load older events.'
+            : 'Direct events always show; indirect exposure only at magnitude 3+. Load older events or add symbols.'
+        }
+        onLoadOlder={loadOlder}
+        loadingOlder={loadingOlder}
+        hasMore={hasMore}
+        isStarred={isStarred}
+        onToggleStar={toggleStar}
       />
 
-      <AssessmentPanel report={selected} />
+      <AssessmentPanel report={selected} ltpWs={{ send, lastMessage, connected }} />
     </div>
   );
 }

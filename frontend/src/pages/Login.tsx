@@ -7,7 +7,7 @@ import { Logo } from '@/components/ds';
 
 const FEATURES = [
   'Live event feed · sub-second ingestion',
-  'Pre-computed dossiers · 1,800+ listed names',
+  'Pre-computed dossiers · 460+ covered names',
   'Exposure mapping · cross-sector propagation',
 ];
 
@@ -65,7 +65,7 @@ export function Login() {
             </h1>
             <p style={{ fontSize: 14.5, lineHeight: 1.6, color: 'var(--ink-2)', margin: '0 0 36px' }}>
               Structured, real-time assessment of every market-moving event across the NSE universe — pre-computed
-              dossiers, exposure maps, and conviction calls for institutional equity desks.
+              dossiers, exposure maps, and channel-attributed impact analysis for institutional equity desks.
             </p>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
               {FEATURES.map((f) => (
@@ -121,7 +121,7 @@ export function Login() {
 
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, paddingTop: 24, marginTop: 28, borderTop: '1px solid var(--border)' }}>
               <span style={{ width: 5, height: 5, borderRadius: 1, background: 'var(--ink-faint)', flexShrink: 0 }} />
-              <span className="mono" style={{ fontSize: 9.5, letterSpacing: '0.04em', color: 'var(--ink-mute)', lineHeight: 1.5 }}>
+              <span className="mono" style={{ fontSize: 10, letterSpacing: '0.04em', color: 'var(--ink-mute)', lineHeight: 1.5 }}>
                 Sessions are logged for compliance.
               </span>
             </div>

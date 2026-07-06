@@ -34,6 +34,9 @@ class Company(Base):
     sector_nse: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     industry_nse: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     bse_group: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)  # A/B/T/Z
+    # 6-digit BSE security code (api.bseindia.com key). Unique via partial
+    # index ix_companies_bse_scrip_code (migration 019) — NULL for NSE-only rows.
+    bse_scrip_code: Mapped[Optional[str]] = mapped_column(String(10), nullable=True, index=True)
     mcap_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # Market cap in Crores
     listing_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
 
@@ -317,6 +320,12 @@ class FinancialResult(Base):
     nse_filing_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("nse_filings.id"), nullable=True
     )
+    # When the result was ANNOUNCED to the exchange (drift measurement anchors
+    # here, not at period_end). NSE: filing/broadcast date; BSE: results-index
+    # timestamp. Indexed via ix_financial_results_announced (migration 020).
+    announced_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     raw_xbrl_facts: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     # Accounting taxonomy this row was filed under (indas / nbfc / banking /
     # life_insurance / general_insurance / nonindas). Tells consumers how to
@@ -342,6 +351,43 @@ class FinancialResult(Base):
         Index("ix_financial_results_symbol", "symbol"),
         Index("ix_financial_results_period", "period_end"),
         Index("ix_financial_results_symbol_period", "symbol", "period_end"),
+    )
+
+
+class EarningsSurprise(Base):
+    """One row per (symbol, quarter): standardized earnings surprise (SUE)
+    computed at results ingest against the company's own history, with the
+    trailing-distribution decile and liquidity screen. Frozen recipe from the
+    validated PEAD study (study_version, see research/pead_signals.py).
+    Deciles 10/1 with liquidity_pass emit deterministic signal_outcomes rows
+    (source='PEAD_SUE') for live out-of-sample tracking."""
+    __tablename__ = "earnings_surprises"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(
+        String(20), ForeignKey("companies.symbol", ondelete="CASCADE"), nullable=False
+    )
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    announced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    eps_basic: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    revenue_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    sue_eps: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    sue_revenue: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    sue_composite: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    percentile: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    decile: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    liquidity_pass: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    median_traded_value_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    reference_n: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    study_version: Mapped[str] = mapped_column(String(20), nullable=False)
+    signal_emitted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "period_end", name="uq_earnings_surprise"),
     )
 
 

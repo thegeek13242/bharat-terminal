@@ -52,7 +52,7 @@ export function SymbolAutocomplete({ onAdd }: { onAdd: (symbol: string) => void 
             if (e.key === 'Enter') commit(sug[0]?.symbol ?? q);
             if (e.key === 'Escape') setOpen(false);
           }}
-          style={{ fontSize: 11, padding: '8px 9px' }}
+          style={{ fontSize: 11.5, padding: '8px 9px' }}
         />
         <Button variant="primary" onClick={() => commit(sug[0]?.symbol ?? q)} style={{ padding: '8px 14px' }}>
           Add
@@ -84,6 +84,7 @@ export function SymbolAutocomplete({ onAdd }: { onAdd: (symbol: string) => void 
                 e.preventDefault();
                 commit(c.symbol);
               }}
+              className="row-hover"
               style={{
                 display: 'flex',
                 alignItems: 'baseline',
@@ -92,14 +93,12 @@ export function SymbolAutocomplete({ onAdd }: { onAdd: (symbol: string) => void 
                 cursor: 'pointer',
                 borderBottom: '1px solid var(--border)',
               }}
-              onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--bg-elev-2)')}
-              onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
             >
-              <span className="mono" style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink)' }}>
+              <span className="mono" style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--ink)' }}>
                 {c.symbol}
               </span>
               <span
-                style={{ fontSize: 11, color: 'var(--ink-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                style={{ fontSize: 11.5, color: 'var(--ink-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
               >
                 {c.company_name}
               </span>

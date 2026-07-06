@@ -1,7 +1,3 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-
 /* ── Taperead Terminal design system ───────────────────────────────────────
    Ported from the design handoff (design-system/tokens-and-classes.css).
    Muted dark slate, single disciplined petrol-teal accent, IBM Plex type. */
@@ -106,6 +102,21 @@ body{
 .line-clamp-2{
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
 }
+
+/* Row hover — CSS-driven so we don't mutate inline styles on every mouse move.
+   The selected row keeps its own background via .is-selected (higher specificity). */
+.row-hover{transition:background .12s ease;}
+.row-hover:hover:not(.is-selected){background:var(--bg-elev-2);}
+
+/* Off-screen feed rows skip layout/paint so an uncapped, deeply-paged feed
+   stays smooth without a virtualization library. */
+.feed-row{content-visibility:auto;contain-intrinsic-size:auto 72px;}
+
+/* Star toggle in feed rows: hidden until row hover, always visible once on. */
+.star-btn{background:transparent;border:none;padding:0;line-height:1;font-size:13px;color:var(--ink-faint);cursor:pointer;opacity:0;transition:opacity .12s ease,color .12s ease;}
+.row-hover:hover .star-btn{opacity:1;}
+.star-btn:hover{color:var(--warn);}
+.star-btn.on{opacity:1;color:var(--warn);}
 
 input{font-family:inherit;}
 .ds-input::placeholder{color:var(--ink-mute);}

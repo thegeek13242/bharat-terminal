@@ -93,17 +93,20 @@ def _extract_text(data: bytes) -> Optional[str]:
 
 
 async def fetch_pdf_text(
-    url: str, session: aiohttp.ClientSession
+    url: str, session: aiohttp.ClientSession,
+    referer: str = "https://www.nseindia.com/",
 ) -> Optional[str]:
     """Download `url` and return extracted text, or None on any failure.
 
     Bounded by PDF_FETCH_TIMEOUT_S / PDF_MAX_BYTES / PDF_MAX_PAGES so it is safe
-    to call inline on the filing path."""
+    to call inline on the filing path. `referer` must match the exchange host
+    (NSE default; BSE attachments need a bseindia referer)."""
     if not url or ".pdf" not in url.lower():
         return None
     try:
         timeout = aiohttp.ClientTimeout(total=PDF_FETCH_TIMEOUT_S)
-        async with session.get(url, headers=_PDF_HEADERS, timeout=timeout) as resp:
+        headers = {**_PDF_HEADERS, "Referer": referer}
+        async with session.get(url, headers=headers, timeout=timeout) as resp:
             if resp.status != 200:
                 logger.warning(f"[pdf] {resp.status} fetching {url}")
                 return None

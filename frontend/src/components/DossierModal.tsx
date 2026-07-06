@@ -1,11 +1,37 @@
 import { useEffect, useState } from 'react';
 import { CompanyDetail, DossierFull } from '@/types';
 import { api, ApiError } from '@/lib/api';
-import { SectionHeader, KpiCard, DirectionPill, ReasoningList } from './panel-parts';
-import { crore, num, pct, dash, Direction } from '@/lib/format';
+import { SectionHeader, KpiCard, DirectionPill } from './panel-parts';
+import { EmptyState } from './ds';
+import { crore, num, pct, dash, dayLabel, Direction, DIRECTION_VAR } from '@/lib/format';
 
 function linkDirection(d: string): Direction {
   return d === 'positive' ? 'tailwind' : d === 'negative' ? 'headwind' : 'neutral';
+}
+
+/** Signed beta color: positive = tailwind, negative = headwind, ~0 = neutral. */
+function betaColor(beta: number): string {
+  if (beta > 0) return DIRECTION_VAR.tailwind;
+  if (beta < 0) return DIRECTION_VAR.headwind;
+  return DIRECTION_VAR.neutral;
+}
+
+/** Small ↗ evidence link (new tab, noreferrer). */
+function EvidenceLink({ url }: { url?: string | null }) {
+  if (!url) return null;
+  return (
+    <a
+      href={url}
+      target="_blank"
+      rel="noreferrer"
+      onClick={(e) => e.stopPropagation()}
+      className="mono"
+      style={{ fontSize: 11.5, color: 'var(--accent)', textDecoration: 'none' }}
+      title={url}
+    >
+      ↗
+    </a>
+  );
 }
 
 export function DossierModal({ symbol, onClose }: { symbol: string; onClose: () => void }) {
@@ -41,13 +67,7 @@ export function DossierModal({ symbol, onClose }: { symbol: string; onClose: () 
     };
   }, [symbol]);
 
-  const reasoning = dossier
-    ? (dossier.sensitivities ?? [])
-        .slice(0, 6)
-        .map((s) =>
-          `${s.trigger_id}: β ${s.beta > 0 ? '+' : ''}${num(s.beta, 2)} via ${s.channel}${s.rationale ? ` — ${s.rationale}` : ''}`,
-        )
-    : [];
+  const sensitivities = dossier?.sensitivities ?? [];
 
   return (
     <div
@@ -94,32 +114,34 @@ export function DossierModal({ symbol, onClose }: { symbol: string; onClose: () 
           }}
         >
           <span className="mono" style={{ fontSize: 18, fontWeight: 600, color: 'var(--ink)' }}>{symbol}</span>
-          <span className="mono upper" style={{ fontSize: 9, letterSpacing: '0.14em', color: 'var(--ink-mute)' }}>NSE · EQ</span>
+          <span className="mono upper" style={{ fontSize: 10, letterSpacing: '0.14em', color: 'var(--ink-mute)' }}>NSE · EQ</span>
           <span
             className="mono upper"
-            style={{ fontSize: 8.5, letterSpacing: '0.14em', color: 'var(--accent)', border: '1px solid var(--accent-line)', borderRadius: 2, padding: '2px 6px' }}
+            style={{ fontSize: 10, letterSpacing: '0.14em', color: 'var(--accent)', border: '1px solid var(--accent-line)', borderRadius: 2, padding: '2px 6px' }}
           >
             Dossier
           </span>
           <button
             onClick={onClose}
-            style={{ marginLeft: 'auto', background: 'transparent', border: '1px solid var(--border-hi)', color: 'var(--ink-dim)', borderRadius: 4, width: 26, height: 26, cursor: 'pointer', fontSize: 15 }}
+            style={{ marginLeft: 'auto', background: 'transparent', border: '1px solid var(--border-hi)', color: 'var(--ink-dim)', borderRadius: 4, width: 26, height: 26, cursor: 'pointer', fontSize: 18 }}
           >
             ×
           </button>
         </div>
 
         {state === 'loading' && (
-          <div className="mono upper" style={{ padding: 40, textAlign: 'center', color: 'var(--ink-mute)', fontSize: 11, letterSpacing: '0.1em' }}>
+          <div className="mono upper" style={{ padding: 40, textAlign: 'center', color: 'var(--ink-mute)', fontSize: 11.5, letterSpacing: '0.1em' }}>
             Loading…
           </div>
         )}
 
         {state === 'none' && (
-          <div style={{ padding: '48px 24px', textAlign: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14 }}>
-            <span style={{ width: 44, height: 44, border: '1px dashed var(--ink-faint)', borderRadius: 6 }} />
-            <div className="mono" style={{ fontSize: 13, color: 'var(--ink-dim)' }}>Dossier not yet generated</div>
-            <div style={{ fontSize: 12, color: 'var(--ink-mute)' }}>Queued for analysis · typically &lt; 2 min</div>
+          <div style={{ padding: '32px 24px' }}>
+            <EmptyState
+              title="Dossier not yet generated"
+              sub="Dossiers are pre-computed for ~469 of ~2,400 names. This name is not yet covered."
+              fill={false}
+            />
           </div>
         )}
 
@@ -137,29 +159,89 @@ export function DossierModal({ symbol, onClose }: { symbol: string; onClose: () 
             {/* Companies Affected (linkages) */}
             <SectionHeader>Companies Affected · Linkages</SectionHeader>
             {(dossier.linkages ?? []).length === 0 ? (
-              <div style={{ padding: '14px 24px', fontSize: 12, color: 'var(--ink-mute)' }}>No linkages recorded.</div>
+              <div style={{ padding: '14px 24px', fontSize: 11.5, color: 'var(--ink-mute)' }}>No linkages recorded.</div>
             ) : (
               (dossier.linkages ?? []).map((l) => (
                 <div
                   key={l.target_symbol + l.kind}
-                  style={{ display: 'grid', gridTemplateColumns: '88px 1fr 110px', gap: 10, padding: '9px 24px', borderTop: '1px solid var(--border)', alignItems: 'center' }}
+                  style={{ display: 'grid', gridTemplateColumns: '88px 1fr 110px 20px', gap: 10, padding: '9px 24px', borderTop: '1px solid var(--border)', alignItems: 'center' }}
                 >
-                  <span className="mono" style={{ fontSize: 12, color: 'var(--ink)' }}>{l.target_symbol}</span>
-                  <span className="mono upper" style={{ fontSize: 9, letterSpacing: '0.08em', color: 'var(--ink-dim)' }}>{dash(l.kind)}</span>
+                  <span className="mono" style={{ fontSize: 13, color: 'var(--ink)' }}>{l.target_symbol}</span>
+                  <span className="mono upper" style={{ fontSize: 10, letterSpacing: '0.06em', color: 'var(--ink-dim)' }}>{dash(l.kind)}</span>
                   <DirectionPill direction={linkDirection(l.direction)} />
+                  <span style={{ textAlign: 'right' }}><EvidenceLink url={l.evidence_url} /></span>
                 </div>
               ))
             )}
 
-            {/* Reasoning (sensitivities) */}
-            <SectionHeader>Reasoning · Sensitivities</SectionHeader>
-            <ReasoningList items={reasoning} />
+            {/* Trigger sensitivities — the differentiator. Signed betas by
+                channel, with lag/confidence and evidence links. */}
+            <SectionHeader>Trigger Sensitivities</SectionHeader>
+            {sensitivities.length === 0 ? (
+              <div style={{ padding: '14px 24px', fontSize: 11.5, color: 'var(--ink-mute)' }}>No sensitivities recorded.</div>
+            ) : (
+              <>
+                <div
+                  className="mono upper"
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: '1.3fr 1.1fr 58px 44px 52px 20px',
+                    gap: 8,
+                    padding: '7px 24px',
+                    fontSize: 10,
+                    letterSpacing: '0.08em',
+                    color: 'var(--ink-dim)',
+                  }}
+                >
+                  <span>Trigger</span>
+                  <span>Channel</span>
+                  <span style={{ textAlign: 'right' }}>Beta</span>
+                  <span style={{ textAlign: 'right' }}>Lag</span>
+                  <span style={{ textAlign: 'right' }}>Conf</span>
+                  <span />
+                </div>
+                {sensitivities.map((s) => (
+                  <div
+                    key={s.trigger_id + s.channel}
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: '1.3fr 1.1fr 58px 44px 52px 20px',
+                      gap: 8,
+                      padding: '9px 24px',
+                      borderTop: '1px solid var(--border)',
+                      alignItems: 'center',
+                    }}
+                    title={s.rationale ?? undefined}
+                  >
+                    <span className="mono" style={{ fontSize: 11.5, color: 'var(--ink-2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {s.trigger_id}
+                    </span>
+                    <span style={{ fontSize: 11.5, color: 'var(--ink-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {dash(s.channel)}
+                    </span>
+                    <span className="num" style={{ fontSize: 11.5, fontWeight: 600, textAlign: 'right', color: betaColor(s.beta) }}>
+                      {s.beta > 0 ? '+' : ''}{num(s.beta, 2)}
+                    </span>
+                    <span className="num" style={{ fontSize: 11.5, textAlign: 'right', color: 'var(--ink-dim)' }}>
+                      {s.lag_days != null ? `${s.lag_days}d` : dash(null)}
+                    </span>
+                    <span className="mono upper" style={{ fontSize: 10, letterSpacing: '0.04em', textAlign: 'right', color: 'var(--ink-dim)' }}>
+                      {dash(s.confidence)}
+                    </span>
+                    <span style={{ textAlign: 'right' }}><EvidenceLink url={s.evidence_url} /></span>
+                  </div>
+                ))}
+              </>
+            )}
 
             {/* Dossier meta (honest verdict surrogate — no fabricated buy/sell) */}
             <div style={{ background: 'var(--accent-dim)', borderTop: '1px solid var(--accent-line)', padding: '14px 24px' }}>
-              <div className="mono upper" style={{ fontSize: 9, letterSpacing: '0.18em', color: 'var(--accent)' }}>Dossier</div>
+              <div className="mono upper" style={{ fontSize: 10, letterSpacing: '0.16em', color: 'var(--accent)' }}>Dossier</div>
               <div className="mono" style={{ fontSize: 11.5, color: 'var(--ink-2)', marginTop: 6 }}>
                 v{dossier.version} · quality {num((dossier.data_quality ?? 0) * 100, 0)}% · {dash(dossier.model_used)}
+              </div>
+              <div className="mono upper" style={{ fontSize: 10, letterSpacing: '0.1em', color: 'var(--ink-mute)', marginTop: 5 }}>
+                Data as of {dayLabel(dossier.generated_at)}
               </div>
             </div>
           </div>

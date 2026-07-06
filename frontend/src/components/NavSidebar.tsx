@@ -8,8 +8,9 @@ const SIDEBAR_MAX = 420;
 
 const NAV: { to: string; label: string; key: string }[] = [
   { to: '/terminal', label: 'Feed', key: 'feed' },
-  { to: '/signals', label: 'Signals', key: 'signals' },
   { to: '/watchlist', label: 'Watchlist', key: 'watchlist' },
+  { to: '/starred', label: 'Starred', key: 'starred' },
+  { to: '/surprises', label: 'Surprises', key: 'surprises' },
   { to: '/universe', label: 'Universe', key: 'universe' },
 ];
 
@@ -18,11 +19,14 @@ interface Props {
   children?: ReactNode;
   /** Right-aligned counts per nav item. */
   counts?: Partial<Record<string, number | string>>;
+  /** Pages with a live WS stream pass this; the live dot + label track it. */
   connected?: boolean;
   statusLabel?: string;
+  /** Pages WITHOUT a live stream pass a truthful static label (no live dot). */
+  staticStatus?: string;
 }
 
-export function NavSidebar({ children, counts, connected = false, statusLabel = 'CONNECTED · NSE' }: Props) {
+export function NavSidebar({ children, counts, connected = false, statusLabel = 'LIVE FEED', staticStatus }: Props) {
   const { pathname } = useLocation();
   const { user, logout } = useAuth();
 
@@ -94,7 +98,7 @@ export function NavSidebar({ children, counts, connected = false, statusLabel = 
                 display: 'flex',
                 alignItems: 'center',
                 gap: 9,
-                fontSize: 12,
+                fontSize: 11.5,
                 padding: '9px 12px',
                 borderRadius: 4,
                 textDecoration: 'none',
@@ -114,7 +118,7 @@ export function NavSidebar({ children, counts, connected = false, statusLabel = 
               />
               {item.label}
               {counts?.[item.key] !== undefined && (
-                <span className="num" style={{ marginLeft: 'auto', fontSize: 10.5, color: 'var(--ink-mute)' }}>
+                <span className="num" style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--ink-mute)' }}>
                   {counts[item.key]}
                 </span>
               )}
@@ -128,14 +132,26 @@ export function NavSidebar({ children, counts, connected = false, statusLabel = 
 
       <div style={{ borderTop: '1px solid var(--border)', padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 12 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          {connected ? (
-            <LiveDot color="tail" />
+          {staticStatus ? (
+            // Stream-less page: neutral dot, truthful static label — no fake "connected".
+            <>
+              <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--ink-faint)' }} />
+              <span className="mono upper" style={{ fontSize: 10, letterSpacing: '0.14em', color: 'var(--ink-dim)' }}>
+                {staticStatus}
+              </span>
+            </>
           ) : (
-            <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--ink-faint)' }} />
+            <>
+              {connected ? (
+                <LiveDot color="tail" />
+              ) : (
+                <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--ink-faint)' }} />
+              )}
+              <span className="mono upper" style={{ fontSize: 10, letterSpacing: '0.14em', color: 'var(--ink-dim)' }}>
+                {connected ? statusLabel : 'OFFLINE'}
+              </span>
+            </>
           )}
-          <span className="mono upper" style={{ fontSize: 8.5, letterSpacing: '0.16em', color: 'var(--ink-dim)' }}>
-            {connected ? statusLabel : 'OFFLINE'}
-          </span>
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
@@ -153,7 +169,7 @@ export function NavSidebar({ children, counts, connected = false, statusLabel = 
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                fontSize: 10.5,
+                fontSize: 10,
                 flexShrink: 0,
               }}
             >
@@ -161,12 +177,14 @@ export function NavSidebar({ children, counts, connected = false, statusLabel = 
             </span>
           )}
           <div style={{ minWidth: 0, flex: 1 }}>
-            <div className="mono" style={{ fontSize: 11, color: 'var(--ink-2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <div className="mono" style={{ fontSize: 11.5, color: 'var(--ink-2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {user?.name || user?.email || 'Analyst'}
             </div>
-            <div className="mono upper" style={{ fontSize: 8, letterSpacing: '0.12em', color: 'var(--ink-mute)' }}>
-              Equity Desk
-            </div>
+            {user?.name && user?.email && (
+              <div className="mono" style={{ fontSize: 10, color: 'var(--ink-mute)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {user.email}
+              </div>
+            )}
           </div>
           <button
             onClick={() => logout()}
@@ -177,7 +195,7 @@ export function NavSidebar({ children, counts, connected = false, statusLabel = 
               border: '1px solid var(--border-hi)',
               color: 'var(--ink-mute)',
               borderRadius: 4,
-              fontSize: 8,
+              fontSize: 10,
               letterSpacing: '0.1em',
               padding: '4px 6px',
               cursor: 'pointer',

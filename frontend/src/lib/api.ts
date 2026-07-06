@@ -48,24 +48,11 @@ export const api = {
 
   logout: () => request<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
 
-  getNewsFeed: (limit = 50, sector?: string) =>
-    request<{ items: any[]; count: number }>(
-      `/news/feed?limit=${limit}${sector ? `&sector=${sector}` : ''}`
-    ),
-
-  getImpactFeed: (limit = 50, relevantOnly = true) =>
-    request<{ items: any[]; count: number }>(
-      `/impact/feed?limit=${limit}&relevant_only=${relevantOnly}`
-    ),
-
-  getImpact: (newsId: string) =>
-    request<any>(`/impact/${newsId}`),
-
-  getCompany: (symbol: string) =>
-    request<any>(`/company/${symbol}`),
-
-  getGraph: (symbol: string, hops = 2) =>
-    request<{ nodes: any[]; edges: any[] }>(`/graph/${symbol}?hops=${hops}`),
+  getImpactFeed: (limit = 50, relevantOnly = true, before?: string) => {
+    const qs = new URLSearchParams({ limit: String(limit), relevant_only: String(relevantOnly) });
+    if (before) qs.set('before', before);
+    return request<{ items: any[]; count: number }>(`/impact/feed?${qs.toString()}`);
+  },
 
   getWatchlist: () =>
     request<{ items: any[] }>('/watchlist/'),
@@ -73,22 +60,14 @@ export const api = {
   saveWatchlist: (items: any[]) =>
     request('/watchlist/', { method: 'POST', body: JSON.stringify(items) }),
 
-  getSentimentLatest: (theme?: string, direction?: string, limit = 100) => {
-    const qs = new URLSearchParams({ limit: String(limit) });
-    if (theme) qs.set('theme', theme);
-    if (direction) qs.set('direction', direction);
-    return request<{ items: any[]; count: number }>(`/sentiment/latest?${qs}`);
-  },
+  // ── Starred events (account-level shortlist) ─────────────────────────
+  getStarred: () => request<{ items: any[]; count: number }>('/starred/'),
 
-  getSentimentRecent: (limit = 100, sinceMinutes = 720) =>
-    request<{ items: any[]; count: number }>(
-      `/sentiment/recent?limit=${limit}&since_minutes=${sinceMinutes}`
-    ),
+  starEvent: (reportId: string) =>
+    request<{ ok: boolean }>(`/starred/${encodeURIComponent(reportId)}`, { method: 'PUT' }),
 
-  getSentimentThemes: (sinceMinutes = 720) =>
-    request<{ themes: any[]; count: number }>(
-      `/sentiment/themes?since_minutes=${sinceMinutes}`
-    ),
+  unstarEvent: (reportId: string) =>
+    request<{ ok: boolean }>(`/starred/${encodeURIComponent(reportId)}`, { method: 'DELETE' }),
 
   // ── Companies browser ────────────────────────────────────────────────
   listCompanies: (params: {
@@ -111,70 +90,17 @@ export const api = {
   getCompanyDetail: (symbol: string) =>
     request<any>(`/companies/${encodeURIComponent(symbol)}`),
 
-  getCompanyFinancials: (symbol: string, period: 'quarterly' | 'annual' | 'all' = 'quarterly', limit = 40) =>
-    request<{ symbol: string; count: number; items: any[] }>(
-      `/companies/${encodeURIComponent(symbol)}/financials?period=${period}&limit=${limit}`,
-    ),
-
-  getCompanyPrices: (symbol: string, days = 365) =>
-    request<{ symbol: string; count: number; items: any[] }>(
-      `/companies/${encodeURIComponent(symbol)}/prices?days=${days}`,
-    ),
-
-  getCompanyLinkages: (symbol: string) =>
-    request<{ symbol: string; outbound: any[]; inbound: any[] }>(
-      `/companies/${encodeURIComponent(symbol)}/linkages`,
-    ),
-
   // ── Dossier ──────────────────────────────────────────────────────────
-  listDossiers: (params: { min_quality?: number; limit?: number; offset?: number } = {}) => {
-    const qs = new URLSearchParams();
-    Object.entries(params).forEach(([k, v]) => {
-      if (v !== undefined && v !== null) qs.set(k, String(v));
-    });
-    return request<{ total: number; limit: number; offset: number; items: any[] }>(
-      `/dossier/list?${qs.toString()}`,
-    );
-  },
-
   getDossier: (symbol: string) =>
     request<any>(`/dossier/${encodeURIComponent(symbol)}`),
 
-  getDossierExposed: (trigger: string, minAbsBeta = 0.05, limit = 50) =>
-    request<{ trigger: string; count: number; items: any[] }>(
-      `/dossier/exposed/?trigger=${encodeURIComponent(trigger)}&min_abs_beta=${minAbsBeta}&limit=${limit}`,
+  // ── Earnings surprises (PEAD statistics) ─────────────────────────────
+  getRecentSurprises: (days = 7, decile: 'tails' | 'all' = 'tails') =>
+    request<{ items: any[]; count: number; historical_context: any }>(
+      `/earnings-surprises/recent?days=${days}&decile=${decile}`,
     ),
 
-  getDossierImpactGraph: (
-    trigger: string,
-    opts: { max_hops?: number; min_abs_beta?: number; limit_first_degree?: number; limit_per_node?: number } = {},
-  ) => {
-    const qs = new URLSearchParams({ trigger });
-    Object.entries(opts).forEach(([k, v]) => {
-      if (v !== undefined) qs.set(k, String(v));
-    });
-    return request<any>(`/dossier/impact-graph/?${qs.toString()}`);
-  },
-
-  getDossierTriggers: () =>
-    request<{ count: number; items: any[] }>(`/dossier/triggers/`),
-
-  // ── Daily signal reports ─────────────────────────────────────────────
-  /** Current actionable trading day (live), or a specific date's report. */
-  getSignalReport: (date?: string) =>
-    request<any>(date ? `/signals/daily-report/${date}` : `/signals/daily-report`),
-
-  getSignalReportDates: (limit = 120) =>
-    request<{ dates: any[] }>(`/signals/report-dates?limit=${limit}`),
-
-  // ── DB Explorer ──────────────────────────────────────────────────────
-  listDbTables: () => request<{ tables: any[] }>(`/db/tables`),
-
-  getDbTable: (table: string, params: { q?: string; limit?: number; offset?: number } = {}) => {
-    const qs = new URLSearchParams();
-    Object.entries(params).forEach(([k, v]) => {
-      if (v !== undefined && v !== null && v !== '') qs.set(k, String(v));
-    });
-    return request<any>(`/db/${encodeURIComponent(table)}?${qs.toString()}`);
-  },
+  // ── Internal-only (403 for regular accounts) ─────────────────────────
+  getInternalLtp: (symbol: string) =>
+    request<any>(`/internal/ltp/${encodeURIComponent(symbol)}`),
 };

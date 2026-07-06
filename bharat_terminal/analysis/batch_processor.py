@@ -122,8 +122,11 @@ _BATCH_TOOL = {
 
 def _build_prompt(items: List[NewsItem]) -> str:
     lines = [
-        "Analyze the following Indian financial news articles for equity market impact. "
-        "Return one result per article in the same order.\n"
+        "You are triaging a raw news wire for an Indian equity fund's trading desk. "
+        "Assess each article for tradeable information content. Most articles carry "
+        "none — be strict: reserve high conviction for clear, material, company- or "
+        "sector-moving surprises; mark recaps, derivative coverage, and opinion "
+        "pieces low. Return one result per article in the same order.\n"
     ]
     for i, item in enumerate(items):
         body_snippet = (item.full_body or item.body or "")[:_BODY_CHARS]

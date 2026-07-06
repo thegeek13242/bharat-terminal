@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import signal
 import time
 
@@ -8,7 +9,7 @@ from bharat_terminal.analysis.kafka_publisher import ImpactKafkaPublisher
 from bharat_terminal.analysis.pipeline import process_news_item
 from bharat_terminal.analysis.batch_processor import process_batch, BATCH_MAX_SIZE, BATCH_WINDOW_S
 from bharat_terminal.analysis.market_hours import is_market_hours
-from bharat_terminal.analysis.llm_logger import get_llm_logger
+from bharat_terminal.analysis.llm_logger import begin_task_cost, current_task_cost
 from bharat_terminal.analysis.guardrails import (
     get_monitor,
     ITEM_PROCESSING_TIMEOUT_S,
@@ -26,6 +27,14 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Bounded concurrency for market-hours real-time items. Sequential processing
+# (~20-35s/item) made bursty filing clusters queue for minutes; N items in
+# flight cuts the tail without unbounded LLM fan-out. Off-hours items keep the
+# original sequential/batch behaviour. Backpressure: the consume loop blocks on
+# the semaphore when all slots are busy (aiokafka heartbeats run in the
+# background, and max_poll_interval_ms=900s far exceeds the item timeout).
+RT_CONCURRENCY = int(os.getenv("RT_CONCURRENCY", "3"))
 
 
 async def main():
@@ -83,54 +92,84 @@ async def main():
             get_monitor().record_breach("PIPELINE_EXCEPTION", f"batch flush failed: {e}")
             logger.error(f"[BATCH] Flush failed: {e}", exc_info=True)
 
-    # ── per-item real-time handler ────────────────────────────────────────────
+    # ── per-item real-time processing ─────────────────────────────────────────
+    _rt_sem = asyncio.Semaphore(RT_CONCURRENCY)
+    _rt_tasks: set[asyncio.Task] = set()
+
+    async def _process_rt(news_item: NewsItem):
+        """Full per-item pipeline run. Safe to run concurrently: cost is
+        attributed via a task-local bucket (see llm_logger), publishes are
+        independent per item, and offsets auto-commit regardless."""
+        logger.info(f"[RT] Processing: [{news_item.source}] {news_item.headline[:80]}")
+        begin_task_cost()
+        try:
+            # Hard time budget per item: a single stuck item can never block
+            # the consumer (which previously froze the whole feed for hours).
+            report = await asyncio.wait_for(
+                process_news_item(news_item), timeout=ITEM_PROCESSING_TIMEOUT_S
+            )
+            await publisher.publish(report)
+            _state["last_publish"] = time.monotonic()
+            logger.info(
+                f"[RT] Published: relevant={report.relevant}, "
+                f"companies={len(report.company_impacts)}, "
+                f"signals={len(report.trade_signals)}, "
+                f"latency={report.processing_latency_ms:.0f}ms"
+            )
+        except asyncio.TimeoutError:
+            get_monitor().record_breach(
+                "ITEM_TIMEOUT",
+                f"{news_item.id} exceeded {ITEM_PROCESSING_TIMEOUT_S:.0f}s budget",
+            )
+            logger.error(
+                f"[RT] Item timed out (> {ITEM_PROCESSING_TIMEOUT_S:.0f}s), skipping: "
+                f"{news_item.id}"
+            )
+        except Exception as e:
+            get_monitor().record_breach(
+                "PIPELINE_EXCEPTION", f"{news_item.id}: {e}")
+            logger.error(f"[RT] Pipeline failed for {news_item.id}: {e}", exc_info=True)
+        finally:
+            # Task-local bucket: correct even with concurrent items in flight.
+            item_cost = current_task_cost() or 0.0
+            if item_cost > ITEM_COST_BUDGET_USD:
+                get_monitor().record_breach(
+                    "ITEM_COST_BUDGET",
+                    f"{news_item.id} cost ${item_cost:.3f} > budget ${ITEM_COST_BUDGET_USD:.2f}",
+                )
+
+    async def _spawn_rt(news_item: NewsItem):
+        try:
+            await _process_rt(news_item)
+        finally:
+            _rt_sem.release()
+
+    # ── per-item handler ──────────────────────────────────────────────────────
     async def handle_news(news_item: NewsItem):
         nonlocal _batch_buf, _batch_deadline
 
-        if is_market_hours():
+        # Exchange filings always take the full per-item pipeline, even off
+        # hours: results PDFs land in the evening, and the batch-triage path
+        # produces no grounded filing summary (and shallow impacts). Filings
+        # are the product's tier-1 source — accuracy over batching.
+        filings_full = os.getenv("FILINGS_ALWAYS_FULL_PIPELINE", "1") == "1"
+        is_filing = news_item.source in ("NSE_FILINGS", "BSE_FILINGS")
+
+        if is_market_hours() or (filings_full and is_filing):
             # ── real-time mode ────────────────────────────────────────────────
             # If we're transitioning from off-hours, flush any queued items first
             if _batch_buf:
                 logger.info("[BATCH→RT] Market opened — flushing queued batch")
                 await _flush_batch()
 
-            logger.info(f"[RT] Processing: [{news_item.source}] {news_item.headline[:80]}")
-            cost_before = get_llm_logger().total_cost_usd
-            try:
-                # Hard time budget per item: a single stuck item can never block
-                # the consumer (which previously froze the whole feed for hours).
-                report = await asyncio.wait_for(
-                    process_news_item(news_item), timeout=ITEM_PROCESSING_TIMEOUT_S
-                )
-                await publisher.publish(report)
-                _state["last_publish"] = time.monotonic()
-                logger.info(
-                    f"[RT] Published: relevant={report.relevant}, "
-                    f"companies={len(report.company_impacts)}, "
-                    f"signals={len(report.trade_signals)}, "
-                    f"latency={report.processing_latency_ms:.0f}ms"
-                )
-            except asyncio.TimeoutError:
-                get_monitor().record_breach(
-                    "ITEM_TIMEOUT",
-                    f"{news_item.id} exceeded {ITEM_PROCESSING_TIMEOUT_S:.0f}s budget",
-                )
-                logger.error(
-                    f"[RT] Item timed out (> {ITEM_PROCESSING_TIMEOUT_S:.0f}s), skipping: "
-                    f"{news_item.id}"
-                )
-            except Exception as e:
-                get_monitor().record_breach(
-                    "PIPELINE_EXCEPTION", f"{news_item.id}: {e}")
-                logger.error(f"[RT] Pipeline failed for {news_item.id}: {e}", exc_info=True)
-            finally:
-                # RT items process one at a time, so this delta is the item's cost.
-                item_cost = get_llm_logger().total_cost_usd - cost_before
-                if item_cost > ITEM_COST_BUDGET_USD:
-                    get_monitor().record_breach(
-                        "ITEM_COST_BUDGET",
-                        f"{news_item.id} cost ${item_cost:.3f} > budget ${ITEM_COST_BUDGET_USD:.2f}",
-                    )
+            # Bounded concurrency for ALL real-time items (market hours and
+            # off-hours filings alike — results-evening filing bursts were the
+            # worst measured queueing). Blocks here (natural backpressure) only
+            # when all RT_CONCURRENCY slots are busy.
+            await _rt_sem.acquire()
+            task = asyncio.create_task(_spawn_rt(news_item))
+            _rt_tasks.add(task)
+            task.add_done_callback(_rt_tasks.discard)
 
         else:
             # ── batch mode ────────────────────────────────────────────────────
@@ -201,6 +240,11 @@ async def main():
         [consumer_task, timer_task, watchdog_task, shutdown_task],
         return_when=asyncio.FIRST_COMPLETED,
     )
+
+    # Drain in-flight real-time items on graceful shutdown
+    if _rt_tasks:
+        logger.info(f"[RT] Shutdown — waiting for {len(_rt_tasks)} in-flight item(s)")
+        await asyncio.wait(_rt_tasks, timeout=ITEM_PROCESSING_TIMEOUT_S)
 
     # Flush any remaining items on graceful shutdown
     if _batch_buf:

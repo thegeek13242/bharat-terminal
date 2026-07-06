@@ -34,6 +34,21 @@ IMPACT_TOOL = {
     "input_schema": {
         "type": "object",
         "properties": {
+            "event_scope": {
+                "type": "string",
+                "enum": ["company_specific", "supply_chain", "sector_wide", "macro"],
+                "description": (
+                    "How this event transmits beyond the directly named companies. "
+                    "company_specific: idiosyncratic — litigation/settlements, fraud, "
+                    "penalties, management changes, one-off writeoffs, buybacks, "
+                    "pledges, company ratings actions; does NOT affect competitors or "
+                    "sector peers. supply_chain: transmits along customer/supplier "
+                    "links — order wins/losses, capacity changes, production cuts. "
+                    "sector_wide: affects the whole sector — regulation, sector demand "
+                    "or pricing shifts, sector-relevant commodity moves. macro: "
+                    "economy-wide — rates, FX, budget, geopolitics."
+                ),
+            },
             "impacts": {
                 "type": "array",
                 "items": {
@@ -54,9 +69,14 @@ IMPACT_TOOL = {
                 }
             }
         },
-        "required": ["impacts"]
+        "required": ["impacts", "event_scope"]
     }
 }
+
+VALID_SCOPES = {"company_specific", "supply_chain", "sector_wide", "macro"}
+# Conservative default: an unclassified event does not fan out through the
+# relationship graph beyond ownership edges (see stage4 gating).
+DEFAULT_SCOPE = "company_specific"
 
 
 async def fetch_company_memory(symbol: str) -> Optional[dict]:
@@ -145,7 +165,7 @@ Revenue Segments: {json.dumps(ctx.get('business', {}).get('revenue_segments', []
         if market_sector_backdrop else ""
     )
 
-    return f"""You are an Indian equity market analyst. Assess the financial impact of this news on each affected company.
+    return f"""You are a senior equity analyst on the research desk of an Indian PMS/AIF fund. Your impact assessments feed the fund's position decisions: overstating noise wastes risk budget, missing a material event loses alpha. Both errors cost the fund — be exact, quantified, and skeptical.
 
 NEWS:
 Headline: {news_item.headline}
@@ -155,11 +175,26 @@ Source: {news_item.source}
 {backdrop_section}COMPANY PROFILES:
 {company_ctx_text}
 
-Score the impact for each company based on:
-1. Direct revenue/earnings impact
-2. Regulatory/structural implications
-3. Competitive positioning changes
-4. Time horizon for the impact to materialize
+ASSESSMENT DISCIPLINE:
+1. QUANTIFY against company size. Relate any ₹/$ amounts in the news to the
+   company's TTM revenue, PAT, and market cap from its profile. A ₹500 Cr order
+   is transformative for a ₹2,000 Cr-revenue company and noise for a
+   ₹2,00,000 Cr one. State the rough percentage in the explanation.
+2. MAGNITUDE anchors (plausible effect on fair value / annual earnings power):
+   5 = transformative (>10%)   4 = major (5-10%)   3 = clearly material (2-5%)
+   2 = minor (<2%) or soft/qualitative   1 = negligible, procedural, PR.
+   Most news items are a 1 or 2. Reserve ≥3 for quantified, verifiable substance.
+3. MECHANISM over vibes: name the transmission channel — which line item moves,
+   why, and over what horizon. If you cannot name the mechanism, the magnitude
+   is 1-2 by definition.
+4. SENTIMENT is the direction of THIS EVENT's effect on the company's
+   fundamentals — never the stock's recent performance and never the net of
+   every concurrent overhang. A record-output quarter is POSITIVE even if the
+   stock fell 16% last month amid unrelated worries; a contract loss is
+   NEGATIVE even after a rally. Surrounding negatives/positives belong in
+   magnitude and the explanation text — never flip the sign with them. Use
+   "negative" only when the event itself harms earnings power, the balance
+   sheet, or business prospects.
 5. RECENT EVENT MEMORY (if shown): judge whether this news is genuinely NEW, a
    continuation/escalation of an ongoing situation, or merely repeat coverage of
    an event already captured. If the memory shows the same event was already
@@ -170,7 +205,21 @@ Score the impact for each company based on:
    vice-versa) warrants more caution. Do NOT let the backdrop override a clear,
    material, company-specific signal in the news itself.
 
-Be precise. If impact is unclear, use magnitude 1-2 with "neutral" sentiment."""
+Also classify event_scope — does this event transmit beyond the directly named
+companies? Be strict: a litigation settlement, penalty, fraud, management exit,
+or one-off cash outflow at one company is company_specific — it does NOT make
+competitors or sector peers exposed (e.g. a bank paying to settle its own
+lawsuit says nothing about other banks). Use sector_wide only when the CAUSE
+itself is sector-level (regulation, sector demand/pricing, input costs for the
+whole sector), supply_chain when the effect travels through named customers or
+suppliers, and macro for economy-wide drivers.
+
+EXPLANATION STYLE: mechanism → affected line item → rough quantum → horizon, in
+2-3 factual sentences an analyst can verify against the source. No hype
+adjectives, no advice or buy/sell language — describe the exposure; the reader
+forms the view.
+
+If impact is unclear, use magnitude 1-2 with "neutral" sentiment."""
 
 
 async def score_impacts(
@@ -178,13 +227,15 @@ async def score_impacts(
     symbols: List[str],
     macro_theme: str,
     affected_sectors: Optional[List[str]] = None,
-) -> List[CompanyImpact]:
+) -> tuple[List[CompanyImpact], str]:
     """
-    Score impact of news on each company symbol.
+    Score impact of news on each company symbol, and classify the event's
+    transmission scope (gates Stage-4 propagation).
+    Returns (impacts, event_scope).
     SLA: ≤1.5s
     """
     if not symbols:
-        return []
+        return [], DEFAULT_SCOPE
 
     start_time = time.time()
     llm_logger = get_llm_logger()
@@ -242,7 +293,7 @@ async def score_impacts(
                 decay_factor=1.0,
             )
             for sym in symbols_to_score
-        ]
+        ], DEFAULT_SCOPE
 
     prompt = build_impact_prompt(news_item, symbols_to_score, contexts, memories,
                                  market_sector_backdrop=backdrop)
@@ -301,7 +352,12 @@ async def score_impacts(
                 decay_factor=1.0,
             ))
 
-        return impacts
+        event_scope = tool_result.get("event_scope")
+        if event_scope not in VALID_SCOPES:
+            logger.warning(f"Stage 3: invalid event_scope {event_scope!r} — using {DEFAULT_SCOPE}")
+            event_scope = DEFAULT_SCOPE
+
+        return impacts, event_scope
 
     except Exception as e:
         llm_latency = (time.time() - llm_start) * 1000
@@ -315,4 +371,4 @@ async def score_impacts(
         )
         llm_logger.log(record)
         logger.error(f"Stage 3 error: {e}")
-        return []
+        return [], DEFAULT_SCOPE

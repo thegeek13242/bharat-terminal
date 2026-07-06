@@ -168,16 +168,20 @@ async def _resolve_symbols(
     if explicit:
         query = select(Company.symbol).where(Company.symbol.in_(explicit))
     elif tier == "nifty500":
-        # Top 500 by market cap
+        # Top 500 by market cap. BSE-only companies are excluded: these tiers
+        # feed NSE XBRL/financials sweeps, and large BSE-only names (e.g. NSDL)
+        # would otherwise produce dead NSE requests.
         query = (
             select(Company.symbol)
-            .where(Company.is_active == True)
+            .where(Company.is_active == True, Company.exchange != "BSE")
             .order_by(Company.mcap_cr.desc().nullslast())
             .limit(500)
         )
     else:
-        # All active companies
-        query = select(Company.symbol).where(Company.is_active == True)
+        # All active companies (except BSE-only — see above)
+        query = select(Company.symbol).where(
+            Company.is_active == True, Company.exchange != "BSE"
+        )
 
     if not full_refresh and not explicit:
         # Process companies that either have low data quality OR have no financial results yet.
@@ -250,6 +254,8 @@ async def _upsert_financial_result(
     filing_meta: Dict,
     parsed: Dict,
     nse_filing_id: Optional[int],
+    source: str = "nse_xbrl",
+    announced_at=None,
 ) -> bool:
     """Upsert a single financial_results row. Returns True if data was new/updated."""
     quarter = parsed.get("quarter", {})
@@ -318,8 +324,14 @@ async def _upsert_financial_result(
         "taxonomy": parsed.get("taxonomy"),
         "sector_financials": parsed.get("sector_financials"),
         # Provenance
-        "source": "nse_xbrl",
+        "source": source,
         "nse_filing_id": nse_filing_id,
+        # Announcement timestamp — the PEAD drift anchor. Excluded from the
+        # conflict-update set below so the ORIGINAL announcement survives
+        # result revisions/refilings.
+        "announced_at": (announced_at
+                         or filing_meta.get("broadcast_date")
+                         or filing_meta.get("filing_date")),
         "raw_xbrl_facts": parsed.get("raw_facts"),
     }
 
@@ -327,7 +339,8 @@ async def _upsert_financial_result(
         constraint="uq_financial_result",
         set_={
             k: v for k, v in values.items()
-            if k not in ("symbol", "period_end", "period_type", "consolidated", "created_at")
+            if k not in ("symbol", "period_end", "period_type", "consolidated",
+                         "created_at", "announced_at")
         },
     )
     await session.execute(stmt)
@@ -410,6 +423,7 @@ async def _process_symbol_financials(
 ) -> Dict:
     """Process all financial filings for a single symbol. Returns stats dict."""
     stats = {"symbol": symbol, "filings_found": 0, "parsed": 0, "failed": 0, "skipped": 0}
+    surprise_jobs: List[tuple] = []  # (period_end, announced_at) per parsed quarter
 
     # Fetch filing index from NSE (single attempt — skip on empty, don't waste time retrying)
     raw_filings = await fetch_filing_index(symbol, client, limiter)
@@ -458,6 +472,11 @@ async def _process_symbol_financials(
         )
         if ok:
             stats["parsed"] += 1
+            xbrl_meta = parsed.get("metadata", {})
+            surprise_jobs.append((
+                xbrl_meta.get("period_end") or filing_meta.get("to_date"),
+                filing_meta.get("broadcast_date") or filing_meta.get("filing_date"),
+            ))
             # Mark filing as parsed
             if nse_filing_id:
                 await session.execute(
@@ -472,6 +491,15 @@ async def _process_symbol_financials(
     if stats["parsed"] > 0:
         await _compute_ttm_and_update_company(session, symbol)
         await invalidate_company_cache(symbol)
+
+    # PEAD earnings-surprise per newly parsed quarter (deterministic,
+    # fail-open — must never block results ingest). Runs in the caller's
+    # transaction; the caller's commit persists surprises + any signal.
+    if surprise_jobs:
+        from bharat_terminal.research.pead_signals import compute_surprise
+        for period_end, ann in surprise_jobs:
+            if period_end:
+                await compute_surprise(session, symbol, period_end, ann)
 
     return stats
 
@@ -886,6 +914,139 @@ async def sync_prices(days: int = 30) -> Dict:
 
         except Exception as e:
             logger.error(f"Price sync failed: {e}")
+            await session.rollback()
+            await complete_sync_log(session, log_id, "failed", error_message=str(e))
+            await session.commit()
+            raise
+
+
+async def sync_bse_prices(days: int = 5) -> Dict:
+    """
+    Backfill daily OHLCV for the BSE-only universe from the BSE bhavcopy.
+
+    Deliberately separate from sync_prices: its already-loaded check counts
+    ALL price_points rows for a date (>100 → skip) and NSE loads first, so a
+    shared function would never load BSE. The skip check here is BSE-scoped.
+
+    Rows are matched by ISIN restricted to exchange='BSE' — dual-listed
+    companies keep NSE as their sole price source (no cross-exchange close
+    mixing on the same symbol).
+    """
+    from bharat_terminal.kb.sync.prices_sync import fetch_bse_bhavcopy, last_trading_day
+
+    SessionFactory = create_async_session()
+
+    async with SessionFactory() as session:
+        log_id = await start_sync_log(session, "prices", "bse_bhavcopy")
+        await session.commit()
+
+        limiter = RateLimiter(rate=1.0)
+
+        total_records = 0
+        days_loaded = 0
+        days_skipped = 0
+        failed_days = 0
+
+        try:
+            isin_result = await session.execute(
+                select(Company.isin, Company.symbol).where(
+                    Company.exchange == "BSE", Company.isin.isnot(None)
+                )
+            )
+            isin_to_symbol = {row[0]: row[1] for row in isin_result.fetchall()}
+            if not isin_to_symbol:
+                logger.info("[bse_prices] no BSE-only companies onboarded; nothing to do")
+                await complete_sync_log(session, log_id, "success", records_processed=0,
+                                        metadata={"note": "universe empty"})
+                await session.commit()
+                return {"days_loaded": 0, "days_skipped": 0, "failed_days": 0,
+                        "total_records": 0}
+            logger.info(f"[bse_prices] ISIN map: {len(isin_to_symbol)} BSE-only companies")
+
+            today = last_trading_day()
+
+            for day_offset in range(days):
+                target_date = today - timedelta(days=day_offset)
+                if target_date.weekday() >= 5:
+                    continue
+
+                # BSE-scoped already-loaded check (join to companies.exchange).
+                existing = await session.execute(
+                    select(sa_func.count())
+                    .select_from(
+                        PricePoint.__table__.join(
+                            Company.__table__,
+                            Company.symbol == PricePoint.symbol,
+                        )
+                    )
+                    .where(PricePoint.date == target_date, Company.exchange == "BSE")
+                )
+                count = existing.scalar() or 0
+                if count > 100:
+                    days_skipped += 1
+                    continue
+
+                async with limiter:
+                    try:
+                        prices = await fetch_bse_bhavcopy(target_date)
+                    except Exception as e:
+                        logger.warning(f"[bse_prices] bhavcopy failed for {target_date}: {e}")
+                        failed_days += 1
+                        continue
+                if not prices:
+                    continue
+
+                matched = 0
+                try:
+                    for price in prices:
+                        symbol = isin_to_symbol.get(price["isin"])
+                        if not symbol:
+                            continue  # dual-listed / not in universe
+                        stmt = pg_insert(PricePoint.__table__).values(
+                            symbol=symbol,
+                            date=price["date"],
+                            open=price.get("open"),
+                            high=price.get("high"),
+                            low=price.get("low"),
+                            close=price["close"],
+                            volume=price.get("volume"),
+                        ).on_conflict_do_nothing(constraint="uq_price_point")
+                        await session.execute(stmt)
+                        matched += 1
+
+                    total_records += matched
+                    days_loaded += 1
+                    logger.info(
+                        f"[bse_prices] {target_date}: {matched} of {len(prices)} "
+                        f"bhavcopy rows matched the BSE-only universe"
+                    )
+                except Exception as e:
+                    logger.warning(f"[bse_prices] insert failed for {target_date}: {e}")
+                    await session.rollback()
+                    failed_days += 1
+                    continue
+
+                await session.commit()
+
+            await complete_sync_log(
+                session, log_id, "success",
+                records_processed=total_records,
+                metadata={"days_loaded": days_loaded, "days_skipped": days_skipped,
+                          "failed_days": failed_days},
+            )
+            await session.commit()
+
+            summary = {
+                "days_loaded": days_loaded,
+                "days_skipped": days_skipped,
+                "failed_days": failed_days,
+                "total_records": total_records,
+            }
+            logger.info(f"[bse_prices] sync complete: {summary}")
+            return summary
+
+        except Exception as e:
+            logger.error(f"[bse_prices] sync failed: {e}")
             await session.rollback()
             await complete_sync_log(session, log_id, "failed", error_message=str(e))
             await session.commit()

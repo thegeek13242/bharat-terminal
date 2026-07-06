@@ -141,9 +141,12 @@ async def _handle_report(report: dict):
     if not relevant:
         return  # Don't clutter the feed with irrelevant noise
 
+    # Trade signals are internal eval telemetry — persisted above, but never
+    # broadcast to browsers (SEBI RA scope).
+    public_report = {k: v for k, v in report.items() if k != "trade_signals"}
     event = {
         "type": "impact_report",
-        "data": report,
+        "data": public_report,
         "timestamp": datetime.utcnow().isoformat(),
     }
     await manager.broadcast(event)
@@ -157,10 +160,10 @@ async def _persist_to_db(report: dict, news_item: dict, news_id: str):
             await session.execute(
                 text("""
                     INSERT INTO news_items
-                        (id, source, timestamp_utc, headline, body, url,
+                        (id, source, timestamp_utc, headline, body, summary, url,
                          ingest_latency_ms, category, symbols_mentioned)
                     VALUES
-                        (:id, :source, :timestamp_utc, :headline, :body, :url,
+                        (:id, :source, :timestamp_utc, :headline, :body, :summary, :url,
                          :ingest_latency_ms, :category, CAST(:symbols_mentioned AS jsonb))
                     ON CONFLICT (id) DO NOTHING
                 """),
@@ -170,6 +173,7 @@ async def _persist_to_db(report: dict, news_item: dict, news_id: str):
                     "timestamp_utc": _parse_dt(news_item.get("timestamp_utc")),
                     "headline": news_item.get("headline", ""),
                     "body": news_item.get("body"),
+                    "summary": news_item.get("summary"),
                     "url": news_item.get("url", ""),
                     "ingest_latency_ms": news_item.get("ingest_latency_ms", 0.0),
                     "category": news_item.get("category"),
