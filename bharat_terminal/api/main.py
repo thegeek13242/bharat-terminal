@@ -35,6 +35,7 @@ from bharat_terminal.api.routes import (
     signals_report,
     starred,
     internal_ltp,
+    earnings_surprises,
 )
 from bharat_terminal.api.ws_manager import manager
 
@@ -101,6 +102,10 @@ app.include_router(graph.router, dependencies=_auth)
 app.include_router(watchlist.router, dependencies=_auth)
 app.include_router(starred.router, dependencies=_auth)
 app.include_router(sentiment.router, dependencies=_auth)
+# Earnings-surprise statistics (PEAD): deterministic, factual-statistical
+# payloads with disclaimer — customer-visible per founder decision 2026-07-04
+# (flagged for RA counsel review; see routes/earnings_surprises.py docstring).
+app.include_router(earnings_surprises.router, dependencies=_auth)
 app.include_router(websocket.router)
 
 # Internal research surfaces (signal reports + hit-rate metrics). These carry

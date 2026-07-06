@@ -94,6 +94,12 @@ export const api = {
   getDossier: (symbol: string) =>
     request<any>(`/dossier/${encodeURIComponent(symbol)}`),
 
+  // ── Earnings surprises (PEAD statistics) ─────────────────────────────
+  getRecentSurprises: (days = 7, decile: 'tails' | 'all' = 'tails') =>
+    request<{ items: any[]; count: number; historical_context: any }>(
+      `/earnings-surprises/recent?days=${days}&decile=${decile}`,
+    ),
+
   // ── Internal-only (403 for regular accounts) ─────────────────────────
   getInternalLtp: (symbol: string) =>
     request<any>(`/internal/ltp/${encodeURIComponent(symbol)}`),

@@ -10,6 +10,7 @@ const NAV: { to: string; label: string; key: string }[] = [
   { to: '/terminal', label: 'Feed', key: 'feed' },
   { to: '/watchlist', label: 'Watchlist', key: 'watchlist' },
   { to: '/starred', label: 'Starred', key: 'starred' },
+  { to: '/surprises', label: 'Surprises', key: 'surprises' },
   { to: '/universe', label: 'Universe', key: 'universe' },
 ];
 
