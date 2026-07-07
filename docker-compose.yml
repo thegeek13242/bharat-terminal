@@ -400,6 +400,26 @@ services:
     restart: unless-stopped
     logging: *default-logging
 
+  onboarding-worker:
+    # Polls the landing edge for approved demo requests, creates the app_users
+    # invite row, and sends the onboarding email. Reuses the api image (has
+    # httpx + sqlalchemy + asyncpg + the code). Idles when the queue is empty.
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+    container_name: bharat-onboarding
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: [".env"]
+    environment:
+      <<: *common-env
+    command: ["python", "-m", "bharat_terminal.onboarding.provision_worker", "--loop"]
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+    logging: *default-logging
+
   frontend:
     build:
       context: .
