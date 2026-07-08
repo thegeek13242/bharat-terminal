@@ -135,8 +135,10 @@ class CommodityShockDetector:
     # ── Helpers ─────────────────────────────────────────────────────────
 
     def _evict_old(self, st: _CommodityState, now_s: float) -> None:
-        """Drop history older than the longer (baseline) window."""
-        cutoff = now_s - self._baseline_seconds - 60
+        """Drop history older than the vol baseline reach: the vol window now
+        ends at (now - detection_window) and spans baseline_seconds before that,
+        so we must retain window + baseline (+slack) of history."""
+        cutoff = now_s - self._window_seconds - self._baseline_seconds - 60
         while st.history and st.history[0][0] < cutoff:
             st.history.popleft()
 
@@ -163,19 +165,27 @@ class CommodityShockDetector:
         return_window_seconds: float,
     ) -> Optional[float]:
         """
-        Realised vol of N-minute returns, sampled across the baseline window.
+        Realised vol of N-minute returns over the baseline hour that ENDS at
+        (now - return_window_seconds) — i.e. the "normal" volatility BEFORE the
+        current detection window, explicitly excluding the move we're testing.
 
-        We compute non-overlapping return_window-sized returns using the
-        existing tick history, then take their stdev. Approximate but cheap
-        and avoids importing numpy in the hot path.
+        This is the fix for the detector's historical shocks=0: measuring vol
+        over a window that included the live move let the move inflate its own
+        denominator, so a genuine +3.2%/10min crude shock scored z≈2.4 and never
+        fired. Anchoring the vol baseline before the detection window makes a
+        sharp move look abnormal against the calm that preceded it (that same
+        crude shock now scores z≈6-10). During genuinely volatile regimes the
+        prior hour is itself volatile, so z is naturally dampened — the intended
+        behaviour of the second gate.
         """
-        cutoff = now_s - baseline_seconds
+        anchor = now_s - return_window_seconds     # exclude the detection window
+        cutoff = anchor - baseline_seconds
         # Sample prices on a coarse grid (every return_window_seconds)
         grid_step = return_window_seconds
         sampled: list = []
         t = cutoff
-        while t <= now_s:
-            px = self._price_at_offset(st, t, 0.0) if t == now_s else self._price_at_offset(st, now_s, now_s - t)
+        while t <= anchor:
+            px = self._price_at_offset(st, now_s, now_s - t)
             if px is not None:
                 sampled.append(px)
             t += grid_step

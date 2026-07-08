@@ -82,6 +82,9 @@ body{
 .btn-ghost{background:transparent;color:var(--ink-2);border-color:var(--border-hi);}
 .btn-ghost:not(:disabled):hover{border-color:var(--accent);color:var(--accent);}
 
+/* Citation "Source ↗" link on feed rows */
+.feed-cite:hover{border-color:var(--accent);color:var(--accent);}
+
 .card{background:var(--bg-elev);border:1px solid var(--border);border-radius:8px;}
 
 ::selection{background:var(--accent);color:#06120F;}
