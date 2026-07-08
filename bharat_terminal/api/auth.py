@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import jwt
-from fastapi import HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import text
 
