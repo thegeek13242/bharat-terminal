@@ -338,10 +338,53 @@ async def score_impacts(
         if total_latency > 1500:
             logger.warning(f"Stage 3 SLA breach: {total_latency:.0f}ms > 1500ms")
 
+        # The LLM was asked to score exactly symbols_to_score, but it sometimes
+        # echoes an identifier from the news text instead — e.g. the numeric
+        # BSE scrip code embedded in filing headlines ("Foo Ltd - 503626 - ...")
+        # — which then surfaces verbatim in the feed. Enforce the contract:
+        # every impact must map back to a provided symbol, else it is dropped.
+        provided = {s.upper(): s for s in symbols_to_score}
+        name_to_symbol = {}
+        for sym in symbols_to_score:
+            nm = ((contexts.get(sym) or {}).get("identity") or {}).get("company_name", "")
+            if nm:
+                name_to_symbol[nm.upper().strip()] = sym
+
+        def _canonical(item: dict) -> Optional[str]:
+            raw = (item.get("symbol") or "").upper().strip()
+            if raw in provided:
+                return provided[raw]
+            nm = (item.get("company_name") or "").upper().strip()
+            if nm in name_to_symbol:
+                return name_to_symbol[nm]
+            return None
+
         impacts = []
+        seen_symbols: set = set()
         for item in tool_result.get("impacts", []):
+            canonical = _canonical(item)
+            if canonical is None:
+                # Last resort: KB resolution (cached, rare — only on LLM drift),
+                # accepted only if it lands back in the provided set.
+                from bharat_terminal.analysis.signal_gates import resolve_symbol
+                for cand in (item.get("symbol"), item.get("company_name")):
+                    if cand:
+                        r = await asyncio.to_thread(resolve_symbol, cand)
+                        if r and r.upper() in provided:
+                            canonical = provided[r.upper()]
+                            break
+            if canonical is None:
+                logger.warning(
+                    f"Stage 3: dropping impact with unmappable symbol "
+                    f"{item.get('symbol')!r} / {item.get('company_name')!r} "
+                    f"(scored set: {symbols_to_score})"
+                )
+                continue
+            if canonical in seen_symbols:
+                continue
+            seen_symbols.add(canonical)
             impacts.append(CompanyImpact(
-                symbol=item["symbol"],
+                symbol=canonical,
                 company_name=item["company_name"],
                 sentiment=item["sentiment"],
                 magnitude=item["magnitude"],
