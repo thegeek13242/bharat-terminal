@@ -27,7 +27,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
-STUDY_VERSION = "pead_v2_2026_07"
+STUDY_VERSION = "pead_v2.1_2026_07"
+
+# v2.1 input hygiene (re-validated 2026-07-05: composite D10-D1 +2.18%/20d t=5.1,
+# up from v2.0's +2.11%/t=4.7). Two cleanings, neither mutates stored data:
+#  - winsorize SUE at ±10σ: near-dormant shells (e.g. INDBNK, ~0 revenue for
+#    years then a jump) produce absurd 40-68σ scores from near-zero historical
+#    variance. The percentile RANK is unaffected (monotone), but capping keeps
+#    displayed values sane and stops outliers dominating the composite mean.
+#  - drop non-positive revenue quarters from the revenue-SUE history: many
+#    filers report only audited ANNUAL figures at year-end, so the derived
+#    standalone Q4 (= FY - 9M) can be legitimately negative on a reversal/
+#    restatement (e.g. HINDOILEXP -205.89 Cr). The parser correctly stores that
+#    per the source-of-truth doctrine; it is simply not a valid "revenue growth"
+#    input. Such an event then has no revenue-SUE → no composite → unranked
+#    (matches the study, which required both legs).
+SUE_WINSOR = 10.0
 
 MIN_PRIOR_YOY_OBS = 4
 ENTRY_MIN_PRICE = 5.0
@@ -46,10 +61,10 @@ D1_HISTORICAL_EXCESS_20D = 0.5
 HISTORICAL_CONTEXT = {
     "study_version": STUDY_VERSION,
     "summary": (
-        "In our backtest of 21,188 Indian quarterly results (2020–2026), "
+        "In our backtest of ~21,000 Indian quarterly results (2020–2026), "
         "companies whose combined earnings-and-revenue surprise ranked in the "
         "top decile of the trailing year went on to outperform the median "
-        "result-reporting company by +2.6% over the following 20 trading "
+        "result-reporting company by ~2.6% over the following 20 trading "
         "sessions on average; bottom-decile surprises underperformed."
     ),
     "disclaimer": (
@@ -90,7 +105,8 @@ def compute_sue(history: Dict[date, float], period_end: date,
     sd = math.sqrt(var)
     if sd <= 1e-9:
         return None
-    return (surprise - mu) / sd
+    z = (surprise - mu) / sd
+    return max(-SUE_WINSOR, min(SUE_WINSOR, z))  # v2.1 winsorize
 
 
 def pead_signal_id(symbol: str, period_end: date) -> str:
@@ -106,7 +122,10 @@ async def _load_history(session: AsyncSession, symbol: str):
         ORDER BY period_end, consolidated DESC
     """), {"sym": symbol})).all()
     eps = {r.period_end: float(r.eps_basic) for r in rows}
-    rev = {r.period_end: float(r.revenue_cr) for r in rows if r.revenue_cr is not None}
+    # v2.1: only strictly-positive revenue quarters feed the revenue-SUE — a
+    # derived/reversal negative Q4 is real in the filing but not a growth input.
+    rev = {r.period_end: float(r.revenue_cr) for r in rows
+           if r.revenue_cr is not None and float(r.revenue_cr) > 0}
     return eps, rev
 
 
@@ -204,7 +223,8 @@ async def _compute_surprise_inner(session, symbol, period_end, announced_at,
             percentile = EXCLUDED.percentile, decile = EXCLUDED.decile,
             liquidity_pass = EXCLUDED.liquidity_pass,
             median_traded_value_cr = EXCLUDED.median_traded_value_cr,
-            reference_n = EXCLUDED.reference_n, updated_at = now()
+            reference_n = EXCLUDED.reference_n,
+            study_version = EXCLUDED.study_version, updated_at = now()
     """), {"sym": symbol, "pend": period_end, "ann": announced_at,
            "eps": eps_h.get(period_end), "rev": rev_h.get(period_end),
            "se": sue_eps, "sr": sue_rev, "sc": composite, "pct": pct,
