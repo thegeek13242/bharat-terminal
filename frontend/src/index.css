@@ -112,6 +112,13 @@ body{
    stays smooth without a virtualization library. */
 .feed-row{content-visibility:auto;contain-intrinsic-size:auto 72px;}
 
+/* Semantic prose highlights: figures in bright mono; signed moves colored.
+   Priced-in pill = the "already moved" warning an analyst must not miss. */
+.hl-num{font-family:var(--mono);color:var(--ink);font-weight:600;}
+.hl-pos{font-family:var(--mono);color:var(--tail);font-weight:600;}
+.hl-neg{font-family:var(--mono);color:var(--head);font-weight:600;}
+.pill-priced-in{display:inline-block;font-size:9px;letter-spacing:0.1em;padding:2px 7px;border-radius:3px;color:var(--head);background:rgba(198,132,118,0.12);border:1px solid rgba(198,132,118,0.45);white-space:nowrap;}
+
 /* Star toggle in feed rows: hidden until row hover, always visible once on. */
 .star-btn{background:transparent;border:none;padding:0;line-height:1;font-size:13px;color:var(--ink-faint);cursor:pointer;opacity:0;transition:opacity .12s ease,color .12s ease;}
 .row-hover:hover .star-btn{opacity:1;}

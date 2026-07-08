@@ -12,6 +12,7 @@ import {
   DIRECTION_VAR,
   DIRECTION_LABEL,
 } from '@/lib/format';
+import { hasPricedIn } from '@/lib/richtext';
 
 interface Props {
   reports: ImpactReport[];
@@ -226,6 +227,11 @@ export function FeedList({
                       <div className="mono upper" style={{ fontSize: 10, letterSpacing: '0.08em', color: 'var(--ink-dim)', marginTop: 3 }}>
                         {DIRECTION_LABEL[dir]}
                       </div>
+                      {hasPricedIn(imp?.explanation) && (
+                        <div className="mono upper" style={{ fontSize: 8.5, letterSpacing: '0.08em', color: 'var(--head)', marginTop: 3 }}>
+                          Priced in
+                        </div>
+                      )}
                     </div>
                     {onToggleStar && (
                       <button
