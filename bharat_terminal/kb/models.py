@@ -416,6 +416,65 @@ class ShareholdingPattern(Base):
     )
 
 
+class InvestorHolding(Base):
+    """One row per (company, quarter, named >=1% shareholder) from the SHP XBRL
+    detail table. Powers stock-centric notable-holders + investor-centric
+    portfolio/QoQ views (migration 021)."""
+    __tablename__ = "investor_holdings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(
+        String(20), ForeignKey("companies.symbol", ondelete="CASCADE"), nullable=False
+    )
+    quarter_end: Mapped[date] = mapped_column(Date, nullable=False)
+    holder_name: Mapped[str] = mapped_column(Text, nullable=False)
+    holder_name_norm: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    category: Mapped[Optional[str]] = mapped_column(String(24), nullable=True)
+    holding_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    shares_held: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    source: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "quarter_end", "holder_name", name="uq_investor_holding"),
+        Index("ix_investor_holdings_symbol_q", "symbol", "quarter_end"),
+    )
+
+
+class MarketDeal(Base):
+    """One disclosed bulk/block deal (NSE+BSE). Market-making/HFT churn is FLAGGED
+    (is_excluded + exclude_reason), not deleted, so the filter stays auditable
+    (migration 022)."""
+    __tablename__ = "market_deals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    deal_date: Mapped[date] = mapped_column(Date, nullable=False)
+    exchange: Mapped[str] = mapped_column(String(4), nullable=False)
+    deal_type: Mapped[str] = mapped_column(String(8), nullable=False)  # bulk | block
+    symbol: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, index=True)
+    company_name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    client_name: Mapped[str] = mapped_column(Text, nullable=False)
+    client_name_norm: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    side: Mapped[str] = mapped_column(String(4), nullable=False)  # BUY | SELL
+    quantity: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    value_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    marquee_key: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    is_excluded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    exclude_reason: Mapped[Optional[str]] = mapped_column(String(24), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("deal_date", "exchange", "deal_type", "client_name",
+                         "symbol", "side", "quantity", "price", name="uq_market_deal"),
+        Index("ix_market_deals_symbol_date", "symbol", "deal_date"),
+        Index("ix_market_deals_norm_date", "client_name_norm", "deal_date"),
+    )
+
+
 class CorporateAction(Base):
     __tablename__ = "corporate_actions"
 

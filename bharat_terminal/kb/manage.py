@@ -613,6 +613,24 @@ def main():
         help="Actually write (default is dry-run + rollback)",
     )
 
+    holders_parser = subparsers.add_parser(
+        "investor-holdings-backfill",
+        help="Populate investor_holdings from stored SHP XBRL urls (dry-run by default)",
+    )
+    holders_parser.add_argument("--quarters", type=int, default=2,
+                                help="Newest N quarters per company (default 2)")
+    holders_parser.add_argument("--execute", action="store_true",
+                                help="Actually write (default is dry-run)")
+    holders_parser.add_argument("--symbols", help="Comma-separated subset (default: all)")
+
+    deals_parser = subparsers.add_parser(
+        "market-deals-sync",
+        help="Sync NSE+BSE bulk/block deals with MM/churn exclusion (dry-run by default)",
+    )
+    deals_parser.add_argument("--days", type=int, default=3, help="BSE lookback window")
+    deals_parser.add_argument("--execute", action="store_true",
+                              help="Actually write (default is dry-run)")
+
     args = parser.parse_args()
 
     if args.command == "refresh-dcf":
@@ -666,6 +684,17 @@ def main():
         from bharat_terminal.kb.sync.pipeline import sync_bse_prices
         result = asyncio.run(sync_bse_prices(days=args.days))
         print(f"Result: {result}")
+    elif args.command == "investor-holdings-backfill":
+        from bharat_terminal.kb.sync.investor_holdings_sync import backfill as ih_backfill
+        syms = ([s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+                if args.symbols else None)
+        stats = asyncio.run(ih_backfill(
+            quarters=args.quarters, dry_run=not args.execute, symbols=syms))
+        print(stats)
+    elif args.command == "market-deals-sync":
+        from bharat_terminal.kb.sync.market_deals_sync import sync as deals_sync
+        stats = asyncio.run(deals_sync(days=args.days, dry_run=not args.execute))
+        print(stats)
     elif args.command == "pead-backfill":
         from bharat_terminal.research.pead_signals import backfill
         stats = asyncio.run(backfill(dry_run=not args.execute))

@@ -195,6 +195,9 @@ async def sync_symbol(
             "raw_data": rec,
             **parsed,
         })
+        # Live-capture named (>=1%) holders from the same XBRL (fail-open).
+        from bharat_terminal.kb.sync.investor_holdings_sync import capture_from_xbrl
+        await capture_from_xbrl(symbol, q_end, xr.text, "NSE_XBRL_SHP")
     return rows
 
 

@@ -37,6 +37,7 @@ function EvidenceLink({ url }: { url?: string | null }) {
 export function DossierModal({ symbol, onClose }: { symbol: string; onClose: () => void }) {
   const [dossier, setDossier] = useState<DossierFull | null>(null);
   const [detail, setDetail] = useState<CompanyDetail | null>(null);
+  const [holders, setHolders] = useState<{ quarter_end: string | null; prior_quarter_end: string | null; holders: any[]; recent_deals?: any[] } | null>(null);
   const [state, setState] = useState<'loading' | 'ready' | 'none'>('loading');
 
   useEffect(() => {
@@ -48,7 +49,9 @@ export function DossierModal({ symbol, onClose }: { symbol: string; onClose: () 
   useEffect(() => {
     let cancelled = false;
     setState('loading');
+    setHolders(null);
     api.getCompanyDetail(symbol).then((d) => !cancelled && setDetail(d)).catch(() => {});
+    api.getHolders(symbol).then((h) => !cancelled && setHolders(h)).catch(() => {});
     api
       .getDossier(symbol)
       .then((d) => {
@@ -68,6 +71,76 @@ export function DossierModal({ symbol, onClose }: { symbol: string; onClose: () 
   }, [symbol]);
 
   const sensitivities = dossier?.sensitivities ?? [];
+
+  const changeColor = (c: string): string =>
+    c === 'add' || c === 'new' ? DIRECTION_VAR.tailwind
+      : c === 'trim' || c === 'exit' ? DIRECTION_VAR.headwind
+        : 'var(--ink-dim)';
+
+  function holdersSection() {
+    if (!holders) return null;
+    const deals = holders.recent_deals ?? [];
+    if (holders.holders.length === 0 && deals.length === 0) return null;
+    return (
+      <div>
+        {holders.holders.length > 0 && (
+        <>
+        <SectionHeader>Notable Holders · SHP {holders.quarter_end}</SectionHeader>
+        <div className="mono upper" style={{ display: 'grid', gridTemplateColumns: '1fr 62px 52px 58px 64px', gap: 8, padding: '6px 24px', fontSize: 9.5, letterSpacing: '0.06em', color: 'var(--ink-mute)' }}>
+          <span>Holder</span>
+          <span style={{ textAlign: 'right' }}>Type</span>
+          <span style={{ textAlign: 'right' }}>Hold %</span>
+          <span style={{ textAlign: 'right' }}>Δ QoQ</span>
+          <span style={{ textAlign: 'right' }}>₹ Cr</span>
+        </div>
+        {holders.holders.slice(0, 40).map((h, i) => (
+          <div
+            key={h.holder_name + i}
+            style={{ display: 'grid', gridTemplateColumns: '1fr 62px 52px 58px 64px', gap: 8, padding: '8px 24px', borderTop: '1px solid var(--border)', alignItems: 'center' }}
+            title={h.holder_name}
+          >
+            <span style={{ fontSize: 11.5, color: h.marquee ? 'var(--accent)' : 'var(--ink)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: h.marquee ? 600 : 400 }}>
+              {h.marquee ?? h.holder_name}
+            </span>
+            <span className="mono upper" style={{ fontSize: 9, letterSpacing: '0.04em', textAlign: 'right', color: 'var(--ink-mute)' }}>{dash(h.category)}</span>
+            <span className="num" style={{ fontSize: 11.5, textAlign: 'right', color: 'var(--ink-2)' }}>{h.holding_pct != null ? `${num(h.holding_pct, 2)}` : dash(null)}</span>
+            <span className="num" style={{ fontSize: 11, textAlign: 'right', color: changeColor(h.change), fontWeight: 600 }}>
+              {h.change === 'new' ? 'NEW' : h.change === 'exit' ? 'EXIT' : h.delta_pct != null ? `${h.delta_pct > 0 ? '+' : ''}${num(h.delta_pct, 2)}` : '–'}
+            </span>
+            <span className="num" style={{ fontSize: 11, textAlign: 'right', color: 'var(--ink-dim)' }}>{h.value_cr != null ? num(h.value_cr, 0) : dash(null)}</span>
+          </div>
+        ))}
+        <div className="mono" style={{ padding: '10px 24px', fontSize: 9.5, color: 'var(--ink-mute)', lineHeight: 1.5 }}>
+          SEBI quarterly disclosure of holders &gt;1%. Sub-1% positions not shown. ₹ value = disclosed shares × latest close.
+        </div>
+        </>
+        )}
+
+        {deals.length > 0 && (
+        <>
+          <SectionHeader>Recent Activity · Bulk &amp; Block Deals</SectionHeader>
+          {deals.slice(0, 15).map((d, i) => (
+            <div
+              key={`${d.deal_date}-${d.client_name}-${i}`}
+              style={{ display: 'grid', gridTemplateColumns: '78px 1fr 46px 74px', gap: 8, padding: '8px 24px', borderTop: '1px solid var(--border)', alignItems: 'center' }}
+              title={d.client_name}
+            >
+              <span className="mono" style={{ fontSize: 10, color: 'var(--ink-dim)' }}>{d.deal_date}</span>
+              <span style={{ fontSize: 11.5, color: d.marquee ? 'var(--accent)' : 'var(--ink-2)', fontWeight: d.marquee ? 600 : 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {d.marquee ?? d.client_name}
+              </span>
+              <span className="mono upper" style={{ fontSize: 10, fontWeight: 600, textAlign: 'right', color: d.side === 'BUY' ? DIRECTION_VAR.tailwind : DIRECTION_VAR.headwind }}>{d.side}</span>
+              <span className="num" style={{ fontSize: 11, textAlign: 'right', color: 'var(--ink-dim)' }}>{d.value_cr != null ? num(d.value_cr, 0) : dash(null)}</span>
+            </div>
+          ))}
+          <div className="mono" style={{ padding: '10px 24px', fontSize: 9.5, color: 'var(--ink-mute)', lineHeight: 1.5 }}>
+            Individual disclosed transactions (client &gt;0.5% intraday), market-maker / HFT churn filtered out — not positions. A single leg may be one side of a trade whose other side is executed off-market over days and never disclosed; the holder list above (SEBI filing) is the position of record.
+          </div>
+        </>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div
@@ -246,6 +319,10 @@ export function DossierModal({ symbol, onClose }: { symbol: string; onClose: () 
             </div>
           </div>
         )}
+
+        {/* Notable holders render independent of dossier coverage — most
+            small/midcaps have no dossier but do disclose named holders. */}
+        {state !== 'loading' && holdersSection()}
       </div>
     </div>
   );

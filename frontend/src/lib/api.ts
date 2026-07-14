@@ -100,6 +100,37 @@ export const api = {
       `/earnings-surprises/recent?days=${days}&decile=${decile}`,
     ),
 
+  // ── Notable holders / marquee investors ──────────────────────────────
+  getHolders: (symbol: string) =>
+    request<{ symbol: string; quarter_end: string | null; prior_quarter_end: string | null; holders: any[] }>(
+      `/companies/${encodeURIComponent(symbol)}/holders`,
+    ),
+
+  getInvestors: (params: { marquee_only?: boolean; min_companies?: number } = {}) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null) qs.set(k, String(v));
+    });
+    return request<{ count: number; disclaimer: string; investors: any[] }>(
+      `/investors${qs.toString() ? `?${qs.toString()}` : ''}`,
+    );
+  },
+
+  getInvestorPositions: (ident: string) =>
+    request<{ id: string; display: string; type: string; n_companies: number; total_value_cr: number | null; disclaimer: string; positions: any[]; recent_deals: any[] }>(
+      `/investors/${encodeURIComponent(ident)}`,
+    ),
+
+  getDealFlow: (params: { marquee_only?: boolean; include_excluded?: boolean; days?: number } = {}) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null) qs.set(k, String(v));
+    });
+    return request<{ count: number; disclaimer: string; deals: any[] }>(
+      `/deals${qs.toString() ? `?${qs.toString()}` : ''}`,
+    );
+  },
+
   // ── Internal-only (403 for regular accounts) ─────────────────────────
   getInternalLtp: (symbol: string) =>
     request<any>(`/internal/ltp/${encodeURIComponent(symbol)}`),

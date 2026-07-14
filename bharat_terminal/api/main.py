@@ -36,6 +36,7 @@ from bharat_terminal.api.routes import (
     starred,
     internal_ltp,
     earnings_surprises,
+    investor_holdings,
 )
 from bharat_terminal.api.ws_manager import manager
 
@@ -106,6 +107,8 @@ app.include_router(sentiment.router, dependencies=_auth)
 # payloads with disclaimer — customer-visible per founder decision 2026-07-04
 # (flagged for RA counsel review; see routes/earnings_surprises.py docstring).
 app.include_router(earnings_surprises.router, dependencies=_auth)
+app.include_router(investor_holdings.router, dependencies=_auth)
+app.include_router(investor_holdings.deals_router, dependencies=_auth)
 app.include_router(websocket.router)
 
 # Internal research surfaces (signal reports + hit-rate metrics). These carry
