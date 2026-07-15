@@ -179,9 +179,13 @@ class NSEFilingsAdapter(BaseAdapter):
                             timestamp_utc=p["ts"],
                             headline=p["headline"],
                             body=body,
+                            # Cite the actual filing PDF (attchmntFile). The old
+                            # /company-info/corporate-announcements?symbol= path
+                            # 404s (broken). Fall back to the company page (valid,
+                            # HTTP 200) only when a filing carries no attachment.
                             url=(
-                                f"https://www.nseindia.com/company-info/"
-                                f"corporate-announcements?symbol={p['symbol']}"
+                                (p["attachment"] or "").strip()
+                                or f"https://www.nseindia.com/get-quotes/equity?symbol={p['symbol']}"
                             ),
                             raw_html=None,
                             ingest_latency_ms=ingest_latency,

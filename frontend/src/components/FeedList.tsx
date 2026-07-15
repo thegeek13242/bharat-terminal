@@ -6,8 +6,8 @@ import {
   dayKey,
   dayLabel,
   primaryImpact,
+  reportImpactBand,
   sentimentToDirection,
-  magnitudeBand,
   DIRECTION_GLYPH,
   DIRECTION_VAR,
   DIRECTION_LABEL,
@@ -212,17 +212,42 @@ export function FeedList({
                       >
                         {r.news_item?.headline}
                       </div>
-                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 7 }}>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 5, marginTop: 7 }}>
                         {(r.company_impacts ?? []).slice(0, 3).map((c) => (
                           <Tag key={c.symbol} size="sm">
                             {c.symbol}
                           </Tag>
                         ))}
+                        {r.news_item?.url && (
+                          <a
+                            href={r.news_item.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                            className="mono upper feed-cite"
+                            title="Open the original source in a new tab"
+                            style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: 3,
+                              fontSize: 9,
+                              letterSpacing: '0.08em',
+                              color: 'var(--ink-mute)',
+                              textDecoration: 'none',
+                              border: '1px solid var(--border-hi)',
+                              borderRadius: 2,
+                              padding: '2px 5px',
+                              whiteSpace: 'nowrap',
+                            }}
+                          >
+                            Source <span aria-hidden="true">↗</span>
+                          </a>
+                        )}
                       </div>
                     </div>
                     <div style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                       <div className="mono" style={{ fontSize: 11.5, color: DIRECTION_VAR[dir], fontWeight: 600 }}>
-                        {DIRECTION_GLYPH[dir]} {imp ? magnitudeBand(imp.magnitude) : '—'}
+                        {DIRECTION_GLYPH[dir]} {reportImpactBand(r, imp?.magnitude)}
                       </div>
                       <div className="mono upper" style={{ fontSize: 10, letterSpacing: '0.08em', color: 'var(--ink-dim)', marginTop: 3 }}>
                         {DIRECTION_LABEL[dir]}

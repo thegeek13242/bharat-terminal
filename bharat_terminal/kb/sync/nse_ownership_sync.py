@@ -77,6 +77,87 @@ def parse_named_holders(xml: str) -> List[Tuple[str, Optional[float]]]:
     return out
 
 
+# SHP detail-table context prefix → holder category. The context id names the
+# axis a >1% holder was disclosed under (e.g. D_MutualFundsOrUTI_Context15).
+_CATEGORY_PREFIXES = [
+    ("mutualfundsoruti", "mutual_fund"),
+    ("insurancecompanies", "insurance"),
+    ("foreignportfolioinvestor", "fii"),
+    ("otherforeignshareholders", "fii"),
+    ("otherinstitutionsforeign", "fii"),
+    ("financialinstitutionsbanks", "bank_fi"),
+    ("alternateinvestmentfunds", "aif"),
+    ("othernoninstitutions", "individual"),
+    ("individual", "individual"),
+    ("bodiescorporate", "body_corporate"),
+    ("centralgovernment", "government"),
+    ("stategovernment", "government"),
+    ("anyother", "public_other"),
+]
+
+
+def _holder_category(cref: str, is_promoter: bool) -> str:
+    if is_promoter:
+        return "promoter"
+    key = cref.lower()
+    for frag, cat in _CATEGORY_PREFIXES:
+        if frag in key:
+            return cat
+    return "public"
+
+
+def parse_named_holders_full(xml: str) -> List[Dict[str, Any]]:
+    """Per named (>=1%) shareholder: {name, holding_pct, shares, category}.
+
+    Extends parse_named_holders with the SEBI shares tag and a holder category.
+    Reuses the same D_-prefix context join (name @ D_X_Ctx, numerics @ X_Ctx)
+    and the fraction-vs-percent scale derivation. shares is frequently absent in
+    the >1% table (verified across filings) and is left None when so — pct is
+    the reliable field; downstream value = pct% * mcap.
+    """
+    pct = _local_facts(xml, "ShareholdingAsAPercentageOfTotalNumberOfShares")
+    # Per-holder share count. The SEBI taxonomy tag is
+    # NumberOfFullyPaidUpEquityShares (there is NO NumberOfEquitySharesHeld);
+    # fall back to the plain NumberOfShares total.
+    shares = _local_facts(xml, "NumberOfFullyPaidUpEquityShares")
+    shares_alt = _local_facts(xml, "NumberOfShares")
+    promoter_type = _local_facts(xml, "TypeOfPromoterShareholding")
+    total = pct.get("ShareholdingPattern_ContextI")
+    try:
+        scale = 100.0 if (total is not None and float(total) <= 1.5) else 1.0
+    except ValueError:
+        scale = 1.0
+
+    out: List[Dict[str, Any]] = []
+    for cref, name in re.findall(
+            r'<[\w-]+:NameOfTheShareholder contextRef="([^"]+)"[^>]*>([^<]+)</[\w-]+:NameOfTheShareholder>',
+            xml):
+        ctx = cref[2:] if cref.startswith("D_") else cref
+        holding = None
+        raw = pct.get(ctx) or pct.get(cref)
+        if raw is not None:
+            try:
+                holding = round(float(raw) * scale, 2)
+            except ValueError:
+                pass
+        sh = None
+        raw_sh = (shares.get(ctx) or shares.get(cref)
+                  or shares_alt.get(ctx) or shares_alt.get(cref))
+        if raw_sh is not None:
+            try:
+                sh = int(float(raw_sh))
+            except ValueError:
+                pass
+        is_promoter = bool(promoter_type.get(cref) or promoter_type.get(ctx))
+        out.append({
+            "name": name.strip(),
+            "holding_pct": holding,
+            "shares": sh,
+            "category": _holder_category(cref, is_promoter),
+        })
+    return out
+
+
 async def _latest_xbrl_url(symbol, client, limiter) -> Optional[str]:
     async with limiter:
         r = await client.get(SHP_MASTER_API, params={"index": "equities", "symbol": symbol},

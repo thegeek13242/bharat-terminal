@@ -20,6 +20,7 @@ from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import text
 
 from bharat_terminal.api.db import get_session_factory
+from bharat_terminal.kb.marquee import resolve_investor
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/companies", tags=["companies"])
@@ -236,4 +237,129 @@ async def get_linkages(symbol: str):
         "symbol": symbol.upper(),
         "outbound": [dict(r) for r in outbound],
         "inbound":  [dict(r) for r in inbound],
+    }
+
+
+async def _stock_recent_deals(s, sym: str) -> list:
+    """Recent informed (non-excluded) bulk/block deals for a stock."""
+    rows = (await s.execute(
+        text("""
+            SELECT deal_date, exchange, deal_type, client_name,
+                   client_name_norm, marquee_key, side, quantity, value_cr
+            FROM market_deals
+            WHERE symbol = :symbol AND is_excluded = false
+            ORDER BY deal_date DESC, value_cr DESC NULLS LAST
+            LIMIT 20
+        """),
+        {"symbol": sym},
+    )).mappings().all()
+    return [{
+        "deal_date": d["deal_date"].isoformat(),
+        "exchange": d["exchange"], "deal_type": d["deal_type"],
+        "client_name": d["client_name"],
+        "investor_id": (f"marquee:{d['marquee_key']}" if d["marquee_key"]
+                        else f"norm:{d['client_name_norm']}"),
+        "marquee": (resolve_investor(d["client_name"]) or {}).get("display") if d["marquee_key"] else None,
+        "side": d["side"], "quantity": d["quantity"], "value_cr": d["value_cr"],
+    } for d in rows]
+
+
+@router.get("/{symbol}/holders")
+async def get_holders(symbol: str):
+    """Named (>=1%) holders for the latest disclosed quarter with QoQ change.
+
+    Full-joins the latest quarter against the prior one so new positions, exits,
+    adds and trims all surface. Curated marquee holders are labelled + flagged.
+    ₹ value = shares_held x latest close (NULL when shares undisclosed in XBRL).
+    """
+    sym = symbol.upper()
+    factory = get_session_factory()
+    async with factory() as s:
+        quarters = (await s.execute(
+            text("""SELECT DISTINCT quarter_end FROM investor_holdings
+                    WHERE symbol = :symbol ORDER BY quarter_end DESC LIMIT 2"""),
+            {"symbol": sym},
+        )).scalars().all()
+        if not quarters:
+            return {"symbol": sym, "quarter_end": None, "prior_quarter_end": None,
+                    "holders": [], "recent_deals": await _stock_recent_deals(s, sym)}
+        latest = quarters[0]
+        prior = quarters[1] if len(quarters) > 1 else None
+
+        rows = (await s.execute(
+            text("""
+                WITH cur AS (
+                    SELECT holder_name, holder_name_norm, category, holding_pct, shares_held
+                    FROM investor_holdings WHERE symbol = :symbol AND quarter_end = :latest
+                ),
+                prv AS (
+                    SELECT holder_name, holding_pct AS prev_pct, shares_held AS prev_shares
+                    FROM investor_holdings WHERE symbol = :symbol AND quarter_end = :prior
+                ),
+                px AS (
+                    SELECT close FROM price_points WHERE symbol = :symbol
+                    ORDER BY date DESC LIMIT 1
+                )
+                SELECT
+                    COALESCE(cur.holder_name, prv.holder_name) AS holder_name,
+                    cur.holder_name_norm, cur.category,
+                    cur.holding_pct, cur.shares_held,
+                    prv.prev_pct, prv.prev_shares,
+                    (SELECT close FROM px) AS ltp,
+                    (SELECT mcap_cr FROM companies WHERE symbol = :symbol) AS mcap_cr
+                FROM cur
+                FULL OUTER JOIN prv ON cur.holder_name = prv.holder_name
+                ORDER BY COALESCE(cur.holding_pct, 0) DESC, COALESCE(prv.prev_pct, 0) DESC
+            """),
+            {"symbol": sym, "latest": latest, "prior": prior},
+        )).mappings().all()
+
+    holders = []
+    for r in rows:
+        pct, prev = r["holding_pct"], r["prev_pct"]
+        if pct is None:
+            change = "exit"
+            delta = None if prev is None else round(-prev, 2)
+        elif prev is None:
+            change = "new"
+            delta = None
+        else:
+            delta = round(pct - prev, 2)
+            change = "add" if delta > 0.01 else "trim" if delta < -0.01 else "hold"
+        shares, ltp, mcap = r["shares_held"], r["ltp"], r["mcap_cr"]
+        # Prefer disclosed shares × live price; fall back to pct × market cap
+        # (mathematically the same stake value) when shares are undisclosed.
+        if shares and ltp:
+            value_cr = round(float(shares) * float(ltp) / 1e7, 2)
+        elif pct is not None and mcap:
+            value_cr = round(pct / 100.0 * float(mcap), 2)
+        else:
+            value_cr = None
+        m = resolve_investor(r["holder_name"])
+        holders.append({
+            "holder_name": r["holder_name"],
+            "holder_name_norm": r["holder_name_norm"],
+            "category": r["category"],
+            "holding_pct": pct,
+            "prev_pct": prev,
+            "delta_pct": delta,
+            "change": change,
+            "shares_held": shares,
+            "value_cr": value_cr,
+            "marquee": m["display"] if m else None,
+            "marquee_key": m["key"] if m else None,
+            "marquee_type": m["type"] if m else None,
+        })
+
+    # Recent bulk/block deals for this stock (informed flows only) — the faster,
+    # intra-quarter smart-money signal alongside the quarterly holders snapshot.
+    async with factory() as s:
+        recent_deals = await _stock_recent_deals(s, sym)
+
+    return {
+        "symbol": sym,
+        "quarter_end": latest.isoformat(),
+        "prior_quarter_end": prior.isoformat() if prior else None,
+        "holders": holders,
+        "recent_deals": recent_deals,
     }

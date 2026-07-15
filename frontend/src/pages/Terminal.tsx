@@ -69,11 +69,27 @@ function Chip({
   );
 }
 
-function FilterGroup({ label, children }: { label: string; children: React.ReactNode }) {
+/** Toggle a value in a Set-valued filter (immutable — returns a new Set so
+ *  React re-renders). Enables multi-select within a filter category. */
+function toggleInSet<T>(setter: React.Dispatch<React.SetStateAction<Set<T>>>, value: T) {
+  setter((prev) => {
+    const next = new Set(prev);
+    if (next.has(value)) next.delete(value);
+    else next.add(value);
+    return next;
+  });
+}
+
+function FilterGroup({ label, count, children }: { label: string; count?: number; children: React.ReactNode }) {
   return (
     <div style={{ marginBottom: 16 }}>
-      <div className="mono upper" style={{ fontSize: 10, letterSpacing: '0.14em', color: 'var(--ink-dim)', marginBottom: 8 }}>
-        {label}
+      <div className="mono upper" style={{ fontSize: 10, letterSpacing: '0.14em', color: 'var(--ink-dim)', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span>{label}</span>
+        {count ? (
+          <span style={{ color: 'var(--accent)', background: 'var(--accent-dim)', borderRadius: 8, padding: '0 5px', fontSize: 9 }}>
+            {count}
+          </span>
+        ) : null}
       </div>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>{children}</div>
     </div>
@@ -88,10 +104,12 @@ export function Terminal() {
   // explicitly pinned do we auto-follow the newest event.
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [userPinned, setUserPinned] = useState(false);
-  const [sector, setSector] = useState<string | null>(null);
-  const [source, setSource] = useState<string | null>(null);
-  const [direction, setDirection] = useState<Direction | null>(null);
-  const [rating, setRating] = useState<Rating | null>(null);
+  // Multi-select filters: within a category the selected values OR together
+  // (e.g. NSE_FILINGS OR BSE_FILINGS); across categories they AND.
+  const [selSectors, setSelSectors] = useState<Set<string>>(new Set());
+  const [selSources, setSelSources] = useState<Set<string>>(new Set());
+  const [selDirections, setSelDirections] = useState<Set<Direction>>(new Set());
+  const [selRatings, setSelRatings] = useState<Set<Rating>>(new Set());
   const [range, setRange] = useState<RangeKey>('all');
   // Retain the last explicitly-selected report object so the panel keeps
   // showing it even after eviction from `reports`.
@@ -127,29 +145,33 @@ export function Terminal() {
     return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([s]) => s);
   }, [rangeFiltered]);
 
-  // All filters AND together. Direction/rating use the same primaryImpact
-  // derivation the feed row displays, so the filter matches what users see.
+  // Categories AND together; values WITHIN a category OR (set membership).
+  // Direction/rating use the same primaryImpact derivation the feed row
+  // displays, so the filter matches what users see.
   const filtered = useMemo(
     () =>
       rangeFiltered.filter((r) => {
-        if (sector && !(r.affected_sectors ?? []).includes(sector)) return false;
-        if (source && (r.news_item?.source ?? '') !== source) return false;
-        if (direction || rating) {
+        if (selSectors.size && !(r.affected_sectors ?? []).some((s) => selSectors.has(s))) return false;
+        if (selSources.size && !selSources.has(r.news_item?.source ?? '')) return false;
+        if (selDirections.size || selRatings.size) {
           const imp = primaryImpact(r);
-          if (direction && (imp ? sentimentToDirection(imp.sentiment) : 'neutral') !== direction) return false;
-          if (rating && (imp ? magnitudeBand(imp.magnitude) : null) !== rating) return false;
+          if (selDirections.size && !selDirections.has(imp ? sentimentToDirection(imp.sentiment) : 'neutral'))
+            return false;
+          if (selRatings.size && !(imp && selRatings.has(magnitudeBand(imp.magnitude) as Rating))) return false;
         }
         return true;
       }),
-    [rangeFiltered, sector, source, direction, rating],
+    [rangeFiltered, selSectors, selSources, selDirections, selRatings],
   );
 
-  const anyFilter = sector !== null || source !== null || direction !== null || rating !== null;
+  const activeFilterCount =
+    selSectors.size + selSources.size + selDirections.size + selRatings.size;
+  const anyFilter = activeFilterCount > 0;
   const clearFilters = () => {
-    setSector(null);
-    setSource(null);
-    setDirection(null);
-    setRating(null);
+    setSelSectors(new Set());
+    setSelSources(new Set());
+    setSelDirections(new Set());
+    setSelRatings(new Set());
   };
 
   // When a time window is selected, page older events in until the window is
@@ -237,38 +259,38 @@ export function Terminal() {
     <div style={{ height: '100vh', display: 'grid', gridTemplateColumns: 'var(--sidebar-w, 184px) minmax(0,1.04fr) minmax(0,0.96fr)', overflow: 'hidden' }}>
       <NavSidebar counts={{ feed: reports.length, starred: starredCount }} connected={connected}>
         <div style={{ padding: '12px 4px' }}>
-          <FilterGroup label="Sectors">
+          <FilterGroup label="Sectors" count={selSectors.size}>
             {sectors.map((s) => (
-              <Chip key={s} label={s} active={sector === s} onClick={() => setSector(sector === s ? null : s)} />
+              <Chip key={s} label={s} active={selSectors.has(s)} onClick={() => toggleInSet(setSelSectors, s)} />
             ))}
           </FilterGroup>
 
-          <FilterGroup label="Source">
+          <FilterGroup label="Source" count={selSources.size}>
             {sources.map((s) => (
               <Chip
                 key={s}
                 label={s.replace(/_/g, ' ')}
-                active={source === s}
-                onClick={() => setSource(source === s ? null : s)}
+                active={selSources.has(s)}
+                onClick={() => toggleInSet(setSelSources, s)}
               />
             ))}
           </FilterGroup>
 
-          <FilterGroup label="Direction">
+          <FilterGroup label="Direction" count={selDirections.size}>
             {DIRECTION_OPTIONS.map((o) => (
               <Chip
                 key={o.value}
                 label={o.label}
-                active={direction === o.value}
+                active={selDirections.has(o.value)}
                 activeColor={DIRECTION_VAR[o.value]}
-                onClick={() => setDirection(direction === o.value ? null : o.value)}
+                onClick={() => toggleInSet(setSelDirections, o.value)}
               />
             ))}
           </FilterGroup>
 
-          <FilterGroup label="Impact rating">
+          <FilterGroup label="Impact rating" count={selRatings.size}>
             {RATING_OPTIONS.map((v) => (
-              <Chip key={v} label={v} active={rating === v} onClick={() => setRating(rating === v ? null : v)} />
+              <Chip key={v} label={v} active={selRatings.has(v)} onClick={() => toggleInSet(setSelRatings, v)} />
             ))}
           </FilterGroup>
 
@@ -287,7 +309,7 @@ export function Terminal() {
                 border: '1px solid var(--border-hi)',
               }}
             >
-              Clear filters
+              Clear filters · {activeFilterCount}
             </button>
           )}
         </div>

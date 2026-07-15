@@ -134,3 +134,13 @@ export function primaryImpact(report: ImpactReport): CompanyImpact | undefined {
   const pool = firstDegree.length ? firstDegree : impacts;
   return [...pool].sort((a, b) => (b.magnitude ?? 0) - (a.magnitude ?? 0))[0];
 }
+
+/** Event-level impact band for a feed row. A commodity shock only reaches the
+ *  feed after the detector's strict ≥3σ / ≥1.2% gate, so the EVENT is material
+ *  by construction and is flagged HIGH regardless of individual company betas
+ *  (per-company magnitudes stay data-backed). All other reports fall back to
+ *  the top affected company's magnitude. */
+export function reportImpactBand(report: ImpactReport, primaryMagnitude?: number): string {
+  if (report.news_item?.category === 'COMMODITY_SHOCK') return 'HIGH';
+  return primaryMagnitude != null ? magnitudeBand(primaryMagnitude) : DASH;
+}

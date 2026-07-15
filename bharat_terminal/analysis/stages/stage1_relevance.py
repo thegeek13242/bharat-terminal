@@ -272,8 +272,20 @@ def classify_relevance(news_item: NewsItem) -> RelevanceResult:
     """
     start = time.time()
 
-    # ── Short-circuit: exchange filings are always relevant ───────────
+    # ── Short-circuit: exchange filings ───────────────────────────────
     if news_item.source in ("NSE_FILINGS", "BSE_FILINGS"):
+        # Suppress zero-news-value administrative filings (Reg 74(5)/7(3)/40
+        # certificates, trading-window notices, newspaper copies, board-meeting
+        # intimations…) — they spam the feed and cost LLM analysis for nothing.
+        # Narrow + keep-guarded so material filings are never hidden.
+        from bharat_terminal.analysis.filing_policy import is_feed_noise
+        if is_feed_noise(news_item.source, news_item.category, news_item.headline or ""):
+            return RelevanceResult(
+                relevant=False,
+                confidence=1.0,
+                reason="Routine administrative filing — suppressed from feed",
+                latency_ms=(time.time() - start) * 1000,
+            )
         return RelevanceResult(
             relevant=True,
             confidence=1.0,

@@ -273,6 +273,25 @@ class Monitor:
             except Exception as e:
                 logger.error(f"[price_sync] Failed: {e}")
 
+    async def daily_market_deals(self):
+        """Bulk & block deals after the exchanges publish them (~19:30–20:00 IST).
+        Runs at 20:30 IST. --days 3 window catches any late BSE revisions;
+        upserts are idempotent. Market-maker / HFT churn is filtered at write."""
+        from bharat_terminal.kb.sync.market_deals_sync import sync as market_deals_sync
+        while not self._shutdown.is_set():
+            target = self._next_occurrence(hour=20, minute=30)
+            while target.weekday() >= 5:
+                target += timedelta(days=1)
+            logger.info(f"[market_deals] Next run at {target.isoformat()}")
+            if not await self._sleep_until(target):
+                break
+            try:
+                logger.info("[market_deals] Starting bulk/block deal sync")
+                result = await market_deals_sync(days=3, dry_run=False)
+                logger.info(f"[market_deals] Complete: {result}")
+            except Exception as e:
+                logger.error(f"[market_deals] Failed: {e}")
+
     # ── Weekly Safety-Net Sweep ────────────────────────────────────────────
 
     async def weekly_sweep(self):
@@ -552,6 +571,7 @@ class Monitor:
             asyncio.create_task(self.memory_digest_refresh(),  name="memory_digest"),
             asyncio.create_task(self.bse_daily_price_sync(),   name="bse_price_sync"),
             asyncio.create_task(self.weekly_bse_sweep(),       name="bse_weekly_sweep"),
+            asyncio.create_task(self.daily_market_deals(),     name="market_deals"),
         ]
 
         await self._shutdown.wait()

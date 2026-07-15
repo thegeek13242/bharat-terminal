@@ -42,12 +42,16 @@ def _row(r) -> dict:
 async def recent_surprises(
     days: int = Query(7, ge=1, le=90),
     decile: str = Query("tails", pattern="^(tails|all)$"),
+    include_illiquid: bool = Query(False),
     user: dict = Depends(get_current_user),
 ):
     """Recent surprise events. decile=tails (default) returns only the
-    top/bottom decile — the classes the backtest found informative."""
+    top/bottom decile — the classes the backtest found informative. Illiquid
+    names (below the ₹1 Cr/day screen that the study REQUIRED) are excluded by
+    default; the validated edge does not apply to them."""
     session_factory = get_session_factory()
     decile_clause = "AND es.decile IN (1, 10)" if decile == "tails" else ""
+    liq_clause = "" if include_illiquid else "AND es.liquidity_pass"
     async with session_factory() as session:
         rows = (await session.execute(text(f"""
             SELECT es.symbol, c.company_name, es.period_end, es.announced_at,
@@ -59,6 +63,7 @@ async def recent_surprises(
             WHERE es.announced_at >= now() - make_interval(days => :days)
               AND es.sue_composite IS NOT NULL
               {decile_clause}
+              {liq_clause}
             ORDER BY es.announced_at DESC
             LIMIT 200
         """), {"days": days})).all()
