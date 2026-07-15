@@ -104,7 +104,7 @@ def parse_shp_xbrl(xml: str) -> Dict[str, Any]:
 
     # Total shareholder count (the ShareholdingPattern/total context).
     total_holders = None
-    for cid in (f"ShareholdingPattern_ContextI", "Total_ContextI"):
+    for cid in ("ShareholdingPattern_ContextI", "Total_ContextI"):
         if cid in nsh:
             try:
                 total_holders = int(float(nsh[cid]))
@@ -116,7 +116,8 @@ def parse_shp_xbrl(xml: str) -> Dict[str, Any]:
         for c, v in nsh.items():
             if ctx_cat.get(c) in ("ShareholdingPattern", "Total"):
                 try:
-                    total_holders = int(float(v)); break
+                    total_holders = int(float(v))
+                    break
                 except ValueError:
                     pass
     out["num_shareholders"] = total_holders
@@ -128,7 +129,8 @@ def parse_shp_xbrl(xml: str) -> Dict[str, Any]:
     for c, v in pledge.items():
         if ctx_cat.get(c, "").startswith("ShareholdingOfPromoter"):
             try:
-                pl = round(float(v) * scale, 2); break
+                pl = round(float(v) * scale, 2)
+                break
             except ValueError:
                 pass
     out["promoter_pledge_pct"] = pl

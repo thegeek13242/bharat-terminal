@@ -7,10 +7,11 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import AsyncIterator, Awaitable, Callable, Optional
 
-IST = ZoneInfo("Asia/Kolkata")
 from bharat_terminal.types import NewsItem
 from bharat_terminal.ingestion.pdf_fetch import fetch_pdf_text
 from .base import BaseAdapter
+
+IST = ZoneInfo("Asia/Kolkata")
 
 logger = logging.getLogger(__name__)
 
