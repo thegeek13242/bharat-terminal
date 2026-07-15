@@ -26,7 +26,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional
 
 import httpx
-from sqlalchemy import select, text
+from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from bharat_terminal.kb.marquee import norm_investor, resolve_investor
