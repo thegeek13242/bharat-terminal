@@ -631,6 +631,14 @@ def main():
     deals_parser.add_argument("--execute", action="store_true",
                               help="Actually write (default is dry-run)")
 
+    reval_parser = subparsers.add_parser(
+        "results-sentiment-eval",
+        help="Results-filing sentiment vs same-day move, post-rubric-fix vs baseline "
+             "(dry-run by default; --execute persists to sync_log)",
+    )
+    reval_parser.add_argument("--execute", action="store_true",
+                              help="Persist run to sync_log (default: log only)")
+
     args = parser.parse_args()
 
     if args.command == "refresh-dcf":
@@ -690,6 +698,10 @@ def main():
                 if args.symbols else None)
         stats = asyncio.run(ih_backfill(
             quarters=args.quarters, dry_run=not args.execute, symbols=syms))
+        print(stats)
+    elif args.command == "results-sentiment-eval":
+        from bharat_terminal.research.results_sentiment_eval import evaluate
+        stats = asyncio.run(evaluate(dry_run=not args.execute))
         print(stats)
     elif args.command == "market-deals-sync":
         from bharat_terminal.kb.sync.market_deals_sync import sync as deals_sync
