@@ -502,6 +502,42 @@ class Monitor:
                 except Exception as e:
                     logger.error(f"[signal_eval] Failed: {e}", exc_info=True)
 
+    async def daily_results_sentiment_eval(self):
+        """QA check (weekdays): results-filing sentiment vs same-day price move,
+        cumulative since the 2026-07-16 scenario-rubric fix, compared against
+        the frozen pre-fix baseline (SWSOLAR postmortem). Same price-sync gate
+        as daily_signal_eval — the eval reads today's close from price_points,
+        so scoring before the sync lands would silently drop today's filings.
+        Logs the confusion matrix + persists it to sync_log
+        (sync_type='results_sentiment_eval'). Idempotent and re-runnable."""
+        while not self._shutdown.is_set():
+            target = self._next_occurrence(hour=19, minute=5)
+            while target.weekday() >= 5:
+                target += timedelta(days=1)
+            logger.info(f"[results_eval] Next run at {target.isoformat()} "
+                        f"(gated on daily_price_sync completion)")
+            if not await self._sleep_until(target):
+                break
+
+            run_day = target.date()
+            deadline = target + timedelta(minutes=self._SIGNAL_EVAL_MAX_WAIT_MIN)
+            while self._price_sync_date != run_day:
+                if datetime.now(IST) >= deadline:
+                    logger.warning(
+                        f"[results_eval] price sync for {run_day} not confirmed "
+                        f"— skipping tonight (eval is cumulative; tomorrow's "
+                        f"run covers today's filings)")
+                    break
+                if not await self._sleep_seconds(self._SIGNAL_EVAL_POLL_SEC):
+                    return
+            else:
+                try:
+                    from bharat_terminal.research.results_sentiment_eval import evaluate
+                    await evaluate(dry_run=False)
+                    logger.info("[results_eval] Done")
+                except Exception as e:
+                    logger.error(f"[results_eval] Failed: {e}", exc_info=True)
+
     async def memory_index_refresh(self):
         """Keep the derived `memory_items` event index fresh: incremental refresh
         of the recent window (embeds only new/changed events) + a retention prune.
@@ -572,6 +608,7 @@ class Monitor:
             asyncio.create_task(self.bse_daily_price_sync(),   name="bse_price_sync"),
             asyncio.create_task(self.weekly_bse_sweep(),       name="bse_weekly_sweep"),
             asyncio.create_task(self.daily_market_deals(),     name="market_deals"),
+            asyncio.create_task(self.daily_results_sentiment_eval(), name="results_eval"),
         ]
 
         await self._shutdown.wait()

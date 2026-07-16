@@ -6,6 +6,7 @@ import time
 import logging
 import os
 import json
+import re
 import uuid
 import asyncio
 import httpx
@@ -14,6 +15,7 @@ from bharat_terminal import llm
 from bharat_terminal.llm import provider_for_model
 from bharat_terminal.types import NewsItem, CompanyImpact
 from bharat_terminal.analysis.llm_logger import get_llm_logger, LLMCallRecord, compute_cost
+from bharat_terminal.analysis.scenario_rubrics import rubric_for
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +167,12 @@ Revenue Segments: {json.dumps(ctx.get('business', {}).get('revenue_segments', []
         if market_sector_backdrop else ""
     )
 
+    # Scenario-specific rubric for known filing types (results, order wins,
+    # fund raises, rating actions). '' for everything else — see
+    # scenario_rubrics.py for the SWSOLAR postmortem that motivated this.
+    scenario_block = rubric_for(
+        news_item.headline or "", news_item.full_body or news_item.body or "")
+
     return f"""You are a senior equity analyst on the research desk of an Indian PMS/AIF fund. Your impact assessments feed the fund's position decisions: overstating noise wastes risk budget, missing a material event loses alpha. Both errors cost the fund — be exact, quantified, and skeptical.
 
 NEWS:
@@ -204,7 +212,7 @@ ASSESSMENT DISCIPLINE:
    conviction — a company-positive read in a sector under sustained pressure (or
    vice-versa) warrants more caution. Do NOT let the backdrop override a clear,
    material, company-specific signal in the news itself.
-
+{scenario_block}
 Also classify event_scope — does this event transmit beyond the directly named
 companies? Be strict: a litigation settlement, penalty, fraud, management exit,
 or one-off cash outflow at one company is company_specific — it does NOT make
@@ -344,18 +352,25 @@ async def score_impacts(
         # — which then surfaces verbatim in the feed. Enforce the contract:
         # every impact must map back to a provided symbol, else it is dropped.
         provided = {s.upper(): s for s in symbols_to_score}
+
+        def _norm_name(s: str) -> str:
+            """Company-name key tolerant of legal-suffix variants (Ltd vs Limited)."""
+            s = re.sub(r"[.,&'()\-/]", " ", (s or "").upper())
+            s = re.sub(r"\b(LIMITED|LTD|PRIVATE|PVT)\b", " ", s)
+            return re.sub(r"\s+", " ", s).strip()
+
         name_to_symbol = {}
         for sym in symbols_to_score:
             nm = ((contexts.get(sym) or {}).get("identity") or {}).get("company_name", "")
             if nm:
-                name_to_symbol[nm.upper().strip()] = sym
+                name_to_symbol[_norm_name(nm)] = sym
 
         def _canonical(item: dict) -> Optional[str]:
             raw = (item.get("symbol") or "").upper().strip()
             if raw in provided:
                 return provided[raw]
-            nm = (item.get("company_name") or "").upper().strip()
-            if nm in name_to_symbol:
+            nm = _norm_name(item.get("company_name") or "")
+            if nm and nm in name_to_symbol:
                 return name_to_symbol[nm]
             return None
 
@@ -373,6 +388,18 @@ async def score_impacts(
                         if r and r.upper() in provided:
                             canonical = provided[r.upper()]
                             break
+            if canonical is None and len(symbols_to_score) == 1:
+                # Single-symbol contract: the LLM was asked to score exactly one
+                # company, so whatever identifier it echoed (BSE scrip code,
+                # name variant), the impact can only belong to that company.
+                # Seen live 2026-07-16: BSE results filing scored as '535916'
+                # instead of 'ALSL' and silently dropped. Multi-symbol events
+                # keep the strict drop (remapping there would guess).
+                canonical = symbols_to_score[0]
+                logger.info(
+                    f"Stage 3: remapped unmappable symbol {item.get('symbol')!r} "
+                    f"-> {canonical} (single-symbol contract)"
+                )
             if canonical is None:
                 logger.warning(
                     f"Stage 3: dropping impact with unmappable symbol "
