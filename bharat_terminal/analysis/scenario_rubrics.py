@@ -196,6 +196,66 @@ _RUBRICS = {
 }
 
 
+# ── Sector addendum: lenders (banks / NBFCs) ───────────────────────────────
+# The universal results rubric speaks revenue/PBT — a lender's statement has
+# neither (banking-format P&L starts at "Interest earned"; NBFCs at interest
+# income + ECL impairment). Routed off the FILING BODY's own signature, not
+# companies.sector_nse: industry_nse is 100% NULL (known landmine) and
+# sector_nse lumps banks with brokers/insurers/AMCs. Two or more distinct
+# signals required — single hits ("provision") occur in non-lender text.
+
+_LENDER_SIGNALS_RE = re.compile(
+    r"interest\s+earned|net\s+interest\s+(?:income|margin)|\bnii\b|\bnim\b"
+    r"|gross\s+n\.?p\.?a\.?|\bgnpa\b|net\s+n\.?p\.?a\.?|\bnnpa\b"
+    r"|provision\s+coverage|\bcasa\b|credit\s+cost|slippages?"
+    r"|impairment\s+(?:of|on)\s+financial\s+instruments|expected\s+credit\s+loss"
+    r"|assets?\s+under\s+management|\baum\b|capital\s+adequacy|\bcrar\b"
+    r"|cost\s+of\s+(?:funds|borrowings?)|disbursements?",
+    re.I)
+
+
+def is_lender_results(body: str) -> bool:
+    """True when the filing body carries >=2 distinct lender-statement signals."""
+    hits = {m.group(0).lower().strip() for m in
+            _LENDER_SIGNALS_RE.finditer((body or "")[:40000])}
+    return len(hits) >= 2
+
+
+_LENDER_ADDENDUM = """\
+This results statement is a LENDER's (bank / NBFC) — the industrial
+revenue/PBT framing above does NOT apply. Use the lender mapping:
+a. CORE LINES: Net Interest Income (interest earned - interest expended),
+   pre-provision operating profit (PPOP), provisions / credit cost, GNPA and
+   NNPA percentages with slippages, advances & deposits growth (for NBFCs:
+   AUM, disbursements, cost of funds, spread). State NII and PPOP YoY changes
+   explicitly — an assessment that omits them is invalid.
+b. DIRECTION comes from NII/PPOP trajectory AND asset-quality direction
+   TOGETHER. Bottom-line PAT alone is never direction for a lender.
+c. LENDER ONE-OFF CLASS: provision write-backs/releases, recoveries from
+   written-off accounts, treasury/MTM gains, stake-sale gains, DTA
+   remeasurement. PAT growth with flat/declining PPOP, or with credit cost
+   far below the company's own run-rate, is below-the-line — say so; it does
+   not make the quarter positive.
+d. MARGIN ANALOG: state the NIM trajectory in bps (NBFCs: spread / cost of
+   funds). NIM compression while profits grow must be stated and caps
+   magnitude at 3, exactly like the industrial margin rule.
+e. ASSET QUALITY TRUMPS GROWTH: rising slippages/GNPA or falling provision
+   coverage alongside profit growth must be stated and tempers direction;
+   improving asset quality with steady PPOP upgrades it.
+f. FUNDING: deposit growth materially lagging advances growth (or rising
+   cost of funds for NBFCs) is a constraint worth one sentence."""
+
+
+def lender_addendum(scenario_key: str, body: str) -> str:
+    """Lender sector addendum, '' unless a results scenario with lender body."""
+    if scenario_key != "financial_results" or not is_lender_results(body):
+        return ""
+    return (
+        "\nSECTOR ADDENDUM — LENDER RESULTS (overrides the industrial results "
+        "mapping where they conflict):\n" + _LENDER_ADDENDUM + "\n"
+    )
+
+
 def rubric_for(headline: str, body: str = "") -> str:
     """Full prompt block for a detected scenario, or '' when none applies."""
     key = detect_scenario(headline, body)

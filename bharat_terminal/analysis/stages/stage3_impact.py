@@ -15,7 +15,9 @@ from bharat_terminal import llm
 from bharat_terminal.llm import provider_for_model
 from bharat_terminal.types import NewsItem, CompanyImpact
 from bharat_terminal.analysis.llm_logger import get_llm_logger, LLMCallRecord, compute_cost
-from bharat_terminal.analysis.scenario_rubrics import rubric_for
+from bharat_terminal.analysis.scenario_rubrics import (
+    detect_scenario, lender_addendum, rubric_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -168,10 +170,14 @@ Revenue Segments: {json.dumps(ctx.get('business', {}).get('revenue_segments', []
     )
 
     # Scenario-specific rubric for known filing types (results, order wins,
-    # fund raises, rating actions). '' for everything else — see
-    # scenario_rubrics.py for the SWSOLAR postmortem that motivated this.
-    scenario_block = rubric_for(
-        news_item.headline or "", news_item.full_body or news_item.body or "")
+    # fund raises, rating actions), plus the lender sector addendum when the
+    # results body carries a bank/NBFC statement signature. '' otherwise —
+    # see scenario_rubrics.py for the SWSOLAR postmortem that motivated this.
+    _body = news_item.full_body or news_item.body or ""
+    _scenario_key = detect_scenario(news_item.headline or "", _body)
+    scenario_block = rubric_for(news_item.headline or "", _body)
+    if _scenario_key:
+        scenario_block += lender_addendum(_scenario_key, _body)
 
     return f"""You are a senior equity analyst on the research desk of an Indian PMS/AIF fund. Your impact assessments feed the fund's position decisions: overstating noise wastes risk budget, missing a material event loses alpha. Both errors cost the fund — be exact, quantified, and skeptical.
 

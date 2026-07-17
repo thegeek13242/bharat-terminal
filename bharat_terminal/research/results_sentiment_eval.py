@@ -75,9 +75,10 @@ def _has_fingerprint(explanation: str) -> bool:
     """
     e = (explanation or "").lower()
     standard = "revenue" in e and ("pbt" in e or "profit before" in e)
-    bank = (("net interest income" in e or "nii" in e)
-            and ("net profit" in e or "profit after tax" in e or "pat" in e))
-    return standard or bank
+    lender = (("net interest income" in e or "nii" in e or "interest income" in e)
+              and ("net profit" in e or "profit after tax" in e or "pat" in e
+                   or "pbt" in e))
+    return standard or lender
 
 
 async def evaluate(dry_run: bool = True) -> Dict[str, Any]:
