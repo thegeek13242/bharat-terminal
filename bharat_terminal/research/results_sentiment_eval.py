@@ -2,12 +2,12 @@
 
 Motivation (SWSOLAR postmortem 2026-07-16): quarterly-results filings were
 classified by headline-metric cherry-picking, so "positive" calls landed on
-quarters the market sold hard. Baseline measured over 2026-07-02 → 2026-07-16
-(pre-fix, market-hours results filings, hop-0 impacts):
+quarters the market sold hard. Frozen pre-fix baseline (2026-07-02 →
+2026-07-16 09:12 UTC, filings ≤14:00 IST, corrected events excluded):
 
-    positive n=21  avg +1.41%  hard-wrong (fell >1.5%) 5/21 = 23.8%
-    neutral  n=32  avg -0.33%
-    negative n=3   avg -3.17%
+    positive n=21  avg +0.38%  hard-wrong (fell >1.5%) 8/21 = 38.1%
+    neutral  n=36  avg -0.23%
+    negative n=2   avg -3.90%
 
 The scenario-rubric fix (analysis/scenario_rubrics.py) deployed 2026-07-16
 ~09:12 UTC targets exactly this. This module re-measures the same confusion
@@ -17,9 +17,11 @@ run in sync_log (sync_type='results_sentiment_eval', metadata = full stats).
 Methodology — identical to the baseline study, deliberately:
   - Results filings only, detected with the SAME detect_scenario() the rubric
     uses (headline + body P&L gate), so we measure what the fix targets.
-  - Market-hours filings only (09:15–15:00 IST): the same-day close is the
-    reaction. After-hours filings are excluded (their reaction is next-day;
-    mixing horizons would break comparability with the baseline).
+  - Filings ≤14:00 IST only, guaranteeing ≥90 minutes of post-filing tape.
+    Late-day filings get the full day's move attributed to them, which
+    misattributes pre-filing intraday moves (NAVKARCORP 2026-07-17 fell 10.7%
+    BEFORE its 14:55 filing and rose after — the old 15:00 window scored it
+    hard-wrong). After-hours filings excluded entirely (reaction is next-day).
   - Move = close(D) vs previous trading close, from price_points (NSE+BSE).
   - hop-0 impacts only. hard-wrong: positive & move < -1.5%, or
     negative & move > +1.5%.
@@ -48,15 +50,34 @@ logger = logging.getLogger(__name__)
 # str: asyncpg rejects string params against timestamptz columns.)
 FIX_DEPLOYED_AT = datetime(2026, 7, 16, 9, 12, tzinfo=timezone.utc)
 
-# Frozen pre-fix baseline (2026-07-02 → 2026-07-16, same methodology).
+# Frozen pre-fix baseline — recomputed 2026-07-17 under the current
+# methodology (filings ≤14:00 IST so ≥90min of post-filing tape; the 18
+# manually-corrected 2026-07-16 events excluded, since their stored rows no
+# longer reflect pre-fix pipeline output). The original 15:00-window baseline
+# was 23.8% hard-wrong; the cleaner window shows pre-fix positives were worse
+# (38.1%) once late-day misattribution is removed.
 BASELINE = {
-    "window": "2026-07-02..2026-07-16 (pre-fix)",
-    "positive": {"n": 21, "avg_day_pct": 1.41, "hard_wrong": 5, "hard_wrong_pct": 23.8},
-    "neutral": {"n": 32, "avg_day_pct": -0.33},
-    "negative": {"n": 3, "avg_day_pct": -3.17, "hard_wrong": 0},
+    "window": "2026-07-02..2026-07-16T09:12 (pre-fix, <=14:00 IST, corrections excluded)",
+    "positive": {"n": 21, "avg_day_pct": 0.38, "hard_wrong": 8, "hard_wrong_pct": 38.1},
+    "neutral": {"n": 36, "avg_day_pct": -0.23},
+    "negative": {"n": 2, "avg_day_pct": -3.90, "hard_wrong": 0},
 }
 
 HARD_WRONG_PCT = 1.5  # |same-day move| beyond which a wrong-sign call is "hard wrong"
+
+
+def _has_fingerprint(explanation: str) -> bool:
+    """Did the explanation follow the rubric's core-line discipline?
+
+    Standard companies: revenue AND PBT stated. Banks/NBFC-lenders legitimately
+    report NII + net profit instead of revenue/PBT (FEDERALBNK 2026-07-17 was a
+    false negative under the revenue-only check), so accept that vocabulary too.
+    """
+    e = (explanation or "").lower()
+    standard = "revenue" in e and ("pbt" in e or "profit before" in e)
+    bank = (("net interest income" in e or "nii" in e)
+            and ("net profit" in e or "profit after tax" in e or "pat" in e))
+    return standard or bank
 
 
 async def evaluate(dry_run: bool = True) -> Dict[str, Any]:
@@ -80,7 +101,7 @@ async def evaluate(dry_run: bool = True) -> Dict[str, Any]:
               WHERE ir.created_at > :fix_at
                 AND (imp->>'hop_distance')::int = 0
                 AND (n.timestamp_utc AT TIME ZONE 'Asia/Kolkata')::time
-                    BETWEEN '09:15' AND '15:00'
+                    BETWEEN '09:15' AND '14:00'
             )
             SELECT ev.*, p1.close AS close_d,
                    (SELECT p0.close FROM price_points p0
@@ -102,11 +123,7 @@ async def evaluate(dry_run: bool = True) -> Dict[str, Any]:
             "symbol": r["symbol"], "date": str(r["ist_date"]),
             "sentiment": r["sentiment"], "magnitude": r["magnitude"],
             "move_pct": round(move, 2),
-            # rubric fingerprint: explanation states both revenue and PBT
-            "fingerprint": bool(r["explanation"]
-                                and "revenue" in r["explanation"].lower()
-                                and ("pbt" in r["explanation"].lower()
-                                     or "profit before" in r["explanation"].lower())),
+            "fingerprint": _has_fingerprint(r["explanation"]),
         })
 
     stats: Dict[str, Any] = {
