@@ -65,7 +65,7 @@ async def get_transcript(
     session_factory = get_session_factory()
     async with session_factory() as session:
         r = (await session.execute(text(f"""
-            SELECT {_LIST_COLS}, ct.full_text
+            SELECT {_LIST_COLS}, ct.full_text, ct.structure, ct.structure_status
             FROM concall_transcripts ct
             LEFT JOIN companies c ON c.symbol = ct.symbol
             WHERE ct.id = :tid
@@ -74,6 +74,11 @@ async def get_transcript(
         raise HTTPException(status_code=404, detail="transcript_not_found")
     out = _list_row(r)
     out["full_text"] = r.full_text
+    # Annotation layer (speakers/segments/highlights/pages) — offsets into
+    # full_text, verbatim-anchored at build time. Null when structuring is
+    # pending/failed; the client falls back to the raw reader.
+    out["structure"] = r.structure
+    out["structure_status"] = r.structure_status
     return out
 
 

@@ -84,9 +84,12 @@ _PENDING_SQL = """
 """
 
 
-def extract_full_text(data: bytes) -> tuple[Optional[str], int]:
+def extract_full_text(data: bytes) -> tuple[Optional[str], int, list[dict]]:
     """Extract the COMPLETE text of a PDF — every page, no char cap.
-    Returns (text | None, page_count). Runs CPU-bound; call via to_thread."""
+    Returns (text | None, page_count, page_offsets) where page_offsets maps
+    each page to its (start, end) character span in the joined text. Pages
+    are cleaned individually so the offsets stay valid.
+    Runs CPU-bound; call via to_thread."""
     import pypdf
 
     reader = pypdf.PdfReader(io.BytesIO(data))
@@ -94,15 +97,27 @@ def extract_full_text(data: bytes) -> tuple[Optional[str], int]:
         try:
             reader.decrypt("")  # exchange PDFs are often empty-password encrypted
         except Exception:
-            return None, 0
-    pages = []
+            return None, 0, []
+    parts: list[str] = []
     for page in reader.pages:  # deliberately uncapped
         try:
-            pages.append(page.extract_text() or "")
+            parts.append(_clean(page.extract_text() or ""))
         except Exception:
-            pages.append("")  # keep page alignment; never drop content silently
-    text_ = _clean("\n\n".join(pages))
-    return (text_ or None), len(reader.pages)
+            parts.append("")  # keep page alignment; never drop content silently
+    offsets: list[dict] = []
+    pos = 0
+    joined: list[str] = []
+    for n, part in enumerate(parts, start=1):
+        if joined:
+            joined.append("\n\n")
+            pos += 2
+        offsets.append({"n": n, "start": pos, "end": pos + len(part)})
+        joined.append(part)
+        pos += len(part)
+    # No trailing .strip(): it would shift every stored page offset. Pages are
+    # individually stripped by _clean already.
+    text_ = "".join(joined)
+    return (text_ or None), len(reader.pages), offsets
 
 
 def _first_symbol(symbols_mentioned) -> Optional[str]:
@@ -151,6 +166,7 @@ async def sync_transcripts(
     limit: Optional[int] = None,
     dry_run: bool = False,
     retry_failed: bool = False,
+    structure: bool = True,
 ) -> dict:
     from bharat_terminal.kb.sync.utils import create_async_session
 
@@ -180,9 +196,11 @@ async def sync_transcripts(
             data, status = await _fetch_pdf(http, r.url)
             full_text = None
             pages = chars = None
+            page_offsets: list[dict] = []
             if data is not None:
                 try:
-                    full_text, pages = await asyncio.to_thread(extract_full_text, data)
+                    full_text, pages, page_offsets = await asyncio.to_thread(
+                        extract_full_text, data)
                 except Exception as e:
                     logger.warning(f"[transcripts] extract error {symbol}: {e}")
                     full_text = None
@@ -220,10 +238,108 @@ async def sync_transcripts(
                     f"[transcripts] {symbol}: {pages}p / {chars:,} chars "
                     f"({i + 1}/{len(rows)})"
                 )
+                if structure:
+                    ok = await _structure_row(
+                        SessionFactory, r.id, symbol, full_text, page_offsets)
+                    stats["structured" if ok else "structure_failed"] = (
+                        stats.get("structured" if ok else "structure_failed", 0) + 1)
             await asyncio.sleep(POLITENESS_DELAY_S)
 
     logger.info(f"[transcripts] DONE: {stats}")
     return stats
+
+
+async def _structure_row(SessionFactory, news_id: str, symbol: str,
+                         full_text: str, page_offsets: list[dict]) -> bool:
+    """Run LLM structuring for one stored transcript; fail-soft. The
+    transcript row stays available (parse_status ok) regardless — structure
+    is an annotation layer, never a gate on availability."""
+    from bharat_terminal.kb.sync.transcript_structure import (
+        STRUCTURE_MODEL, structure_transcript,
+    )
+
+    try:
+        struct = await structure_transcript(full_text, page_offsets, symbol)
+    except Exception as e:
+        logger.warning(f"[transcripts] structuring error {symbol}: {e}")
+        struct = None
+    async with SessionFactory() as db:
+        await db.execute(text("""
+            UPDATE concall_transcripts
+            SET structure = :struct, structure_status = :st,
+                structure_model = :model, structured_at = now(),
+                updated_at = now()
+            WHERE news_id = :nid
+        """), {"struct": json.dumps(struct) if struct else None,
+               "st": "ok" if struct else "failed",
+               "model": STRUCTURE_MODEL, "nid": news_id})
+        await db.commit()
+    return struct is not None
+
+
+async def restructure(limit: Optional[int] = None) -> dict:
+    """Re-fetch + re-extract + structure rows that have no good structure yet
+    (backfill for pre-phase-2 rows and --retry for failed structuring).
+    Re-extraction also (re)computes page offsets, updating full_text to the
+    offset-consistent per-page extraction — content identical, still unclipped."""
+    from bharat_terminal.kb.sync.utils import create_async_session
+
+    stats = {"candidates": 0, "structured": 0, "structure_failed": 0,
+             "fetch_failed": 0}
+    SessionFactory = create_async_session()
+    async with SessionFactory() as db:
+        rows = (await db.execute(text(f"""
+            SELECT news_id, symbol, pdf_url FROM concall_transcripts
+            WHERE parse_status = 'ok' AND structure_status != 'ok'
+            ORDER BY announced_at DESC
+            {f"LIMIT {int(limit)}" if limit else ""}
+        """))).all()
+    stats["candidates"] = len(rows)
+    logger.info(f"[transcripts] restructure: {len(rows)} candidate(s)")
+
+    async with httpx.AsyncClient() as http:
+        for r in rows:
+            data, _ = await _fetch_pdf(http, r.pdf_url)
+            if data is None:
+                stats["fetch_failed"] += 1
+                continue
+            full_text, pages, page_offsets = await asyncio.to_thread(
+                extract_full_text, data)
+            if not full_text:
+                stats["fetch_failed"] += 1
+                continue
+            async with SessionFactory() as db:
+                await db.execute(text("""
+                    UPDATE concall_transcripts
+                    SET full_text = :t, page_count = :p, char_count = :c,
+                        updated_at = now()
+                    WHERE news_id = :nid
+                """), {"t": full_text, "p": pages, "c": len(full_text),
+                       "nid": r.news_id})
+                await db.commit()
+            ok = await _structure_row(SessionFactory, r.news_id, r.symbol,
+                                      full_text, page_offsets)
+            stats["structured" if ok else "structure_failed"] += 1
+            await asyncio.sleep(POLITENESS_DELAY_S)
+
+    logger.info(f"[transcripts] restructure DONE: {stats}")
+    return stats
+
+
+async def watch(interval_s: int) -> None:
+    """Real-time mode: poll for new transcript announcements forever.
+    Ingestion lands the announcement (with the PDF URL) within minutes of the
+    exchange filing; this loop makes the transcript + structure available
+    end-to-end without manual runs."""
+    logger.info(f"[transcripts] watch mode, every {interval_s}s")
+    while True:
+        try:
+            stats = await sync_transcripts()
+            if stats.get("pending"):
+                logger.info(f"[transcripts] watch cycle: {stats}")
+        except Exception as e:
+            logger.error(f"[transcripts] watch cycle failed (continuing): {e}")
+        await asyncio.sleep(interval_s)
 
 
 def main() -> None:
@@ -236,9 +352,25 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--retry-failed", action="store_true",
                     help="Re-attempt announcements whose last parse failed.")
+    ap.add_argument("--no-structure", action="store_true",
+                    help="Fetch/store only; skip the LLM annotation pass.")
+    ap.add_argument("--restructure", action="store_true",
+                    help="(Re)run structuring for stored transcripts lacking it.")
+    ap.add_argument("--watch", action="store_true",
+                    help="Run forever, syncing new transcripts as they arrive.")
+    ap.add_argument("--interval", type=int,
+                    default=int(os.getenv("TRANSCRIPT_WATCH_INTERVAL_S", "180")))
     args = ap.parse_args()
+
+    if args.watch:
+        asyncio.run(watch(args.interval))
+        return
+    if args.restructure:
+        stats = asyncio.run(restructure(limit=args.limit))
+        sys.exit(0 if stats.get("fetch_failed", 0) == 0 else 1)
     stats = asyncio.run(sync_transcripts(
-        limit=args.limit, dry_run=args.dry_run, retry_failed=args.retry_failed))
+        limit=args.limit, dry_run=args.dry_run, retry_failed=args.retry_failed,
+        structure=not args.no_structure))
     sys.exit(0 if stats.get("fetch_failed", 0) == 0 else 1)
 
 

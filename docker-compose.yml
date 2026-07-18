@@ -268,6 +268,27 @@ services:
     restart: unless-stopped
     logging: *default-logging
 
+  transcript-watcher:
+    # Real-time concall transcript pipeline (A1): polls for new transcript
+    # announcements (ingestion lands them within minutes of the exchange
+    # filing), fetches the COMPLETE PDF text (never clipped), and runs the
+    # LLM annotation pass (speakers/highlights). See kb/sync/transcript_sync.py.
+    build:
+      context: .
+      dockerfile: docker/kb/Dockerfile
+    container_name: bharat-transcript-watcher
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kb-migrate:
+        condition: service_completed_successfully
+    env_file: [".env"]
+    environment:
+      <<: *common-env
+    command: ["python", "-m", "bharat_terminal.kb.sync.transcript_sync", "--watch"]
+    restart: unless-stopped
+    logging: *default-logging
+
   analysis-worker:
     build:
       context: .
