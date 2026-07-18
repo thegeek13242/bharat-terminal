@@ -20,3 +20,4 @@ websocket-client==1.8.0
 # [vertex] pulls google-auth for ADC. Digest defaults to a Gemini model, so only
 # google-genai is needed (a Claude digest model would also need anthropic[vertex]).
 google-genai>=0.3,<2
+pypdf==6.11.0            # concall transcript extraction (transcript_sync — full text, no clipping)

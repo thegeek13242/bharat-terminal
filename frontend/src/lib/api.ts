@@ -101,6 +101,15 @@ export const api = {
       `/earnings-surprises/recent?days=${days}&decile=${decile}`,
     ),
 
+  // ── Concall transcripts (complete text, never clipped) ───────────────
+  getRecentTranscripts: (days = 30, limit = 100) =>
+    request<{ items: any[]; count: number }>(`/transcripts/recent?days=${days}&limit=${limit}`),
+
+  getTranscriptsForSymbol: (symbol: string) =>
+    request<{ items: any[]; count: number }>(`/transcripts/${encodeURIComponent(symbol)}`),
+
+  getTranscript: (id: number) => request<any>(`/transcripts/id/${id}`),
+
   // ── Notable holders / marquee investors ──────────────────────────────
   getHolders: (symbol: string) =>
     request<{ symbol: string; quarter_end: string | null; prior_quarter_end: string | null; holders: any[] }>(

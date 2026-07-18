@@ -11,6 +11,7 @@ const NAV: { to: string; label: string; key: string }[] = [
   { to: '/watchlist', label: 'Watchlist', key: 'watchlist' },
   { to: '/starred', label: 'Starred', key: 'starred' },
   { to: '/surprises', label: 'Surprises', key: 'surprises' },
+  { to: '/transcripts', label: 'Transcripts', key: 'transcripts' },
   { to: '/investors', label: 'Smart Money', key: 'investors' },
   { to: '/universe', label: 'Universe', key: 'universe' },
 ];
