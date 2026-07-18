@@ -69,6 +69,30 @@ async def health():
     return {"status": "ok", "service": "kb-api", "timestamp": datetime.utcnow().isoformat()}
 
 
+@app.get("/ltp")
+async def get_ltp_batch(symbols: str):
+    """Batch live equity LTPs via the shared Angel One session — one upstream
+    getMarketData call for all symbols. No EOD fallback: absent/stale session
+    returns an empty quotes map and the caller keeps its own pending state.
+
+    LICENSING (do not widen): Angel One data is licensed for the account
+    holder's own use. Reachable by customers ONLY through api-gateway routes
+    that gate on require_internal_user / INTERNAL_RESEARCH_EMAILS — never
+    expose publicly and never fold output into broadcast/stored reports.
+    """
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()][:16]
+    if not syms:
+        return {"quotes": {}, "source": "angelone_live",
+                "asof": datetime.utcnow().isoformat()}
+    live = await get_current_ltps(syms, redis_client)
+    return {
+        "quotes": {s: {"ltp": i["ltp"], "prev_close": i.get("prev_close")}
+                   for s, i in live.items() if i.get("ltp")},
+        "source": "angelone_live",
+        "asof": datetime.utcnow().isoformat(),
+    }
+
+
 @app.get("/ltp/{symbol}")
 async def get_ltp(symbol: str):
     """Live NSE equity LTP via the shared Angel One session, falling back to

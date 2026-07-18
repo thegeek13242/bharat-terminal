@@ -15,6 +15,11 @@ interface SurpriseRow {
   decile: number | null;
   liquidity_pass: boolean | null;
   study_version: string;
+  reaction_return_pct: number | null;
+  reaction_basis: 'close' | 'live' | null;
+  reaction_asof: string | null;
+  reaction_date: string | null;
+  price_diverged: boolean | null;
 }
 
 interface HistoricalContext {
@@ -62,6 +67,13 @@ export function Surprises() {
             bottom decile of the trailing year, computed against each company's own
             8-quarter history.
           </div>
+          <div style={{ marginTop: 10, fontSize: 11.5, lineHeight: 1.55, color: 'var(--ink-mute)' }}>
+            Reaction is the close-to-close price move over the first trading session
+            after the announcement. An amber flag marks results where price moved 2%
+            or more against the surprise direction — the market read the same numbers
+            differently. Until that first close lands, the reaction is pending: the
+            market has not voted yet.
+          </div>
           <div style={{ marginTop: 14, display: 'flex', gap: 4 }}>
             {[7, 14, 30, 90].map((d) => (
               <button
@@ -99,7 +111,7 @@ export function Surprises() {
           className="mono upper"
           style={{
             display: 'grid',
-            gridTemplateColumns: '110px 1fr 90px 80px 90px 90px 80px',
+            gridTemplateColumns: '110px 1fr 90px 80px 110px 90px 90px 80px',
             gap: 12,
             padding: '7px 20px',
             background: 'var(--bg-elev)',
@@ -113,6 +125,7 @@ export function Surprises() {
           <span>Company</span>
           <span>Quarter</span>
           <span style={{ textAlign: 'right' }}>Decile</span>
+          <span style={{ textAlign: 'right' }}>Reaction</span>
           <span style={{ textAlign: 'right' }}>SUE eps</span>
           <span style={{ textAlign: 'right' }}>SUE rev</span>
           <span style={{ textAlign: 'right' }}>Liquid</span>
@@ -132,12 +145,13 @@ export function Surprises() {
           )}
           {items.map((r) => {
             const top = r.decile === 10;
+            const reaction = r.reaction_return_pct;
             return (
               <div
                 key={`${r.symbol}-${r.period_end}`}
                 style={{
                   display: 'grid',
-                  gridTemplateColumns: '110px 1fr 90px 80px 90px 90px 80px',
+                  gridTemplateColumns: '110px 1fr 90px 80px 110px 90px 90px 80px',
                   gap: 12,
                   padding: '9px 20px',
                   borderBottom: '1px solid var(--border)',
@@ -165,6 +179,63 @@ export function Surprises() {
                   }}
                 >
                   {top ? 'Top 10%' : 'Bottom 10%'}
+                </span>
+                <span style={{ textAlign: 'right' }}>
+                  {reaction == null ? (
+                    <span
+                      className="mono"
+                      title="No completed trading session since the announcement — the market's verdict is not in the data yet."
+                      style={{ fontSize: 11, color: 'var(--ink-mute)' }}
+                    >
+                      pending
+                    </span>
+                  ) : (
+                    <>
+                      <span
+                        className="mono"
+                        style={{
+                          color: reaction >= 0 ? 'var(--pos, #7fb069)' : 'var(--neg, #c68476)',
+                        }}
+                      >
+                        {`${reaction > 0 ? '+' : ''}${reaction.toFixed(1)}%`}
+                      </span>
+                      {r.reaction_basis === 'live' && (
+                        <span
+                          className="mono upper"
+                          title="Provisional — measured against the current session's last traded price; hardens at the close."
+                          style={{
+                            marginLeft: 6,
+                            fontSize: 9,
+                            letterSpacing: '0.1em',
+                            color: 'var(--accent, #3fa192)',
+                          }}
+                        >
+                          live
+                        </span>
+                      )}
+                    </>
+                  )}
+                  {r.price_diverged && (
+                    <span
+                      className="mono upper"
+                      title={
+                        r.reaction_basis === 'live'
+                          ? 'Provisional — the current session is running ≥2% against the surprise direction'
+                          : 'First-session price move ran ≥2% against the surprise direction'
+                      }
+                      style={{
+                        marginLeft: 6,
+                        fontSize: 9,
+                        letterSpacing: '0.1em',
+                        padding: '1px 5px',
+                        borderRadius: 3,
+                        color: 'var(--warn, #c2a05e)',
+                        border: `1px ${r.reaction_basis === 'live' ? 'dashed' : 'solid'} var(--warn, #c2a05e)`,
+                      }}
+                    >
+                      diverged
+                    </span>
+                  )}
                 </span>
                 <span className="mono" style={{ textAlign: 'right', color: 'var(--ink-2)' }}>{fmt(r.sue_eps)}</span>
                 <span className="mono" style={{ textAlign: 'right', color: 'var(--ink-2)' }}>{fmt(r.sue_revenue)}</span>
