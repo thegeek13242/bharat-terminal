@@ -48,9 +48,10 @@ export const api = {
 
   logout: () => request<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
 
-  getImpactFeed: (limit = 50, relevantOnly = true, before?: string) => {
+  getImpactFeed: (limit = 50, relevantOnly = true, before?: string, symbols?: string[]) => {
     const qs = new URLSearchParams({ limit: String(limit), relevant_only: String(relevantOnly) });
     if (before) qs.set('before', before);
+    if (symbols && symbols.length > 0) qs.set('symbols', symbols.join(','));
     return request<{ items: any[]; count: number }>(`/impact/feed?${qs.toString()}`);
   },
 

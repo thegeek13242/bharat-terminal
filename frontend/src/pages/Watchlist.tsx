@@ -17,9 +17,13 @@ interface Tracked {
 }
 
 export function Watchlist() {
-  const { reports, wsStatus, send, lastMessage, loadOlder, loadingOlder, hasMore } = useImpactFeed();
-  const { isStarred, toggleStar, count: starredCount } = useStarred();
   const [tracked, setTracked] = useState<Tracked[]>([]);
+  // Server-filtered feed: hydration/pagination fetch this watchlist's own
+  // history instead of intersecting with the global recency window.
+  const trackedSymbols = useMemo(() => tracked.map((t) => t.symbol.toUpperCase()), [tracked]);
+  const { reports, wsStatus, send, lastMessage, loadOlder, loadingOlder, hasMore } =
+    useImpactFeed(trackedSymbols);
+  const { isStarred, toggleStar, count: starredCount } = useStarred();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [userPinned, setUserPinned] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);

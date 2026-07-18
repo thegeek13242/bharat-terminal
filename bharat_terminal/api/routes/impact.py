@@ -51,6 +51,14 @@ async def get_impact_feed(
         description="ISO8601 timestamp; return only reports with created_at strictly "
         "before this value (keyset pagination for loading older events).",
     ),
+    symbols: str | None = Query(
+        default=None,
+        description="Comma-separated NSE/BSE symbols; return only reports whose "
+        "company_impacts mention at least one of them (any hop distance / "
+        "magnitude — materiality filtering stays client-side where the "
+        "per-symbol thresholds live). Lets a small watchlist reach past the "
+        "global recency window instead of intersecting with it.",
+    ),
 ):
     """
     Return the most recent ImpactReports with embedded news_item.
@@ -73,15 +81,26 @@ async def get_impact_feed(
                 status_code=422, detail=f"Invalid `before` timestamp: {before!r}"
             )
 
+    symbol_list: list[str] = []
+    if symbols:
+        symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()][:50]
+
     # ── 1. PostgreSQL (authoritative, ordered) ─────────────────────────────
     try:
         session_factory = get_session_factory()
         async with session_factory() as session:
             relevant_filter = "AND ir.relevant = true" if relevant_only else ""
             before_filter = "AND ir.created_at < :before" if before_dt else ""
+            symbol_filter = ""
             params: dict = {"limit": limit}
             if before_dt:
                 params["before"] = before_dt
+            if symbol_list:
+                symbol_filter = """AND EXISTS (
+                    SELECT 1 FROM jsonb_array_elements(ir.company_impacts) ci
+                    WHERE upper(ci->>'symbol') = ANY(:symbols)
+                )"""
+                params["symbols"] = symbol_list
             rows = await session.execute(
                 text(f"""
                     SELECT
@@ -92,7 +111,7 @@ async def get_impact_feed(
                         ni.url, ni.ingest_latency_ms, ni.category, ni.symbols_mentioned
                     FROM impact_reports ir
                     LEFT JOIN news_items ni ON ni.id = ir.news_id
-                    WHERE 1=1 {relevant_filter} {before_filter}
+                    WHERE 1=1 {relevant_filter} {before_filter} {symbol_filter}
                     ORDER BY ir.created_at DESC
                     LIMIT :limit
                 """),
@@ -130,6 +149,11 @@ async def get_impact_feed(
                     # Keyset cursor: string ISO compare matches the DB ordering
                     # (created_at is stored/serialised as ISO8601).
                     if before_iso and (r.get("created_at") or "") >= before_iso:
+                        continue
+                    if symbol_list and not any(
+                        (ci.get("symbol") or "").upper() in symbol_list
+                        for ci in (r.get("company_impacts") or [])
+                    ):
                         continue
                     reports.append(_strip_internal(r))
                 except json.JSONDecodeError:

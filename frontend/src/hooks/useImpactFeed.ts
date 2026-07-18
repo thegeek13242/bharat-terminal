@@ -21,25 +21,43 @@ function mergeReports(a: ImpactReport[], b: ImpactReport[]): ImpactReport[] {
   return [...byId.values()].sort((x, y) => (y.created_at ?? '').localeCompare(x.created_at ?? ''));
 }
 
-export function useImpactFeed() {
+/**
+ * @param symbols When given, hydration and pagination are SERVER-filtered to
+ * reports mentioning these symbols — a small watchlist reaches back through
+ * its own history instead of intersecting with the global recency window
+ * (3 tracked symbols × newest-100-global was empty almost always). Undefined
+ * = unfiltered global feed (Terminal). Empty array = nothing tracked yet;
+ * hydration is skipped. Live WS events are unfiltered either way — callers
+ * apply their own materiality rules.
+ */
+export function useImpactFeed(symbols?: string[]) {
   const { status, lastMessage, send } = useWebSocket(WS_URL);
   const [reports, setReports] = useState<ImpactReport[]>([]);
   const [loadingOlder, setLoadingOlder] = useState(false);
   // hasMore stays true until an older page comes back short of a full page.
   const [hasMore, setHasMore] = useState(true);
   const prevStatus = useRef<typeof status | null>(null);
+  // Stable identity for the effect: re-hydrate when the tracked set changes.
+  const symbolsKey = symbols === undefined ? undefined : [...symbols].sort().join(',');
+  const prevSymbolsKey = useRef<string | undefined>(undefined);
 
-  // Hydrate from REST on mount AND on every reconnect. Events that arrived
-  // during a disconnect are otherwise lost forever (WS only pushes live).
-  // Merge+dedupe means re-hydration is safe to run repeatedly.
+  // Hydrate from REST on mount, on every reconnect, AND when the symbol
+  // filter changes. Events that arrived during a disconnect are otherwise
+  // lost forever (WS only pushes live). Merge+dedupe means re-hydration is
+  // safe to run repeatedly.
   useEffect(() => {
     const justConnected = status === 'connected' && prevStatus.current !== 'connected';
+    const symbolsChanged = symbolsKey !== prevSymbolsKey.current;
     prevStatus.current = status;
-    if (!justConnected) return;
+    prevSymbolsKey.current = symbolsKey;
+    if (status !== 'connected' || (!justConnected && !symbolsChanged)) return;
+    if (symbolsKey === '') return; // filtered mode with nothing tracked yet
+
+    if (symbolsChanged) setHasMore(true);
 
     // Hydrate relevant-only to match what the WS broadcasts (relevant events).
     api
-      .getImpactFeed(HYDRATE_LIMIT, true)
+      .getImpactFeed(HYDRATE_LIMIT, true, undefined, symbols)
       .then(({ items }) => {
         const valid = items.filter(isValid);
         if (valid.length > 0) {
@@ -49,7 +67,8 @@ export function useImpactFeed() {
       .catch((err) => {
         console.warn('Impact feed hydration failed:', err);
       });
-  }, [status]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, symbolsKey]);
 
   // Prepend live WebSocket events.
   useEffect(() => {
@@ -68,7 +87,7 @@ export function useImpactFeed() {
     if (!oldest) return;
     setLoadingOlder(true);
     try {
-      const { items } = await api.getImpactFeed(PAGE_LIMIT, true, oldest);
+      const { items } = await api.getImpactFeed(PAGE_LIMIT, true, oldest, symbols);
       const valid = items.filter(isValid);
       if (valid.length < PAGE_LIMIT) setHasMore(false);
       if (valid.length > 0) setReports((prev) => mergeReports(prev, valid));
@@ -77,7 +96,8 @@ export function useImpactFeed() {
     } finally {
       setLoadingOlder(false);
     }
-  }, [reports, loadingOlder, hasMore]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reports, loadingOlder, hasMore, symbolsKey]);
 
   return { reports, wsStatus: status, send, lastMessage, loadOlder, loadingOlder, hasMore };
 }
