@@ -326,6 +326,174 @@ async def restructure(limit: Optional[int] = None) -> dict:
     return stats
 
 
+_NSE_ANN_API = "https://www.nseindia.com/api/corporate-announcements"
+_NSE_API_HEADERS = {
+    **_PDF_HEADERS,
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
+}
+NSE_API_DELAY_S = float(os.getenv("TRANSCRIPT_NSE_API_DELAY_S", "1.5"))
+
+
+async def _nse_announcements(client: httpx.AsyncClient, symbol: str,
+                             d_from: str, d_to: str) -> Optional[list]:
+    """Historical per-symbol announcements from the NSE API (dates DD-MM-YYYY).
+    None on failure — the caller skips and the row is retried on a later run."""
+    try:
+        resp = await client.get(
+            _NSE_ANN_API,
+            params={"index": "equities", "symbol": symbol,
+                    "from_date": d_from, "to_date": d_to},
+            headers=_NSE_API_HEADERS, timeout=25.0, follow_redirects=True)
+        if resp.status_code != 200:
+            logger.warning(f"[transcripts] NSE API {resp.status_code} for {symbol}")
+            return None
+        body = resp.text.strip()
+        if not body.startswith(("[", "{")):
+            logger.warning(f"[transcripts] NSE API non-JSON for {symbol}: {body[:60]!r}")
+            return None
+        data = resp.json()
+        return data if isinstance(data, list) else data.get("data") or []
+    except Exception as e:
+        logger.warning(f"[transcripts] NSE API error for {symbol}: {e}")
+        return None
+
+
+def _pick_announcement(anns: list, headline: str) -> Optional[str]:
+    """Choose the transcript announcement's PDF URL. Exact attchmntText match
+    first (our stored headline IS NSE's attchmntText), then any transcript-
+    subject row with a PDF attachment."""
+    def pdf(a) -> Optional[str]:
+        f = (a.get("attchmntFile") or "").strip()
+        return f if ".pdf" in f.lower() else None
+
+    h = " ".join((headline or "").split()).lower()
+    for a in anns:
+        if " ".join((a.get("attchmntText") or "").split()).lower() == h and pdf(a):
+            return pdf(a)
+    for a in anns:
+        blob = f"{a.get('attchmntText') or ''} {a.get('desc') or ''}".lower()
+        if "transcript" in blob and pdf(a):
+            return pdf(a)
+    return None
+
+
+async def backfill_nse(limit: Optional[int] = None, structure: bool = False) -> dict:
+    """Recover PDF URLs for pre-2026-07-04 transcript announcements (stored
+    with quote-page URLs before ingestion captured attachments) via the NSE
+    announcements API, then fetch + store the complete transcripts.
+
+    Availability-first: structuring defaults OFF here (rows land as
+    structure_status=pending); run --restructure afterwards for annotations.
+    Rows whose URL cannot be recovered are stored as parse_status
+    'url_not_found' so re-runs don't re-query NSE for them (--retry-failed
+    re-attempts explicitly)."""
+    from datetime import timedelta
+    from bharat_terminal.kb.sync.utils import create_async_session
+
+    stats = {"pending": 0, "ok": 0, "url_not_found": 0, "fetch_failed": 0,
+             "extract_failed": 0, "not_pdf": 0, "no_symbol": 0,
+             "api_failed": 0, "total_chars": 0}
+    SessionFactory = create_async_session()
+    async with SessionFactory() as db:
+        rows = (await db.execute(text(f"""
+            SELECT ni.id, ni.source, ni.headline, ni.url, ni.timestamp_utc,
+                   ni.symbols_mentioned
+            FROM news_items ni
+            WHERE ni.headline ILIKE '%transcript%'
+              AND ni.source = 'NSE_FILINGS'
+              AND ni.url NOT ILIKE '%.pdf%'
+              AND NOT EXISTS (SELECT 1 FROM concall_transcripts ct
+                              WHERE ct.news_id = ni.id)
+            ORDER BY ni.timestamp_utc ASC
+            {f"LIMIT {int(limit)}" if limit else ""}
+        """))).all()
+    stats["pending"] = len(rows)
+    logger.info(f"[transcripts] backfill: {len(rows)} announcement(s) to recover")
+
+    ann_cache: dict = {}
+    async with httpx.AsyncClient() as http:
+        for i, r in enumerate(rows):
+            symbol = _first_symbol(r.symbols_mentioned)
+            if not symbol:
+                stats["no_symbol"] += 1
+                continue
+
+            # ±2-day window around the announcement, cached per (symbol, day).
+            day = r.timestamp_utc.date()
+            key = (symbol, day)
+            if key not in ann_cache:
+                d_from = (day - timedelta(days=2)).strftime("%d-%m-%Y")
+                d_to = (day + timedelta(days=2)).strftime("%d-%m-%Y")
+                ann_cache[key] = await _nse_announcements(http, symbol, d_from, d_to)
+                await asyncio.sleep(NSE_API_DELAY_S)
+            anns = ann_cache[key]
+            if anns is None:
+                stats["api_failed"] += 1
+                continue
+
+            pdf_url = _pick_announcement(anns, r.headline)
+            if not pdf_url:
+                stats["url_not_found"] += 1
+                await _store_stub(SessionFactory, r, symbol, "url_not_found")
+                continue
+
+            data, status = await _fetch_pdf(http, pdf_url)
+            full_text = None
+            pages = chars = None
+            page_offsets: list[dict] = []
+            if data is not None:
+                try:
+                    full_text, pages, page_offsets = await asyncio.to_thread(
+                        extract_full_text, data)
+                except Exception as e:
+                    logger.warning(f"[transcripts] extract error {symbol}: {e}")
+                status = "ok" if full_text else (status or "extract_failed")
+                chars = len(full_text) if full_text else None
+
+            async with SessionFactory() as db:
+                await db.execute(text("""
+                    INSERT INTO concall_transcripts
+                        (symbol, news_id, source, headline, announced_at,
+                         pdf_url, pdf_bytes, page_count, char_count,
+                         full_text, parse_status)
+                    VALUES (:sym, :nid, :src, :head, :ann, :url, :bytes,
+                            :pages, :chars, :text, :status)
+                    ON CONFLICT (news_id) DO NOTHING
+                """), {"sym": symbol, "nid": r.id, "src": r.source,
+                       "head": r.headline, "ann": r.timestamp_utc,
+                       "url": pdf_url, "bytes": len(data) if data else None,
+                       "pages": pages, "chars": chars, "text": full_text,
+                       "status": status})
+                await db.commit()
+
+            stats[status] = stats.get(status, 0) + 1
+            if status == "ok":
+                stats["total_chars"] += chars or 0
+                logger.info(f"[transcripts] backfill {symbol}: {pages}p / "
+                            f"{chars:,} chars ({i + 1}/{len(rows)})")
+                if structure:
+                    await _structure_row(SessionFactory, r.id, symbol,
+                                         full_text, page_offsets)
+            await asyncio.sleep(POLITENESS_DELAY_S)
+
+    logger.info(f"[transcripts] backfill DONE: {stats}")
+    return stats
+
+
+async def _store_stub(SessionFactory, r, symbol: str, status: str) -> None:
+    async with SessionFactory() as db:
+        await db.execute(text("""
+            INSERT INTO concall_transcripts
+                (symbol, news_id, source, headline, announced_at, pdf_url,
+                 parse_status)
+            VALUES (:sym, :nid, :src, :head, :ann, :url, :status)
+            ON CONFLICT (news_id) DO NOTHING
+        """), {"sym": symbol, "nid": r.id, "src": r.source, "head": r.headline,
+               "ann": r.timestamp_utc, "url": r.url, "status": status})
+        await db.commit()
+
+
 async def watch(interval_s: int) -> None:
     """Real-time mode: poll for new transcript announcements forever.
     Ingestion lands the announcement (with the PDF URL) within minutes of the
@@ -356,6 +524,10 @@ def main() -> None:
                     help="Fetch/store only; skip the LLM annotation pass.")
     ap.add_argument("--restructure", action="store_true",
                     help="(Re)run structuring for stored transcripts lacking it.")
+    ap.add_argument("--backfill-nse", action="store_true",
+                    help="Recover pre-Jul-04 attachment URLs via the NSE "
+                         "announcements API and ingest those transcripts "
+                         "(no structuring; run --restructure after).")
     ap.add_argument("--watch", action="store_true",
                     help="Run forever, syncing new transcripts as they arrive.")
     ap.add_argument("--interval", type=int,
@@ -365,6 +537,10 @@ def main() -> None:
     if args.watch:
         asyncio.run(watch(args.interval))
         return
+    if args.backfill_nse:
+        # Availability-first: never structure inline here; --restructure after.
+        stats = asyncio.run(backfill_nse(limit=args.limit, structure=False))
+        sys.exit(0 if stats.get("api_failed", 0) == 0 else 1)
     if args.restructure:
         stats = asyncio.run(restructure(limit=args.limit))
         sys.exit(0 if stats.get("fetch_failed", 0) == 0 else 1)
