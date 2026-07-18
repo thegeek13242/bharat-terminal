@@ -283,17 +283,22 @@ async def restructure(limit: Optional[int] = None) -> dict:
     Re-extraction also (re)computes page offsets, updating full_text to the
     offset-consistent per-page extraction — content identical, still unclipped."""
     from bharat_terminal.kb.sync.utils import create_async_session
+    from bharat_terminal.kb.sync.transcript_structure import STRUCTURE_VERSION
 
     stats = {"candidates": 0, "structured": 0, "structure_failed": 0,
              "fetch_failed": 0}
     SessionFactory = create_async_session()
     async with SessionFactory() as db:
+        # Candidates: never structured, failed, or built by an older prompt
+        # vintage — bumping STRUCTURE_VERSION re-annotates the corpus.
         rows = (await db.execute(text(f"""
             SELECT news_id, symbol, pdf_url FROM concall_transcripts
-            WHERE parse_status = 'ok' AND structure_status != 'ok'
+            WHERE parse_status = 'ok'
+              AND (structure_status != 'ok'
+                   OR coalesce((structure->>'version')::int, 1) < :ver)
             ORDER BY announced_at DESC
             {f"LIMIT {int(limit)}" if limit else ""}
-        """))).all()
+        """), {"ver": STRUCTURE_VERSION})).all()
     stats["candidates"] = len(rows)
     logger.info(f"[transcripts] restructure: {len(rows)} candidate(s)")
 

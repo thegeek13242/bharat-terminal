@@ -285,6 +285,9 @@ services:
     env_file: [".env"]
     environment:
       <<: *common-env
+      # v2 structuring prompts generate past the 120s default on long calls
+      # (thinking models); transcript jobs are batch, not latency-bound.
+      LLM_CALL_TIMEOUT_S: "300"
     command: ["python", "-m", "bharat_terminal.kb.sync.transcript_sync", "--watch"]
     restart: unless-stopped
     logging: *default-logging

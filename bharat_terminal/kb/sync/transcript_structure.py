@@ -24,6 +24,12 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 STRUCTURE_MODEL = os.getenv("TRANSCRIPT_STRUCTURE_MODEL", "gemini-3.5-flash")
+# Annotation-vintage marker, stamped into every structure and used by
+# --restructure to pick up rows built by an older prompt. Bump when the
+# prompt/schema changes in a way that warrants corpus-wide re-annotation.
+# v2 (2026-07-19, from the INDIANB/DRREDDY audits): prepared-remarks metric
+# coverage, media role for journalists, self-contained excerpts.
+STRUCTURE_VERSION = 2
 # Model output cap, NOT expected usage: Gemini thinking models spend the same
 # max_tokens budget on internal thoughts BEFORE the JSON — a 32K budget was
 # observed truncating GIPCL's answer at 4K visible tokens. Give the full cap.
@@ -42,7 +48,7 @@ no markdown fences) with this shape:
 {{
   "speakers": [
     {{"name": "<as printed in the transcript>",
-      "role": "management" | "analyst" | "moderator",
+      "role": "management" | "analyst" | "moderator" | "media",
       "title": "<e.g. CFO>" | null,
       "firm": "<company or brokerage>" | null}}
   ],
@@ -68,7 +74,17 @@ Hard rules:
   discarded downstream, so precision matters more than coverage.
 - turns[] must list EVERY speaking turn in order, including the moderator's.
 - 10-25 highlights for a typical call; only genuinely decision-relevant ones.
-- Attribute speakers to management vs analyst from the call's own intro."""
+- When the call has prepared remarks with a results scorecard, cover its
+  headline metrics (profit/revenue growth, margins/NIM, asset quality,
+  ratios vs guidance) with 3-5 highlights — analysts skim for these first.
+- Prefer excerpts that are self-contained: they are also shown OUT of
+  context, so include the subject being discussed. A bare "Probably, yes."
+  is useless as a highlight even when the underlying answer matters —
+  extend the excerpt to carry its own meaning, or highlight the passage
+  where the subject is explicit.
+- Attribute speakers to management vs analyst from the call's own intro.
+  Use "media" for journalists from news organisations (e.g. Reuters,
+  Bloomberg, CNBC), not "analyst"."""
 
 _WS = re.compile(r"\s+")
 
@@ -163,7 +179,7 @@ def derive_qa_start(segments: List[Dict[str, Any]]) -> Optional[int]:
     for g in segments:
         if g["role"] == "management":
             seen_mgmt = True
-        elif seen_mgmt and g["role"] == "analyst":
+        elif seen_mgmt and g["role"] in ("analyst", "media"):
             return g["start"]
     return None
 
@@ -180,7 +196,7 @@ def build_structure(full_text: str, annotations: Dict[str, Any],
     role_by_norm: Dict[str, str] = {}
     for s in annotations.get("speakers") or []:
         name = (s.get("name") or "").strip()
-        role = s.get("role") if s.get("role") in ("management", "analyst", "moderator") else None
+        role = s.get("role") if s.get("role") in ("management", "analyst", "moderator", "media") else None
         if not name or not role:
             continue
         key = _norm_name(name)
@@ -249,7 +265,7 @@ def build_structure(full_text: str, annotations: Dict[str, Any],
     stats["highlights_anchored"] = len(pruned)
 
     return {
-        "version": 1,
+        "version": STRUCTURE_VERSION,
         "pages": pages or [],
         "speakers": speakers,
         "segments": segments,

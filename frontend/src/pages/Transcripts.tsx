@@ -15,16 +15,18 @@ interface TranscriptMeta {
   parse_status: string;
 }
 
+type SpeakerRole = 'management' | 'analyst' | 'moderator' | 'media';
+
 interface Speaker {
   name: string;
-  role: 'management' | 'analyst' | 'moderator';
+  role: SpeakerRole;
   title: string | null;
   firm: string | null;
 }
 
 interface Segment {
   speaker: string;
-  role: 'management' | 'analyst' | 'moderator';
+  role: SpeakerRole;
   start: number;
   end: number;
 }
@@ -62,10 +64,11 @@ const CATEGORY_COLOR: Record<string, string> = {
   demand: '#7f9cc6',
 };
 
-const ROLE_STYLE: Record<Segment['role'], { label: string; color: string }> = {
+const ROLE_STYLE: Record<SpeakerRole, { label: string; color: string }> = {
   management: { label: 'MGMT', color: 'var(--accent, #3fa192)' },
   analyst: { label: 'ANALYST', color: 'var(--warn, #c2a05e)' },
   moderator: { label: 'MODERATOR', color: 'var(--ink-mute)' },
+  media: { label: 'MEDIA', color: '#7f9cc6' },
 };
 
 function RoleChip({ role }: { role: Segment['role'] }) {
