@@ -129,6 +129,45 @@ def _parse_llm_json(raw: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+_HONORIFIC_RE = re.compile(r"^(?:shri|smt|mr|ms|mrs|dr|prof)\.?\s+", re.I)
+
+
+def _norm_name(name: str) -> str:
+    """Speaker-name key for role resolution: drop parentheticals, comma
+    suffixes ("<name>, MD & CEO"), honorifics, case and extra spaces. The
+    2026-07-19 INDIANB audit found the model's roster saying "Shri Binod
+    Kumar" while its turns said "Shri Binod Kumar, MD & CEO" — an exact-match
+    lookup silently mis-roled the bank's MD as an analyst."""
+    n = re.sub(r"\(.*?\)", " ", name or "")
+    n = n.split(",")[0]
+    n = _HONORIFIC_RE.sub("", n.strip())
+    return _WS.sub(" ", n).strip().lower()
+
+
+def resolve_role(speaker: str, role_by_norm: Dict[str, str]) -> str:
+    """Normalized exact match, then containment either way, else analyst."""
+    key = _norm_name(speaker)
+    if key in role_by_norm:
+        return role_by_norm[key]
+    for k, role in role_by_norm.items():
+        if k and key and (key.startswith(k) or k.startswith(key)):
+            return role
+    return "analyst"
+
+
+def derive_qa_start(segments: List[Dict[str, Any]]) -> Optional[int]:
+    """Fallback Q&A boundary: the first analyst turn after management has
+    spoken. Host-led calls often have no explicit "we now begin Q&A" line
+    (the anchor the model is asked for), but the structural boundary exists."""
+    seen_mgmt = False
+    for g in segments:
+        if g["role"] == "management":
+            seen_mgmt = True
+        elif seen_mgmt and g["role"] == "analyst":
+            return g["start"]
+    return None
+
+
 def build_structure(full_text: str, annotations: Dict[str, Any],
                     pages: Optional[List[Dict[str, int]]]) -> Dict[str, Any]:
     """Anchor the model's annotations into `full_text`. Drops what fails.
@@ -138,15 +177,18 @@ def build_structure(full_text: str, annotations: Dict[str, Any],
              "highlights_total": 0, "highlights_anchored": 0}
 
     speakers = []
-    role_by_name: Dict[str, str] = {}
+    role_by_norm: Dict[str, str] = {}
     for s in annotations.get("speakers") or []:
         name = (s.get("name") or "").strip()
         role = s.get("role") if s.get("role") in ("management", "analyst", "moderator") else None
         if not name or not role:
             continue
+        key = _norm_name(name)
+        if key in role_by_norm:
+            continue  # dedupe roster (model sometimes lists a host twice)
         speakers.append({"name": name, "role": role,
                          "title": s.get("title"), "firm": s.get("firm")})
-        role_by_name[name.lower()] = role
+        role_by_norm[key] = role
 
     # Sequential turn anchoring: each anchor is searched from the previous
     # turn's position, so repeated phrases resolve to the right occurrence.
@@ -170,7 +212,7 @@ def build_structure(full_text: str, annotations: Dict[str, Any],
             continue
         segments.append({
             "speaker": t["speaker"],
-            "role": role_by_name.get(t["speaker"].lower(), "analyst"),
+            "role": resolve_role(t["speaker"], role_by_norm),
             "start": t["start"],
             "end": len(full_text),  # provisional; fixed below
         })
@@ -183,6 +225,8 @@ def build_structure(full_text: str, annotations: Dict[str, Any],
         span = _find_span(norm, offmap, annotations["qa_anchor"])
         if span:
             qa_start = span[0]
+    if qa_start is None:
+        qa_start = derive_qa_start(segments)
 
     raw_highlights = annotations.get("highlights") or []
     stats["highlights_total"] = len(raw_highlights)
