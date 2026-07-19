@@ -14,6 +14,7 @@ interface TranscriptMeta {
   page_count: number | null;
   char_count: number | null;
   parse_status: string;
+  period_label: string | null;
 }
 
 type SpeakerRole = 'management' | 'analyst' | 'moderator' | 'media';
@@ -231,6 +232,12 @@ export function Transcripts() {
   const [searching, setSearching] = useState(false);
   const [pendingScroll, setPendingScroll] = useState<number | null>(null);
   const [urlParams, setUrlParams] = useSearchParams();
+  const [quarters, setQuarters] = useState<{ quarter: string; count: number }[]>([]);
+  const [selectedQuarter, setSelectedQuarter] = useState<string | null>(null);
+
+  useEffect(() => {
+    api.getTranscriptQuarters().then(({ items }) => setQuarters(items)).catch(() => {});
+  }, []);
 
   // Deep link (?open=<transcript_id>&at=<char_offset>) — used by research-chat
   // citations and anything else that wants to land inside a specific call.
@@ -267,7 +274,7 @@ export function Transcripts() {
     let cancelled = false;
     setLoading(true);
     api
-      .getRecentTranscripts(60, 200)
+      .getRecentTranscripts(60, 200, selectedQuarter ?? undefined)
       .then((res) => {
         if (cancelled) return;
         setItems(res.items);
@@ -278,7 +285,7 @@ export function Transcripts() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [selectedQuarter]);
 
   useEffect(() => {
     if (selectedId == null) return;
@@ -416,6 +423,29 @@ export function Transcripts() {
             </button>
           )}
         </div>
+        {quarters.length > 0 && (
+          <div style={{ padding: '7px 16px', borderBottom: '1px solid var(--border)', display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+            {[null, ...quarters.map((q) => q.quarter)].map((q) => {
+              const active = selectedQuarter === q;
+              const count = q === null ? null : quarters.find((x) => x.quarter === q)?.count;
+              return (
+                <button
+                  key={q ?? 'all'}
+                  onClick={() => setSelectedQuarter(q)}
+                  className="mono"
+                  style={{
+                    fontSize: 10, padding: '3px 8px', borderRadius: 4, cursor: 'pointer',
+                    background: active ? 'var(--accent-dim)' : 'transparent',
+                    border: `1px solid ${active ? 'var(--accent-line, var(--accent))' : 'var(--border)'}`,
+                    color: active ? 'var(--accent)' : 'var(--ink-dim)',
+                  }}
+                >
+                  {q ?? 'All'}{count != null ? ` · ${count}` : ''}
+                </button>
+              );
+            })}
+          </div>
+        )}
         <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
           {searching && <div className="mono" style={{ padding: 20, fontSize: 11, color: 'var(--ink-mute)' }}>Searching…</div>}
           {!searching && searchResults !== null && searchResults.length === 0 && (
@@ -476,6 +506,7 @@ export function Transcripts() {
                 </div>
                 <div className="mono" style={{ marginTop: 3, fontSize: 10, color: 'var(--ink-dim)' }}>
                   {t.announced_at ? `${dayLabel(t.announced_at)} ${clockTime(t.announced_at)}` : '—'}
+                  {t.period_label && ` · ${t.period_label}`}
                   {t.page_count != null && ` · ${t.page_count}p`}
                 </div>
               </div>
@@ -493,7 +524,7 @@ export function Transcripts() {
               <span className="mono" style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>{doc.symbol}</span>
               <span style={{ fontSize: 12, color: 'var(--ink-mute)' }}>{doc.company_name}</span>
               <span className="mono" style={{ fontSize: 10, color: 'var(--ink-dim)' }}>
-                {doc.page_count != null ? `${doc.page_count} pages` : ''}
+                {doc.period_label ? `${doc.period_label} · ` : ''}{doc.page_count != null ? `${doc.page_count} pages` : ''}
               </span>
               <a
                 href={doc.pdf_url}

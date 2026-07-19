@@ -102,8 +102,14 @@ export const api = {
     ),
 
   // ── Concall transcripts (complete text, never clipped) ───────────────
-  getRecentTranscripts: (days = 30, limit = 100) =>
-    request<{ items: any[]; count: number }>(`/transcripts/recent?days=${days}&limit=${limit}`),
+  getRecentTranscripts: (days = 30, limit = 100, quarter?: string) => {
+    const qs = new URLSearchParams({ days: String(days), limit: String(limit) });
+    if (quarter) qs.set('quarter', quarter);
+    return request<{ items: any[]; count: number }>(`/transcripts/recent?${qs.toString()}`);
+  },
+
+  getTranscriptQuarters: () =>
+    request<{ items: { quarter: string; count: number }[] }>('/transcripts/quarters'),
 
   getTranscriptsForSymbol: (symbol: string) =>
     request<{ items: any[]; count: number }>(`/transcripts/${encodeURIComponent(symbol)}`),

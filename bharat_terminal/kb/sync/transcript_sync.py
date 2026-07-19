@@ -125,6 +125,51 @@ def extract_full_text(data: bytes) -> tuple[Optional[str], int, list[dict]]:
     return (text_ or None), len(reader.pages), offsets
 
 
+# ── Discussed-quarter derivation ───────────────────────────────────────────
+# The quarter a call DISCUSSES ≠ the filing date's quarter (Q4 calls straggle
+# into July). ~90% of transcripts name it on the title page — extract
+# deterministically, fall back to the earnings-season date rule.
+
+_PERIOD_SCAN_CHARS = 3000
+_Q_FYRANGE_RE = re.compile(  # "Q4 – FY 2025-26" / "Q4 FY 25-26" → trailing year wins
+    r"\bQ\s*([1-4])\s*[–\-&,]?\s*(?:and\s+)?FY\s*[-'’ ]?\s*(?:20)?(\d{2})\s*[-–]\s*(?:20)?(\d{2})", re.I)
+_Q_FY_RE = re.compile(
+    r"\b(?:Q|Quarter)\s*([1-4])\s*[–\-&,]?\s*(?:and\s+)?FY\s*[-'’ ]?\s*(?:20)?(\d{2})\b", re.I)
+_ENDED_RE = re.compile(
+    r"(?:quarter|period|3 months?)[^.\n]{0,60}?ended[^.\n]{0,20}?"
+    r"(March|June|September|December)[^.\n]{0,15}?(\d{4})", re.I)
+_ENDED_Q = {"march": (4, 0), "june": (1, 1), "september": (2, 1), "december": (3, 1)}
+
+
+def derive_period(full_text: Optional[str], announced_at) -> Optional[str]:
+    """Label like 'Q1FY27' for the quarter the call discusses. Pure function."""
+    head = (full_text or "")[:_PERIOD_SCAN_CHARS]
+    # (pos, priority, quarter, fy2digit): the FY-range pattern outranks the
+    # simple one at the same position — "Q4 – FY 2025-26" must yield 26, but
+    # the simple pattern also matches there capturing "25".
+    candidates: list[tuple[int, int, int, int]] = []
+    for m in _Q_FYRANGE_RE.finditer(head):
+        candidates.append((m.start(), 0, int(m.group(1)), int(m.group(3))))
+    for m in _Q_FY_RE.finditer(head):
+        candidates.append((m.start(), 1, int(m.group(1)), int(m.group(2))))
+    for m in _ENDED_RE.finditer(head):
+        q, fy_bump = _ENDED_Q[m.group(1).lower()]
+        candidates.append((m.start(), 1, q, (int(m.group(2)) % 100) + fy_bump))
+    for _, _, q, fy in sorted(candidates):
+        if 20 <= fy <= 35:  # sanity window rejects garbled years
+            return f"Q{q}FY{fy}"
+    if announced_at is None:
+        return None
+    mth, yr = announced_at.month, announced_at.year % 100
+    if 4 <= mth <= 6:
+        return f"Q4FY{yr}"
+    if 7 <= mth <= 9:
+        return f"Q1FY{yr + 1}"
+    if 10 <= mth <= 12:
+        return f"Q2FY{yr + 1}"
+    return f"Q3FY{yr}"
+
+
 def _first_symbol(symbols_mentioned) -> Optional[str]:
     v = symbols_mentioned
     if isinstance(v, str):
@@ -220,10 +265,11 @@ async def sync_transcripts(
                     INSERT INTO concall_transcripts
                         (symbol, news_id, source, headline, announced_at,
                          pdf_url, pdf_bytes, page_count, char_count,
-                         full_text, parse_status)
+                         full_text, parse_status, period_label)
                     VALUES (:sym, :nid, :src, :head, :ann, :url, :bytes,
-                            :pages, :chars, :text, :status)
+                            :pages, :chars, :text, :status, :period)
                     ON CONFLICT (news_id) DO UPDATE SET
+                        period_label = EXCLUDED.period_label,
                         full_text = EXCLUDED.full_text,
                         pdf_bytes = EXCLUDED.pdf_bytes,
                         page_count = EXCLUDED.page_count,
@@ -236,6 +282,7 @@ async def sync_transcripts(
                     "bytes": len(data) if data else None, "pages": pages,
                     "chars": chars, "text": full_text,
                     "status": status,
+                    "period": derive_period(full_text, r.timestamp_utc),
                 })
                 await db.commit()
 
@@ -636,15 +683,16 @@ async def backfill_nse(limit: Optional[int] = None, structure: bool = False) -> 
                     INSERT INTO concall_transcripts
                         (symbol, news_id, source, headline, announced_at,
                          pdf_url, pdf_bytes, page_count, char_count,
-                         full_text, parse_status)
+                         full_text, parse_status, period_label)
                     VALUES (:sym, :nid, :src, :head, :ann, :url, :bytes,
-                            :pages, :chars, :text, :status)
+                            :pages, :chars, :text, :status, :period)
                     ON CONFLICT (news_id) DO NOTHING
                 """), {"sym": symbol, "nid": r.id, "src": r.source,
                        "head": r.headline, "ann": r.timestamp_utc,
                        "url": pdf_url, "bytes": len(data) if data else None,
                        "pages": pages, "chars": chars, "text": full_text,
-                       "status": status})
+                       "status": status,
+                       "period": derive_period(full_text, r.timestamp_utc)})
                 await db.commit()
 
             stats[status] = stats.get(status, 0) + 1
@@ -812,10 +860,12 @@ async def _try_ingest_recovered(SessionFactory, row, pdf_bytes: bytes,
             SET full_text = :t, pdf_url = :url, pdf_bytes = :b,
                 page_count = :p, char_count = :c, parse_status = 'ok',
                 structure = NULL, structure_status = 'pending',
-                updated_at = now()
+                period_label = :period, updated_at = now()
             WHERE news_id = :nid
         """), {"t": full_text, "url": source_url, "b": len(pdf_bytes),
-               "p": pages, "c": len(full_text), "nid": row.news_id})
+               "p": pages, "c": len(full_text), "nid": row.news_id,
+               "period": derive_period(full_text,
+                                       getattr(row, "announced_at", None))})
         await db.commit()
     ok = await _structure_row(SessionFactory, row.news_id, row.symbol,
                               full_text, page_offsets)
@@ -837,7 +887,7 @@ async def recover_links(limit: Optional[int] = None) -> dict:
     SessionFactory = create_async_session()
     async with SessionFactory() as db:
         rows = (await db.execute(text(f"""
-            SELECT news_id, symbol, pdf_url, full_text
+            SELECT news_id, symbol, pdf_url, full_text, announced_at
             FROM concall_transcripts WHERE parse_status = 'not_transcript'
             ORDER BY symbol
             {f"LIMIT {int(limit)}" if limit else ""}

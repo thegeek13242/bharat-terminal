@@ -17,7 +17,8 @@ router = APIRouter(prefix="/transcripts", tags=["transcripts"])
 
 _LIST_COLS = """
     ct.id, ct.symbol, c.company_name, ct.headline, ct.announced_at,
-    ct.pdf_url, ct.page_count, ct.char_count, ct.parse_status
+    ct.pdf_url, ct.page_count, ct.char_count, ct.parse_status,
+    ct.period_label
 """
 
 
@@ -32,6 +33,7 @@ def _list_row(r) -> dict:
         "page_count": r.page_count,
         "char_count": r.char_count,
         "parse_status": r.parse_status,
+        "period_label": r.period_label,
     }
 
 
@@ -39,10 +41,17 @@ def _list_row(r) -> dict:
 async def recent_transcripts(
     days: int = Query(30, ge=1, le=365),
     limit: int = Query(100, ge=1, le=500),
+    quarter: str | None = Query(default=None, pattern=r"^Q[1-4]FY\d{2}$"),
     user: dict = Depends(get_current_user),
 ):
-    """Recently filed transcripts across the universe (metadata only)."""
+    """Recently filed transcripts across the universe (metadata only).
+    `quarter` filters by the DISCUSSED quarter (period_label), not filing
+    date — a Q4 call filed in July stays a Q4FY26 call."""
     session_factory = get_session_factory()
+    q_clause = "AND ct.period_label = :quarter" if quarter else ""
+    params: dict = {"days": days, "limit": limit}
+    if quarter:
+        params["quarter"] = quarter
     async with session_factory() as session:
         rows = (await session.execute(text(f"""
             SELECT {_LIST_COLS}
@@ -50,9 +59,10 @@ async def recent_transcripts(
             LEFT JOIN companies c ON c.symbol = ct.symbol
             WHERE ct.announced_at >= now() - make_interval(days => :days)
               AND ct.parse_status = 'ok'
+              {q_clause}
             ORDER BY ct.announced_at DESC
             LIMIT :limit
-        """), {"days": days, "limit": limit})).all()
+        """), params)).all()
     return {"items": [_list_row(r) for r in rows], "count": len(rows)}
 
 
@@ -95,6 +105,21 @@ async def get_transcript(
         """), {"tid": transcript_id})).mappings().all()
     out["guidance"] = [dict(g) for g in grows]
     return out
+
+
+@router.get("/quarters")
+async def quarters(user: dict = Depends(get_current_user)):
+    """Available discussed-quarter facets, most recent season first."""
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        rows = (await session.execute(text("""
+            SELECT period_label, count(*) AS n, max(announced_at) AS latest
+            FROM concall_transcripts
+            WHERE parse_status = 'ok' AND period_label IS NOT NULL
+            GROUP BY period_label
+            ORDER BY latest DESC
+        """))).all()
+    return {"items": [{"quarter": r.period_label, "count": r.n} for r in rows]}
 
 
 @router.get("/search")
