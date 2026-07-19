@@ -32,7 +32,10 @@ CHAT_MAX_TURNS = int(os.getenv("RESEARCH_CHAT_MAX_TURNS", "8"))
 CHAT_MAX_TOKENS = int(os.getenv("RESEARCH_CHAT_MAX_TOKENS", "4096"))
 _RESULT_CAP = 40000  # per tool result, chars of JSON fed back to the model
 
-_REF_RE = re.compile(r"\[(T\d+)\]")
+# Matches [T1] and grouped [T1, T2, T5] — the audit found grouped brackets
+# slipping through a single-ref pattern UNVALIDATED. Each ref in a group is
+# validated individually; the group is rewritten as consecutive singles.
+_REF_RE = re.compile(r"\[(T\d+(?:\s*,\s*T\d+)*)\]")
 
 TOOLS: List[Dict[str, Any]] = [
     {
@@ -75,7 +78,12 @@ TOOLS: List[Dict[str, Any]] = [
             "Our analysis pipeline's assessed events for a company (news + "
             "filings with per-company sentiment, magnitude 1-5, direct vs "
             "propagated, and the reasoning). The evidence base for 'why did "
-            "the stock move' — pair with get_price_returns for the move itself."
+            "the stock move' — pair with get_price_returns for the move itself. "
+            "CAVEAT: assessments are the pipeline's interpretation of source "
+            "articles; numeric price/return claims INSIDE them are not "
+            "independently verified — confirm any such number against "
+            "get_price_returns before repeating it, and attribute event "
+            "narratives as 'our event analysis assessed…'."
         ),
         "input_schema": {
             "type": "object",
@@ -258,13 +266,15 @@ def finalize_answer(text: str, issued: Dict[str, Dict[str, Any]]
 
     def _sub(m: re.Match) -> str:
         nonlocal invalid
-        ref = m.group(1)
-        if ref in issued:
-            if ref not in used:
-                used.append(ref)
-            return m.group(0)
-        invalid += 1
-        return ""
+        out = []
+        for ref in re.split(r"\s*,\s*", m.group(1)):
+            if ref in issued:
+                if ref not in used:
+                    used.append(ref)
+                out.append(f"[{ref}]")
+            else:
+                invalid += 1
+        return "".join(out)
     cleaned = _REF_RE.sub(_sub, text or "").strip()
     return {
         "answer": cleaned,
