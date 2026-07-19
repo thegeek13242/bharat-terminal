@@ -215,6 +215,18 @@ def featurize(df):
         # cap cardinality defensively (event_type has 16 buckets)
         X = pd.concat([X, d.iloc[:, :24]], axis=1)
     y = df["material"]
+
+    # v3 (feature ablation, 2026-07-19): the signal lives in EVENT CONTENT
+    # (taxonomy + |SUE| + run-up: alone 0.593 AUC) with a small assist from
+    # the LLM outputs; stock-context (vol/liquidity/mcap: alone 0.512) and
+    # misc (category/source/hours/hop: alone 0.483) were dead weight —
+    # removing them RAISED out-of-time AUC 0.627 -> 0.638. Vol stays in the
+    # LABEL (it defines materiality) but out of the FEATURES, which also
+    # closes the labeling-geometry concern (model can't learn the threshold).
+    dropped = (["vol60_log", "adv_cr_log", "mcap_log", "mcap_missing",
+                "market_hours", "n_companies_log", "hop"]
+               + [c for c in X.columns if c.startswith(("src_", "cat_"))])
+    X = X.drop(columns=[c for c in dropped if c in X.columns])
     return X, y, df
 
 
@@ -340,7 +352,7 @@ def main() -> None:
     metrics, model = train_and_evaluate(df, args.test_days, args.split_frac,
                                         emb=emb)
     metrics["filings_only"] = args.filings_only
-    metrics["feature_version"] = 2
+    metrics["feature_version"] = 3
 
     os.makedirs(EXPORT_DIR, exist_ok=True)
     stamp = datetime.now(timezone.utc).date().isoformat()
