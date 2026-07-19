@@ -303,7 +303,59 @@ async def _structure_row(SessionFactory, news_id: str, symbol: str,
             await _guidance_row(SessionFactory, news_id, symbol, full_text)
         except Exception as e:  # guidance must never block structure/availability
             logger.warning(f"[transcripts] guidance extraction failed {symbol}: {e}")
+        try:
+            await _embed_row(SessionFactory, news_id, symbol, full_text, struct)
+        except Exception as e:  # embedding must never block availability either
+            logger.warning(f"[transcripts] embedding failed {symbol}: {e}")
     return struct is not None
+
+
+async def _embed_row(SessionFactory, news_id: str, symbol: str,
+                     full_text: str, struct: dict) -> None:
+    from bharat_terminal.kb.sync.transcript_embed import embed_transcript
+
+    async with SessionFactory() as db:
+        me = (await db.execute(text(
+            "SELECT id, announced_at FROM concall_transcripts "
+            "WHERE news_id = :nid"), {"nid": news_id})).first()
+    if not me:
+        return
+    n = await embed_transcript(SessionFactory, me.id, symbol,
+                               me.announced_at, full_text, struct)
+    logger.info(f"[transcripts] {symbol}: embedded {n} chunk(s)")
+
+
+async def embed_backfill(limit: Optional[int] = None) -> dict:
+    """Chunk + embed transcripts lacking the current embed version."""
+    from bharat_terminal.kb.sync.utils import create_async_session
+    from bharat_terminal.kb.sync.transcript_embed import (
+        EMBED_VERSION, embed_transcript,
+    )
+
+    stats = {"candidates": 0, "embedded": 0, "failed": 0, "chunks": 0}
+    SessionFactory = create_async_session()
+    async with SessionFactory() as db:
+        rows = (await db.execute(text(f"""
+            SELECT id, symbol, announced_at, full_text, structure
+            FROM concall_transcripts
+            WHERE parse_status = 'ok' AND structure_status = 'ok'
+              AND coalesce(embed_version, 0) < :ver
+            ORDER BY announced_at ASC
+            {f"LIMIT {int(limit)}" if limit else ""}
+        """), {"ver": EMBED_VERSION})).all()
+    stats["candidates"] = len(rows)
+    logger.info(f"[transcripts] embed backfill: {len(rows)} candidate(s)")
+    for r in rows:
+        try:
+            n = await embed_transcript(SessionFactory, r.id, r.symbol,
+                                       r.announced_at, r.full_text, r.structure)
+            stats["embedded"] += 1
+            stats["chunks"] += n
+        except Exception as e:
+            stats["failed"] += 1
+            logger.warning(f"[transcripts] embed backfill {r.symbol}: {e}")
+    logger.info(f"[transcripts] embed backfill DONE: {stats}")
+    return stats
 
 
 async def _guidance_row(SessionFactory, news_id: str, symbol: str,
@@ -867,6 +919,9 @@ def main() -> None:
                          "transcripts lacking the current extraction version.")
     ap.add_argument("--symbols", type=str, default=None,
                     help="Comma-separated symbol filter (with --extract-guidance).")
+    ap.add_argument("--embed", action="store_true",
+                    help="Chunk + embed transcripts lacking the current "
+                         "embedding version (retrieval substrate).")
     ap.add_argument("--watch", action="store_true",
                     help="Run forever, syncing new transcripts as they arrive.")
     ap.add_argument("--interval", type=int,
@@ -883,6 +938,9 @@ def main() -> None:
     if args.recover_links:
         stats = asyncio.run(recover_links(limit=args.limit))
         sys.exit(0)
+    if args.embed:
+        stats = asyncio.run(embed_backfill(limit=args.limit))
+        sys.exit(0 if stats.get("failed", 0) == 0 else 1)
     if args.extract_guidance:
         syms = ([s.strip().upper() for s in args.symbols.split(",") if s.strip()]
                 if args.symbols else None)

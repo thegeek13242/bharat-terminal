@@ -97,6 +97,24 @@ async def get_transcript(
     return out
 
 
+@router.get("/search")
+async def search_transcripts(
+    q: str = Query(..., min_length=3, max_length=300),
+    symbol: str | None = Query(default=None),
+    k: int = Query(8, ge=1, le=25),
+    user: dict = Depends(get_current_user),
+):
+    """Semantic search across all transcripts. Excerpts are verbatim slices
+    of the filed documents — nothing generated."""
+    from bharat_terminal.grounding.queries import search_transcript_chunks
+
+    try:
+        return await search_transcript_chunks(q, symbol=symbol, k=k)
+    except Exception as e:
+        logger.warning(f"[transcripts] search failed: {e}")
+        raise HTTPException(status_code=503, detail="search_unavailable")
+
+
 @router.get("/{symbol}/guidance")
 async def guidance_timeline(
     symbol: str,

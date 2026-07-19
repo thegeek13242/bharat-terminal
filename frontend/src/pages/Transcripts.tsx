@@ -205,6 +205,18 @@ function StructuredReader({ doc }: { doc: TranscriptFull }) {
   );
 }
 
+interface SearchResult {
+  transcript_id: number;
+  symbol: string;
+  company_name: string | null;
+  announced_at: string;
+  char_start: number;
+  char_end: number;
+  section: string | null;
+  relevance: number;
+  excerpt: string;
+}
+
 export function Transcripts() {
   const [items, setItems] = useState<TranscriptMeta[]>([]);
   const [filter, setFilter] = useState('');
@@ -213,6 +225,29 @@ export function Transcripts() {
   const [loading, setLoading] = useState(true);
   const [docLoading, setDocLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [searchQ, setSearchQ] = useState('');
+  const [searchResults, setSearchResults] = useState<SearchResult[] | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [pendingScroll, setPendingScroll] = useState<number | null>(null);
+
+  async function runSearch() {
+    const q = searchQ.trim();
+    if (q.length < 3) return;
+    setSearching(true);
+    try {
+      const res = await api.searchTranscripts(q);
+      setSearchResults(res.results);
+    } catch {
+      setSearchResults([]);
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  function openResult(r: SearchResult) {
+    setPendingScroll(r.char_start);
+    setSelectedId(r.transcript_id);
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -252,6 +287,21 @@ export function Transcripts() {
       (t) => t.symbol.toUpperCase().includes(q) || (t.company_name ?? '').toUpperCase().includes(q),
     );
   }, [items, filter]);
+
+  // After opening a search result: scroll to the segment containing the hit
+  // once the document (and its structure) has rendered.
+  useEffect(() => {
+    if (pendingScroll == null || !doc || docLoading) return;
+    const segs = doc.structure?.segments;
+    if (segs && segs.length > 0) {
+      const idx = segs.findIndex((s) => pendingScroll >= s.start && pendingScroll < s.end);
+      if (idx >= 0) {
+        setTimeout(() =>
+          document.getElementById(`seg-${idx}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 120);
+      }
+    }
+    setPendingScroll(null);
+  }, [doc, docLoading, pendingScroll]);
 
   const structure = doc?.structure ?? null;
   const keyMoments = useMemo(() => {
@@ -324,10 +374,65 @@ export function Transcripts() {
             Transcripts
           </span>
           <span className="mono upper" style={{ fontSize: 10, letterSpacing: '0.1em', color: 'var(--ink-mute)' }}>
-            {filtered.length} · last 60 days
+            {searchResults !== null ? `${searchResults.length} matches` : `${filtered.length} · last 60 days`}
           </span>
         </div>
+        <div style={{ padding: '8px 16px', borderBottom: '1px solid var(--border)', display: 'flex', gap: 6 }}>
+          <input
+            value={searchQ}
+            onChange={(e) => setSearchQ(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') runSearch();
+              if (e.key === 'Escape') { setSearchQ(''); setSearchResults(null); }
+            }}
+            placeholder="Search across all calls… (Enter)"
+            className="mono"
+            style={{
+              flex: 1, fontSize: 11, padding: '6px 8px', background: 'var(--bg-elev)',
+              border: '1px solid var(--border)', borderRadius: 4, color: 'var(--ink-2)', outline: 'none',
+            }}
+          />
+          {searchResults !== null && (
+            <button
+              onClick={() => { setSearchQ(''); setSearchResults(null); }}
+              className="mono"
+              style={{ fontSize: 10, padding: '4px 8px', background: 'transparent', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--ink-dim)', cursor: 'pointer' }}
+            >
+              ×
+            </button>
+          )}
+        </div>
         <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
+          {searching && <div className="mono" style={{ padding: 20, fontSize: 11, color: 'var(--ink-mute)' }}>Searching…</div>}
+          {!searching && searchResults !== null && searchResults.length === 0 && (
+            <div className="mono" style={{ padding: 20, fontSize: 11, color: 'var(--ink-mute)' }}>No matches in the corpus.</div>
+          )}
+          {!searching && searchResults !== null &&
+            searchResults.map((r, i) => (
+              <div
+                key={`${r.transcript_id}-${i}`}
+                onClick={() => openResult(r)}
+                style={{
+                  padding: '10px 16px', borderBottom: '1px solid var(--border)', cursor: 'pointer',
+                  borderLeft: `2px solid ${r.transcript_id === selectedId ? 'var(--accent)' : 'transparent'}`,
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+                  <span className="mono" style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink-2)' }}>{r.symbol}</span>
+                  <span className="mono" style={{ fontSize: 10, color: 'var(--ink-dim)' }}>
+                    {r.announced_at.slice(0, 10)}{r.section ? ` · ${r.section === 'qa' ? 'Q&A' : 'remarks'}` : ''}
+                  </span>
+                  <span className="mono" style={{ marginLeft: 'auto', fontSize: 9.5, color: 'var(--ink-faint, var(--ink-mute))' }}>
+                    {(r.relevance * 100).toFixed(0)}%
+                  </span>
+                </div>
+                <div style={{ marginTop: 4, fontSize: 11, lineHeight: 1.5, color: 'var(--ink-mute)', display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
+                  {r.excerpt}
+                </div>
+              </div>
+            ))}
+          {searchResults === null && (<>
+
           {loading && <div className="mono" style={{ padding: 20, fontSize: 11, color: 'var(--ink-mute)' }}>Loading…</div>}
           {!loading && error && <div className="mono" style={{ padding: 20, fontSize: 11, color: 'var(--head)' }}>{error}</div>}
           {!loading && !error && filtered.length === 0 && (
@@ -362,6 +467,7 @@ export function Transcripts() {
               </div>
             );
           })}
+          </>)}
         </div>
       </div>
 

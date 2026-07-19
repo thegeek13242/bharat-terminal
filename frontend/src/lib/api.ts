@@ -110,6 +110,12 @@ export const api = {
 
   getTranscript: (id: number) => request<any>(`/transcripts/id/${id}`),
 
+  searchTranscripts: (q: string, symbol?: string, k = 10) => {
+    const qs = new URLSearchParams({ q, k: String(k) });
+    if (symbol) qs.set('symbol', symbol);
+    return request<{ query: string; results: any[] }>(`/transcripts/search?${qs.toString()}`);
+  },
+
   // ── Notable holders / marquee investors ──────────────────────────────
   getHolders: (symbol: string) =>
     request<{ symbol: string; quarter_end: string | null; prior_quarter_end: string | null; holders: any[] }>(

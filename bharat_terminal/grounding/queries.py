@@ -485,3 +485,60 @@ async def get_corporate_actions(
             "subject": (r.details or {}).get("subject") if isinstance(r.details, dict) else None,
         } for r in rows],
     }
+
+
+async def search_transcript_chunks(
+    query: str,
+    symbol: Optional[str] = None,
+    k: int = 8,
+) -> Dict[str, Any]:
+    """Semantic search over concall-transcript chunks (A1 phase 3.2).
+
+    Embeds `query` (RETRIEVAL_QUERY) and cosine-searches the HNSW index.
+    Every result's `excerpt` is a verbatim slice of the filed transcript
+    (chunks are char spans of full_text — nothing generated). Shared by the
+    /transcripts/search API and, later, the research-chat tool loop.
+    """
+    from sqlalchemy import text as sql_text
+    from bharat_terminal.llm.embeddings import embed_query
+
+    qvec = await embed_query(query)
+    if qvec is None:
+        return {"query": query, "results": []}
+    params: Dict[str, Any] = {
+        "q": "[" + ",".join(f"{x:.6f}" for x in qvec) + "]",
+        "k": max(1, min(int(k), 50)),
+    }
+    sym_clause = ""
+    if symbol:
+        sym_clause = "AND tc.symbol = :sym"
+        params["sym"] = symbol.upper()
+    async with _session() as s:
+        rows = (await s.execute(sql_text(f"""
+            SELECT tc.transcript_id, tc.symbol, tc.announced_at,
+                   tc.char_start, tc.char_end, tc.section,
+                   (1 - (tc.embedding <=> (:q)::vector)) AS relevance,
+                   substring(ct.full_text FROM tc.char_start + 1
+                             FOR tc.char_end - tc.char_start) AS excerpt,
+                   c.company_name
+            FROM transcript_chunks tc
+            JOIN concall_transcripts ct ON ct.id = tc.transcript_id
+            LEFT JOIN companies c ON c.symbol = tc.symbol
+            WHERE ct.parse_status = 'ok' {sym_clause}
+            ORDER BY tc.embedding <=> (:q)::vector
+            LIMIT :k
+        """), params)).all()
+    return {
+        "query": query,
+        "results": [{
+            "transcript_id": r.transcript_id,
+            "symbol": r.symbol,
+            "company_name": r.company_name,
+            "announced_at": r.announced_at.isoformat(),
+            "char_start": r.char_start,
+            "char_end": r.char_end,
+            "section": r.section,
+            "relevance": round(float(r.relevance), 4),
+            "excerpt": r.excerpt,
+        } for r in rows],
+    }
