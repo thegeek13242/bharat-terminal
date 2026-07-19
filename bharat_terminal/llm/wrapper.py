@@ -276,8 +276,13 @@ def _gemini_translate(system, messages, tools, tool_choice, max_tokens, temperat
                     continue
                 btype = blk.get("type")
                 if btype == "text":
-                    part = types.Part.from_text(text=blk.get("text", ""))
                     sig = blk.get("_thought_signature")
+                    if not blk.get("text") and sig is not None:
+                        # Hidden-thought placeholder: replay signature-only,
+                        # no empty text part (which Vertex may reject).
+                        parts.append(types.Part(thought_signature=sig))
+                        continue
+                    part = types.Part.from_text(text=blk.get("text", ""))
                     if sig is not None:
                         part.thought_signature = sig
                     parts.append(part)
@@ -343,6 +348,11 @@ def _wrap_gemini_response(resp, model: str) -> LLMResponse:
                 ))
             elif getattr(part, "text", None):
                 blocks.append(ContentBlock(type="text", text=part.text, signature=sig))
+            elif sig is not None:
+                # Signature-only part: a hidden thought (no text, no call).
+                # Gemini 3 REQUIRES this signature replayed in history — drop
+                # it and the next turn 400s with "missing thought_signature".
+                blocks.append(ContentBlock(type="text", text="", signature=sig))
     except (AttributeError, IndexError, TypeError):
         pass
     um = getattr(resp, "usage_metadata", None)
@@ -381,8 +391,10 @@ def assistant_content(resp: LLMResponse) -> List[Dict[str, Any]]:
     """
     blocks: List[Dict[str, Any]] = []
     for b in resp.content:
-        if b.type == "text" and b.text:
-            block: Dict[str, Any] = {"type": "text", "text": b.text}
+        if b.type == "text" and (b.text or b.signature is not None):
+            # Keep empty-text blocks when they carry a thought_signature —
+            # dropping them loses the signature Gemini 3 demands on replay.
+            block: Dict[str, Any] = {"type": "text", "text": b.text or ""}
         elif b.type == "tool_use":
             block = {"type": "tool_use", "id": b.id,
                      "name": b.name, "input": b.input or {}}
