@@ -67,6 +67,11 @@ TRANSCRIPT_PDF_MAX_BYTES = int(
 )
 FETCH_TIMEOUT_S = float(os.getenv("TRANSCRIPT_FETCH_TIMEOUT_S", "60"))
 POLITENESS_DELAY_S = float(os.getenv("TRANSCRIPT_FETCH_DELAY_S", "0.6"))
+# Scanned-PDF detector: pypdf extracts near-nothing from image pages. The
+# 2026-07-19 audit found a 30-page scanned call at ~293 chars/page stored as
+# "ok"; real transcripts run 2-3K chars/page. Rows below the floor get
+# parse_status='needs_ocr' and never reach customers or the LLM.
+MIN_CHARS_PER_PAGE = int(os.getenv("TRANSCRIPT_MIN_CHARS_PER_PAGE", "500"))
 
 _PENDING_SQL = """
     SELECT ni.id, ni.source, ni.headline, ni.url, ni.timestamp_utc,
@@ -205,6 +210,9 @@ async def sync_transcripts(
                     logger.warning(f"[transcripts] extract error {symbol}: {e}")
                     full_text = None
                 status = "ok" if full_text else (status or "extract_failed")
+                if (status == "ok" and pages
+                        and len(full_text) / pages < MIN_CHARS_PER_PAGE):
+                    status = "needs_ocr"  # scanned/image PDF — text is a stub
                 chars = len(full_text) if full_text else None
 
             async with SessionFactory() as db:
@@ -263,16 +271,31 @@ async def _structure_row(SessionFactory, news_id: str, symbol: str,
     except Exception as e:
         logger.warning(f"[transcripts] structuring error {symbol}: {e}")
         struct = None
+
+    # Cover-letter gate: a document with ZERO speaking turns is an intimation
+    # notice ("transcript available on our website"), not a transcript. The
+    # 2026-07-19 audit found 21 of these listed as transcripts (LT, IOC,
+    # HYUNDAI…) rendering empty readers. parse_status='not_transcript' drops
+    # them from every customer list (which filter parse_status='ok').
+    not_transcript = bool(
+        struct and struct["stats"].get("turns_total", 0) == 0)
+    if not_transcript:
+        logger.info(f"[transcripts] {symbol}: zero speaking turns — "
+                    f"classified not_transcript (intimation notice)")
+
     async with SessionFactory() as db:
         await db.execute(text("""
             UPDATE concall_transcripts
             SET structure = :struct, structure_status = :st,
                 structure_model = :model, structured_at = now(),
+                parse_status = CASE WHEN :nt THEN 'not_transcript'
+                                    ELSE parse_status END,
                 updated_at = now()
             WHERE news_id = :nid
         """), {"struct": json.dumps(struct) if struct else None,
                "st": "ok" if struct else "failed",
-               "model": STRUCTURE_MODEL, "nid": news_id})
+               "model": STRUCTURE_MODEL, "nid": news_id,
+               "nt": not_transcript})
         await db.commit()
     return struct is not None
 
@@ -454,6 +477,9 @@ async def backfill_nse(limit: Optional[int] = None, structure: bool = False) -> 
                 except Exception as e:
                     logger.warning(f"[transcripts] extract error {symbol}: {e}")
                 status = "ok" if full_text else (status or "extract_failed")
+                if (status == "ok" and pages
+                        and len(full_text) / pages < MIN_CHARS_PER_PAGE):
+                    status = "needs_ocr"  # scanned/image PDF — text is a stub
                 chars = len(full_text) if full_text else None
 
             async with SessionFactory() as db:

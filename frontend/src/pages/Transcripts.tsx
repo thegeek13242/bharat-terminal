@@ -397,7 +397,7 @@ export function Transcripts() {
 
             <div style={{ flex: 1, overflow: 'auto', minHeight: 0, padding: '8px 24px 20px' }}>
               <div style={{ maxWidth: 760 }}>
-                {structure && doc.full_text ? (
+                {structure && structure.segments.length > 0 && doc.full_text ? (
                   <StructuredReader doc={doc} />
                 ) : (
                   <>
