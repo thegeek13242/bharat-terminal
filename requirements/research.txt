@@ -7,3 +7,7 @@ httpx>=0.27,<1
 sqlalchemy>=2.0,<3
 asyncpg>=0.29,<1
 pgvector>=0.2,<1
+# Materiality calibrator (research/materiality_calibrator.py): classical ML
+# over impact-events × forward returns. scikit-learn pulls numpy/scipy/joblib.
+scikit-learn>=1.4,<2
+pandas>=2.0,<3
