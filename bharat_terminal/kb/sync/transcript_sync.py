@@ -297,7 +297,104 @@ async def _structure_row(SessionFactory, news_id: str, symbol: str,
                "model": STRUCTURE_MODEL, "nid": news_id,
                "nt": not_transcript})
         await db.commit()
+
+    if struct is not None and not not_transcript:
+        try:
+            await _guidance_row(SessionFactory, news_id, symbol, full_text)
+        except Exception as e:  # guidance must never block structure/availability
+            logger.warning(f"[transcripts] guidance extraction failed {symbol}: {e}")
     return struct is not None
+
+
+async def _guidance_row(SessionFactory, news_id: str, symbol: str,
+                        full_text: str) -> bool:
+    """Extract structured guidance + QoQ verdicts for one transcript.
+    Pairs against the company's PREVIOUS ok call (needs that call's guidance
+    already extracted — process chronologically). Idempotent: replaces the
+    transcript's guidance rows. Fail-soft."""
+    from bharat_terminal.kb.sync.transcript_guidance import (
+        GUIDANCE_VERSION, extract_guidance,
+    )
+
+    async with SessionFactory() as db:
+        me = (await db.execute(text(
+            "SELECT id, announced_at FROM concall_transcripts "
+            "WHERE news_id = :nid"), {"nid": news_id})).first()
+        if not me:
+            return False
+        prior_rows = (await db.execute(text("""
+            SELECT g.id, g.metric, g.period, g.value_low, g.value_high, g.unit
+            FROM transcript_guidance g
+            JOIN concall_transcripts prior ON prior.id = g.transcript_id
+            WHERE prior.symbol = :sym AND prior.parse_status = 'ok'
+              AND prior.announced_at < :ann
+              AND prior.announced_at = (
+                  SELECT max(p2.announced_at) FROM concall_transcripts p2
+                  WHERE p2.symbol = :sym AND p2.parse_status = 'ok'
+                    AND p2.announced_at < :ann)
+        """), {"sym": symbol, "ann": me.announced_at})).mappings().all()
+
+    out = await extract_guidance(full_text, symbol, [dict(p) for p in prior_rows])
+    if out is None:
+        return False
+    async with SessionFactory() as db:
+        await db.execute(text(
+            "DELETE FROM transcript_guidance WHERE transcript_id = :tid"),
+            {"tid": me.id})
+        await db.execute(text(
+            "UPDATE concall_transcripts SET guidance_version = :ver, "
+            "updated_at = now() WHERE id = :tid"),
+            {"ver": GUIDANCE_VERSION, "tid": me.id})
+        for it in out["items"]:
+            await db.execute(text("""
+                INSERT INTO transcript_guidance
+                    (transcript_id, symbol, announced_at, metric, period,
+                     value_low, value_high, unit, quote_start, quote_end,
+                     prior_guidance_id, change_verdict, extraction_version)
+                VALUES (:tid, :sym, :ann, :metric, :period, :lo, :hi, :unit,
+                        :qs, :qe, :prior, :verdict, :ver)
+            """), {"tid": me.id, "sym": symbol, "ann": me.announced_at,
+                   "metric": it["metric"], "period": it["period"],
+                   "lo": it["value_low"], "hi": it["value_high"],
+                   "unit": it["unit"], "qs": it["quote_start"],
+                   "qe": it["quote_end"], "prior": it["prior_guidance_id"],
+                   "verdict": it["change_verdict"], "ver": GUIDANCE_VERSION})
+        await db.commit()
+    return True
+
+
+async def extract_guidance_backfill(limit: Optional[int] = None,
+                                    symbols: Optional[list[str]] = None) -> dict:
+    """Chronological guidance extraction over transcripts that lack it —
+    oldest first, so each call's extraction can pair against its
+    predecessor's already-extracted items."""
+    from bharat_terminal.kb.sync.utils import create_async_session
+    from bharat_terminal.kb.sync.transcript_guidance import GUIDANCE_VERSION
+
+    stats = {"candidates": 0, "extracted": 0, "failed": 0}
+    SessionFactory = create_async_session()
+    async with SessionFactory() as db:
+        rows = (await db.execute(text(f"""
+            SELECT news_id, symbol, full_text FROM concall_transcripts ct
+            WHERE parse_status = 'ok' AND structure_status = 'ok'
+              AND coalesce(guidance_version, 0) < :ver
+              {"AND symbol = ANY(:syms)" if symbols else ""}
+            ORDER BY announced_at ASC
+            {f"LIMIT {int(limit)}" if limit else ""}
+        """), {"ver": GUIDANCE_VERSION,
+               **({"syms": symbols} if symbols else {})})).all()
+    stats["candidates"] = len(rows)
+    logger.info(f"[transcripts] guidance backfill: {len(rows)} candidate(s)")
+    for r in rows:
+        try:
+            ok = await _guidance_row(SessionFactory, r.news_id, r.symbol,
+                                     r.full_text)
+        except Exception as e:
+            logger.warning(f"[transcripts] guidance backfill {r.symbol}: {e}")
+            ok = False
+        stats["extracted" if ok else "failed"] += 1
+    logger.info(f"[transcripts] guidance backfill DONE: {stats}")
+    return stats
 
 
 async def restructure(limit: Optional[int] = None) -> dict:
@@ -765,6 +862,11 @@ def main() -> None:
     ap.add_argument("--recover-links", action="store_true",
                     help="For letter-only filings (not_transcript), fetch the "
                          "real transcript from the links inside the letter.")
+    ap.add_argument("--extract-guidance", action="store_true",
+                    help="Chronological guidance extraction + QoQ diffs for "
+                         "transcripts lacking the current extraction version.")
+    ap.add_argument("--symbols", type=str, default=None,
+                    help="Comma-separated symbol filter (with --extract-guidance).")
     ap.add_argument("--watch", action="store_true",
                     help="Run forever, syncing new transcripts as they arrive.")
     ap.add_argument("--interval", type=int,
@@ -781,6 +883,12 @@ def main() -> None:
     if args.recover_links:
         stats = asyncio.run(recover_links(limit=args.limit))
         sys.exit(0)
+    if args.extract_guidance:
+        syms = ([s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+                if args.symbols else None)
+        stats = asyncio.run(extract_guidance_backfill(limit=args.limit,
+                                                      symbols=syms))
+        sys.exit(0 if stats.get("failed", 0) == 0 else 1)
     if args.restructure:
         stats = asyncio.run(restructure(limit=args.limit))
         sys.exit(0 if stats.get("fetch_failed", 0) == 0 else 1)

@@ -79,7 +79,47 @@ async def get_transcript(
     # pending/failed; the client falls back to the raw reader.
     out["structure"] = r.structure
     out["structure_status"] = r.structure_status
+    async with session_factory() as session:
+        grows = (await session.execute(text("""
+            SELECT g.id, g.metric, g.period, g.value_low, g.value_high,
+                   g.unit, g.quote_start, g.quote_end, g.change_verdict,
+                   pg.period AS prior_period, pg.value_low AS prior_low,
+                   pg.value_high AS prior_high, pg.unit AS prior_unit,
+                   pg.transcript_id AS prior_transcript_id,
+                   pg.quote_start AS prior_quote_start,
+                   pg.quote_end AS prior_quote_end
+            FROM transcript_guidance g
+            LEFT JOIN transcript_guidance pg ON pg.id = g.prior_guidance_id
+            WHERE g.transcript_id = :tid
+            ORDER BY g.quote_start
+        """), {"tid": transcript_id})).mappings().all()
+    out["guidance"] = [dict(g) for g in grows]
     return out
+
+
+@router.get("/{symbol}/guidance")
+async def guidance_timeline(
+    symbol: str,
+    limit: int = Query(100, ge=1, le=500),
+    user: dict = Depends(get_current_user),
+):
+    """Per-company guidance timeline across calls (newest first). Factual:
+    management's own stated targets with verbatim-anchored quotes and
+    computed change verdicts — no forward view of ours."""
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        rows = (await session.execute(text("""
+            SELECT g.id, g.transcript_id, g.announced_at, g.metric, g.period,
+                   g.value_low, g.value_high, g.unit, g.change_verdict,
+                   g.prior_guidance_id
+            FROM transcript_guidance g
+            WHERE g.symbol = :sym
+            ORDER BY g.announced_at DESC, g.quote_start
+            LIMIT :limit
+        """), {"sym": symbol.upper(), "limit": limit})).mappings().all()
+    return {"items": [dict(r) | {"announced_at": r["announced_at"].isoformat()}
+                      for r in rows],
+            "count": len(rows)}
 
 
 @router.get("/{symbol}")

@@ -46,10 +46,41 @@ interface Structure {
   stats: Record<string, number>;
 }
 
+interface GuidanceItem {
+  id: number;
+  metric: string;
+  period: string | null;
+  value_low: number | null;
+  value_high: number | null;
+  unit: string | null;
+  quote_start: number;
+  quote_end: number;
+  change_verdict: 'new' | 'raised' | 'lowered' | 'maintained' | 'changed';
+  prior_period: string | null;
+  prior_low: number | null;
+  prior_high: number | null;
+  prior_unit: string | null;
+}
+
 interface TranscriptFull extends TranscriptMeta {
   full_text: string | null;
   structure: Structure | null;
   structure_status: string;
+  guidance: GuidanceItem[];
+}
+
+const VERDICT_STYLE: Record<GuidanceItem['change_verdict'], { label: string; color: string }> = {
+  new: { label: 'NEW', color: 'var(--ink-dim)' },
+  raised: { label: 'RAISED', color: 'var(--tail, #5fa98a)' },
+  lowered: { label: 'LOWERED', color: 'var(--head, #c68476)' },
+  maintained: { label: 'MAINTAINED', color: 'var(--ink-mute)' },
+  changed: { label: 'CHANGED', color: 'var(--warn, #c2a05e)' },
+};
+
+function fmtValue(lo: number | null, hi: number | null, unit: string | null): string {
+  if (lo == null) return '—';
+  const range = hi != null && hi !== lo ? `${lo}–${hi}` : `${lo}`;
+  return unit ? `${range} ${unit}` : range;
 }
 
 // Muted category tints — annotation, not decoration.
@@ -124,7 +155,7 @@ function StructuredReader({ doc }: { doc: TranscriptFull }) {
         if (pos < seg.end) parts.push({ t: text.slice(pos, seg.end) });
 
         return (
-          <div key={i}>
+          <div key={i} id={`seg-${i}`}>
             {showQa && (
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '26px 0 14px' }}>
                 <span className="mono upper" style={{ fontSize: 10, letterSpacing: '0.18em', color: 'var(--ink-dim)' }}>
@@ -354,6 +385,63 @@ export function Transcripts() {
                 Source PDF ↗
               </a>
             </div>
+
+            {(doc.guidance?.length ?? 0) > 0 && (
+              <div style={{ padding: '10px 24px', borderBottom: '1px solid var(--border)', maxHeight: 170, overflow: 'auto' }}>
+                <div className="mono upper" style={{ fontSize: 10, letterSpacing: '0.14em', color: 'var(--ink-dim)', marginBottom: 6 }}>
+                  Management guidance · {doc.guidance.length}
+                  <span style={{ marginLeft: 8, letterSpacing: '0.06em', textTransform: 'none', color: 'var(--ink-mute)' }}>
+                    as stated on the call · change vs previous call
+                  </span>
+                </div>
+                <table className="mono" style={{ width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
+                  <tbody>
+                    {doc.guidance.map((g) => {
+                      const v = VERDICT_STYLE[g.change_verdict] ?? VERDICT_STYLE.new;
+                      const segIdx = structure?.segments.findIndex(
+                        (s) => g.quote_start >= s.start && g.quote_start < s.end,
+                      );
+                      const prior =
+                        g.prior_low != null
+                          ? `was ${fmtValue(g.prior_low, g.prior_high, g.prior_unit)}${g.prior_period ? ` (${g.prior_period})` : ''}`
+                          : undefined;
+                      return (
+                        <tr
+                          key={g.id}
+                          onClick={() =>
+                            segIdx != null && segIdx >= 0 &&
+                            document.getElementById(`seg-${segIdx}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                          }
+                          title={prior}
+                          style={{ cursor: segIdx != null && segIdx >= 0 ? 'pointer' : 'default', borderTop: '1px solid var(--border)' }}
+                        >
+                          <td style={{ padding: '4px 8px 4px 0', color: 'var(--ink-2)' }}>{g.metric}</td>
+                          <td style={{ padding: '4px 8px', color: 'var(--ink-dim)' }}>{g.period ?? '—'}</td>
+                          <td style={{ padding: '4px 8px', color: 'var(--ink-2)', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                            {fmtValue(g.value_low, g.value_high, g.unit)}
+                          </td>
+                          <td style={{ padding: '4px 0 4px 8px', textAlign: 'right' }}>
+                            <span
+                              className="mono upper"
+                              style={{
+                                fontSize: 8.5,
+                                letterSpacing: '0.1em',
+                                padding: '1px 5px',
+                                borderRadius: 3,
+                                color: v.color,
+                                border: `1px solid ${v.color}`,
+                              }}
+                            >
+                              {v.label}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
 
             {keyMoments.length > 0 && (
               <div style={{ padding: '10px 24px', borderBottom: '1px solid var(--border)', maxHeight: 148, overflow: 'auto' }}>
