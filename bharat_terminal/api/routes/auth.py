@@ -74,12 +74,16 @@ async def me(current=Depends(get_current_user)):
     if not user or not user["is_active"]:
         # Session valid but the user was since removed/deactivated.
         raise HTTPException(status_code=401, detail="not_authenticated")
+    from bharat_terminal.api.auth import INTERNAL_RESEARCH_EMAILS
     return {
         "user": {
             "id": user["id"],
             "email": user["email"],
             "name": user.get("name"),
             "picture": user.get("picture"),
+            # Gates internal-only surfaces in the UI (research chat). The
+            # backend enforces independently via require_internal_user.
+            "internal": (user["email"] or "").lower() in INTERNAL_RESEARCH_EMAILS,
         }
     }
 

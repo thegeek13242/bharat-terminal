@@ -10,6 +10,9 @@ from bharat_terminal.grounding.queries import (
     get_price_returns,
     get_shareholding,
     get_corporate_actions,
+    get_recent_impacts,
+    get_guidance_timeline,
+    search_transcript_chunks,
 )
 
 __all__ = [
@@ -18,4 +21,7 @@ __all__ = [
     "get_price_returns",
     "get_shareholding",
     "get_corporate_actions",
+    "get_recent_impacts",
+    "get_guidance_timeline",
+    "search_transcript_chunks",
 ]

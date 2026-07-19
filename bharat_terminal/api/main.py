@@ -38,6 +38,7 @@ from bharat_terminal.api.routes import (
     earnings_surprises,
     investor_holdings,
     transcripts,
+    research_chat,
 )
 from bharat_terminal.api.ws_manager import manager
 
@@ -122,6 +123,8 @@ app.include_router(signal_accuracy.router, dependencies=_internal)
 app.include_router(signals_report.router, dependencies=_internal)
 # Angel One LTP: personal-use data — internal accounts only (licensing).
 app.include_router(internal_ltp.router, dependencies=_internal)
+# F12 research chat — dogfood phase, internal-only (see routes/research_chat.py).
+app.include_router(research_chat.router, dependencies=_internal)
 
 
 @app.get("/health")

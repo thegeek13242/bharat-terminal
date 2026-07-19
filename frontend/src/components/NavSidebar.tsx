@@ -29,8 +29,12 @@ interface Props {
 }
 
 export function NavSidebar({ children, counts, connected = false, statusLabel = 'LIVE FEED', staticStatus }: Props) {
+
   const { pathname } = useLocation();
   const { user, logout } = useAuth();
+  const navItems = user?.internal
+    ? [...NAV, { to: '/research', label: 'Research', key: 'research' }]
+    : NAV;
 
   const monogram = (user?.name || user?.email || 'AM')
     .split(/[\s@.]+/)
@@ -89,7 +93,7 @@ export function NavSidebar({ children, counts, connected = false, statusLabel = 
       </div>
 
       <nav style={{ padding: '12px 10px', display: 'flex', flexDirection: 'column', gap: 3 }}>
-        {NAV.map((item) => {
+        {navItems.map((item) => {
           const active = pathname === item.to;
           return (
             <Link

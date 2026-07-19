@@ -110,6 +110,12 @@ export const api = {
 
   getTranscript: (id: number) => request<any>(`/transcripts/id/${id}`),
 
+  askResearchChat: (messages: { role: 'user' | 'assistant'; content: string }[]) =>
+    request<{
+      answer: string; citations: any[]; status: string;
+      model: string; turns: number; latency_ms: number;
+    }>('/research-chat/ask', { method: 'POST', body: JSON.stringify({ messages }) }),
+
   searchTranscripts: (q: string, symbol?: string, k = 10) => {
     const qs = new URLSearchParams({ q, k: String(k) });
     if (symbol) qs.set('symbol', symbol);

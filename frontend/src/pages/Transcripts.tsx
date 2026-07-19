@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { NavSidebar } from '@/components/NavSidebar';
 import { api } from '@/lib/api';
 import { dayLabel, clockTime } from '@/lib/format';
@@ -229,6 +230,19 @@ export function Transcripts() {
   const [searchResults, setSearchResults] = useState<SearchResult[] | null>(null);
   const [searching, setSearching] = useState(false);
   const [pendingScroll, setPendingScroll] = useState<number | null>(null);
+  const [urlParams, setUrlParams] = useSearchParams();
+
+  // Deep link (?open=<transcript_id>&at=<char_offset>) — used by research-chat
+  // citations and anything else that wants to land inside a specific call.
+  useEffect(() => {
+    const open = urlParams.get('open');
+    if (!open) return;
+    const at = urlParams.get('at');
+    if (at) setPendingScroll(parseInt(at, 10));
+    setSelectedId(parseInt(open, 10));
+    setUrlParams({}, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function runSearch() {
     const q = searchQ.trim();

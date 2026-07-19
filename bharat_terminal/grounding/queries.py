@@ -542,3 +542,78 @@ async def search_transcript_chunks(
             "excerpt": r.excerpt,
         } for r in rows],
     }
+
+
+async def get_recent_impacts(symbol: str, days: int = 30,
+                             limit: int = 15) -> Dict[str, Any]:
+    """Recent analysed events touching `symbol` (direct or propagated) with
+    the pipeline's per-company assessment. The evidence base for
+    'why did it move' questions."""
+    from sqlalchemy import text as sql_text
+
+    async with _session() as s:
+        rows = (await s.execute(sql_text("""
+            SELECT ir.id, ir.created_at, ni.headline, ni.source, ni.url,
+                   ci->>'sentiment' AS sentiment,
+                   (ci->>'magnitude')::int AS magnitude,
+                   (ci->>'hop_distance')::int AS hop_distance,
+                   ci->>'explanation' AS explanation
+            FROM impact_reports ir
+            JOIN news_items ni ON ni.id = ir.news_id
+            CROSS JOIN LATERAL jsonb_array_elements(ir.company_impacts) ci
+            WHERE ir.relevant
+              AND ir.created_at >= now() - make_interval(days => :days)
+              AND upper(ci->>'symbol') = :sym
+            ORDER BY ir.created_at DESC
+            LIMIT :lim
+        """), {"sym": symbol.upper(), "days": int(days),
+               "lim": max(1, min(int(limit), 50))})).all()
+    return {
+        "symbol": symbol.upper(),
+        "window_days": days,
+        "events": [{
+            "impact_report_id": r.id,
+            "at": r.created_at.isoformat(),
+            "headline": r.headline,
+            "source": r.source,
+            "url": r.url,
+            "sentiment": r.sentiment,
+            "magnitude": r.magnitude,
+            "hop_distance": r.hop_distance,
+            "assessment": r.explanation,
+        } for r in rows],
+    }
+
+
+async def get_guidance_timeline(symbol: str, limit: int = 40) -> Dict[str, Any]:
+    """Management guidance extracted from the company's concalls (values AS
+    STATED on the call, verbatim-anchored) with computed QoQ change verdicts."""
+    from sqlalchemy import text as sql_text
+
+    async with _session() as s:
+        rows = (await s.execute(sql_text("""
+            SELECT g.transcript_id, g.announced_at, g.metric, g.period,
+                   g.value_low, g.value_high, g.unit, g.change_verdict,
+                   substring(ct.full_text FROM g.quote_start + 1
+                             FOR g.quote_end - g.quote_start) AS quote
+            FROM transcript_guidance g
+            JOIN concall_transcripts ct ON ct.id = g.transcript_id
+            WHERE g.symbol = :sym
+            ORDER BY g.announced_at DESC, g.quote_start
+            LIMIT :lim
+        """), {"sym": symbol.upper(),
+               "lim": max(1, min(int(limit), 100))})).all()
+    return {
+        "symbol": symbol.upper(),
+        "items": [{
+            "transcript_id": r.transcript_id,
+            "call_date": r.announced_at.date().isoformat(),
+            "metric": r.metric,
+            "period": r.period,
+            "value_low": r.value_low,
+            "value_high": r.value_high,
+            "unit": r.unit,
+            "vs_previous_call": r.change_verdict,
+            "verbatim": r.quote,
+        } for r in rows],
+    }
