@@ -184,13 +184,30 @@ async def main():
 
     adapters = [
         NSEFilingsAdapter(redis_client=redis_client),
-        EconomicTimesAdapter(redis_client=redis_client),
-        MintAdapter(redis_client=redis_client),
-        NDTVProfitAdapter(redis_client=redis_client),
-        MoneyControlAdapter(redis_client=redis_client),
-        ReutersIndiaAdapter(redis_client=redis_client),
-        PTIAdapter(redis_client=redis_client),
     ]
+    # Primary-source doctrine (founder decision 2026-07-19): third-party news
+    # is lagged echo of the filings we already process first-hand (measured
+    # over 30d: 47%+ of its high-magnitude events were filing echoes; much of
+    # the rest was recommendation listicles) — so wire/media adapters are OFF
+    # by default. Code kept intact; re-enable any of them without a rebuild
+    # via INGESTION_EXTRA_SOURCES (comma-separated source names).
+    _third_party = {
+        "ECONOMIC_TIMES": EconomicTimesAdapter,
+        "MINT": MintAdapter,
+        "MARKETS_FEED": NDTVProfitAdapter,
+        "INVESTING_IN": MoneyControlAdapter,
+        "REUTERS_INDIA": ReutersIndiaAdapter,
+        "PTI": PTIAdapter,
+    }
+    _extra = {s.strip().upper()
+              for s in os.getenv("INGESTION_EXTRA_SOURCES", "").split(",")
+              if s.strip()}
+    for _name, _cls in _third_party.items():
+        if _name in _extra:
+            adapters.append(_cls(redis_client=redis_client))
+            logger.info(f"[{_name}] third-party source ENABLED via INGESTION_EXTRA_SOURCES")
+        else:
+            logger.info(f"[{_name}] disabled (primary-source doctrine)")
     # BSE-only universe filings. Env kill switch: every announcement enters the
     # full LLM pipeline, so a runaway-cost situation must be stoppable with an
     # env flip + restart, not a rebuild.

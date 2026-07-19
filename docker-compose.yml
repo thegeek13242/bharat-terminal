@@ -268,6 +268,11 @@ services:
     restart: unless-stopped
     logging: *default-logging
 
+  # ingestion-worker note: third-party news adapters (ET/Mint/PTI/Reuters/
+  # Investing/NDTV) are DISABLED by default since 2026-07-19 (primary-source
+  # doctrine — see ingestion/main.py). Re-enable without rebuild:
+  #   INGESTION_EXTRA_SOURCES: "PTI,REUTERS_INDIA"
+
   transcript-watcher:
     # Real-time concall transcript pipeline (A1): polls for new transcript
     # announcements (ingestion lands them within minutes of the exchange
