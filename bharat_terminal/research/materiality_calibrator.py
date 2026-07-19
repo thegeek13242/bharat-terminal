@@ -45,6 +45,7 @@ _EVENTS_SQL = """
 CREATE TEMP TABLE _cal_events AS
 SELECT ir.id AS impact_id, ir.created_at, ni.source,
        coalesce(ni.category, '') AS category,
+       coalesce(ni.headline, '') AS headline,
        upper(ci->>'symbol') AS symbol,
        coalesce((ci->>'magnitude')::int, 0) AS magnitude,
        coalesce(ci->>'sentiment', 'neutral') AS sentiment,
@@ -70,14 +71,15 @@ WHERE ir.relevant
 
 _PX_SQL = """
 CREATE TEMP TABLE _cal_px AS
-SELECT symbol, date, close,
+SELECT symbol, date, close, ret5_pre,
        stddev_samp(ret) OVER w AS vol60,
        count(ret) OVER w AS nret,
        avg(traded_cr) OVER w AS adv_cr
 FROM (
     SELECT symbol, date, close,
            close * coalesce(volume, 0) / 1e7 AS traded_cr,
-           close / nullif(lag(close) OVER (PARTITION BY symbol ORDER BY date), 0) - 1 AS ret
+           close / nullif(lag(close) OVER (PARTITION BY symbol ORDER BY date), 0) - 1 AS ret,
+           close / nullif(lag(close, 5) OVER (PARTITION BY symbol ORDER BY date), 0) - 1 AS ret5_pre
     FROM price_points
     WHERE symbol IN (SELECT DISTINCT symbol FROM _cal_events)
       AND date >= (SELECT min(public_day) FROM _cal_events) - 120
@@ -87,11 +89,13 @@ WINDOW w AS (PARTITION BY symbol ORDER BY date
 """
 
 _JOIN_SQL = """
-SELECT e.*, b.close AS base_close, b.vol60, b.adv_cr,
-       r.close AS react_close, r.date AS react_date
+SELECT e.*, b.close AS base_close, b.vol60, b.adv_cr, b.ret5_pre,
+       r.close AS react_close, r.date AS react_date,
+       c.mcap_cr,
+       es.sue_abs, es.sue_found
 FROM _cal_events e
 JOIN LATERAL (
-    SELECT close, vol60, adv_cr, nret FROM _cal_px p
+    SELECT close, vol60, adv_cr, nret, ret5_pre FROM _cal_px p
     WHERE p.symbol = e.symbol AND p.date < e.public_day
     ORDER BY date DESC LIMIT 1
 ) b ON b.nret >= :min_vol_obs AND b.vol60 IS NOT NULL AND b.vol60 > 0
@@ -100,6 +104,16 @@ JOIN LATERAL (
     WHERE p.symbol = e.symbol AND p.date >= e.public_day
     ORDER BY date ASC LIMIT 1
 ) r ON r.date <= e.public_day + 7
+LEFT JOIN companies c ON c.symbol = e.symbol
+LEFT JOIN LATERAL (
+    SELECT abs(s.sue_composite) AS sue_abs, 1 AS sue_found
+    FROM earnings_surprises s
+    WHERE s.symbol = e.symbol AND s.sue_composite IS NOT NULL
+      AND s.announced_at BETWEEN e.created_at - interval '3 days'
+                             AND e.created_at + interval '1 day'
+    ORDER BY abs(extract(epoch FROM s.announced_at - e.created_at)) ASC
+    LIMIT 1
+) es ON true
 WHERE e.magnitude > 0
 """
 
@@ -126,6 +140,47 @@ async def build_dataset(days: int, filings_only: bool = False):
     return df
 
 
+_EVENT_TYPES = [
+    # (bucket, keywords) — first match wins; NSE headline template puts the
+    # event after "informed the Exchange about/regarding".
+    ("results", ("financial result", "unaudited", "audited result", "results for")),
+    ("transcript", ("transcript",)),
+    ("concall_invite", ("earnings call", "conference call", "call invite",
+                        "link of recording", "audio recording")),
+    ("investor_meet", ("investor meet", "analyst", "institutional investor")),
+    ("order_win", ("order", "contract", "loa", "letter of award", "work order",
+                   "bagging", "awarded")),
+    ("acquisition_stake", ("acquisition", "acquire", "stake", "amalgamation",
+                           "merger", "demerger", "scheme of arrangement",
+                           "joint venture", "subsidiary")),
+    ("fund_raise", ("fund raise", "fund raising", "qip", "preferential",
+                    "rights issue", "allotment", "issue of", "warrant",
+                    "capital raise", "ncd", "debenture", "bond")),
+    ("rating", ("rating", "crisil", "icra", "care ratings", "india ratings")),
+    ("pledge_sast", ("pledge", "sast", "insider trading", "encumbrance")),
+    ("corp_action", ("dividend", "bonus", "split", "buyback", "buy-back",
+                     "record date")),
+    ("board_meeting", ("board meeting", "meeting of the board")),
+    ("agm_egm", ("agm", "egm", "annual general", "extraordinary general",
+                 "postal ballot", "voting result", "scrutinizer")),
+    ("mgmt_change", ("resignation", "appointment", "cessation",
+                     "change in manage", "change in director", "kmp")),
+    ("newspaper_noise", ("newspaper", "clipping", "advertisement",
+                         "press release published")),
+    ("regulation_generic", ("regulation 30", "regulation 74", "compliance certificate",
+                            "trading window", "closure of trading")),
+]
+
+
+def event_type(headline: str) -> str:
+    """Deterministic event-type bucket from the filing headline."""
+    h = (headline or "").lower()
+    for bucket, keys in _EVENT_TYPES:
+        if any(k in h for k in keys):
+            return bucket
+    return "other"
+
+
 def featurize(df):
     """Label + feature matrix. Everything here is event-time knowable."""
     import numpy as np
@@ -144,17 +199,40 @@ def featurize(df):
     X["vol60_log"] = np.log(df["vol60"])
     X["adv_cr_log"] = np.log1p(df["adv_cr"].clip(lower=0))
     X["market_hours"] = df["market_hours"].astype(int)
+    # v2: event taxonomy, surprise magnitude, priced-in run-up, size.
+    df["event_type"] = df["headline"].map(event_type)
+    X["sue_abs"] = df["sue_abs"].fillna(0).clip(0, 10)
+    X["has_sue"] = df["sue_found"].fillna(0).astype(int)
+    X["runup_sigma"] = (df["ret5_pre"].abs()
+                        / (df["vol60"] * np.sqrt(5))).clip(0, 10).fillna(0)
+    X["mcap_log"] = np.log1p(df["mcap_cr"].fillna(0))
+    X["mcap_missing"] = df["mcap_cr"].isna().astype(int)
     for col, prefix in (("sentiment", "sent"), ("horizon", "hz"),
-                        ("source", "src")):
+                        ("source", "src"), ("category", "cat"),
+                        ("event_type", "ev")):
         d = pd.get_dummies(df[col].fillna("").astype(str).str.lower(),
                            prefix=prefix, dtype=int)
-        # cap cardinality defensively
-        X = pd.concat([X, d.iloc[:, :12]], axis=1)
+        # cap cardinality defensively (event_type has 16 buckets)
+        X = pd.concat([X, d.iloc[:, :24]], axis=1)
     y = df["material"]
     return X, y, df
 
 
-def train_and_evaluate(df, test_days: int, split_frac: float | None = None):
+async def embed_headlines(df):
+    """768-dim headline embeddings via the existing Vertex helper, deduped.
+    Returns an (n, 768) numpy matrix aligned to df rows."""
+    import numpy as np
+    from bharat_terminal.llm.embeddings import embed_texts
+
+    uniq = df["headline"].fillna("").unique().tolist()
+    logger.info(f"embedding {len(uniq)} unique headlines")
+    vecs = await embed_texts(uniq, task_type="RETRIEVAL_DOCUMENT")
+    lookup = {h: v for h, v in zip(uniq, vecs)}
+    return np.array([lookup[h] for h in df["headline"].fillna("")])
+
+
+def train_and_evaluate(df, test_days: int, split_frac: float | None = None,
+                       emb=None):
     """Time-split train/eval. Returns metrics dict + fitted best model."""
     import numpy as np
     from sklearn.linear_model import LogisticRegression
@@ -193,16 +271,34 @@ def train_and_evaluate(df, test_days: int, split_frac: float | None = None):
     except ValueError:
         metrics["baseline_magnitude_auc"] = None
 
-    models = {
-        "logistic": make_pipeline(
+    variants = {
+        "logistic": (make_pipeline(
             StandardScaler(),
             LogisticRegression(max_iter=2000, random_state=SEED)),
-        "hgb": HistGradientBoostingClassifier(random_state=SEED),
+            Xtr.values, Xte.values),
+        "hgb": (HistGradientBoostingClassifier(random_state=SEED),
+                Xtr.values, Xte.values),
     }
+    if emb is not None:
+        # Headline embeddings compressed to 64 dims; SVD fit on TRAIN ONLY.
+        from sklearn.decomposition import TruncatedSVD
+        svd = TruncatedSVD(n_components=64, random_state=SEED)
+        etr = svd.fit_transform(emb[tr.values])
+        ete = svd.transform(emb[te.values])
+        metrics["svd_explained_var"] = round(
+            float(svd.explained_variance_ratio_.sum()), 3)
+        htr = np.hstack([Xtr.values, etr])
+        hte = np.hstack([Xte.values, ete])
+        variants["emb_logistic"] = (make_pipeline(
+            StandardScaler(),
+            LogisticRegression(max_iter=3000, random_state=SEED)), htr, hte)
+        variants["emb_hgb"] = (
+            HistGradientBoostingClassifier(random_state=SEED), htr, hte)
+
     best_name, best_brier, best_model, best_p = None, 1e9, None, None
-    for name, m in models.items():
-        m.fit(Xtr, ytr)
-        p = m.predict_proba(Xte)[:, 1]
+    for name, (m, xtr_v, xte_v) in variants.items():
+        m.fit(xtr_v, ytr)
+        p = m.predict_proba(xte_v)[:, 1]
         b = brier_score_loss(yte, p)
         metrics[f"{name}_brier"] = round(b, 4)
         metrics[f"{name}_auc"] = round(roc_auc_score(yte, p), 4)
@@ -232,6 +328,7 @@ def main() -> None:
     ap.add_argument("--days", type=int, default=400)
     ap.add_argument("--test-days", type=int, default=30)
     ap.add_argument("--filings-only", action="store_true")
+    ap.add_argument("--no-embeddings", action="store_true")
     ap.add_argument("--split-frac", type=float, default=None,
                     help="Proportional time split, e.g. 0.3 = last 30%% as test.")
     args = ap.parse_args()
@@ -239,8 +336,11 @@ def main() -> None:
     df = asyncio.run(build_dataset(args.days, filings_only=args.filings_only))
     if df.empty:
         raise SystemExit("no dataset rows")
-    metrics, model = train_and_evaluate(df, args.test_days, args.split_frac)
+    emb = None if args.no_embeddings else asyncio.run(embed_headlines(df))
+    metrics, model = train_and_evaluate(df, args.test_days, args.split_frac,
+                                        emb=emb)
     metrics["filings_only"] = args.filings_only
+    metrics["feature_version"] = 2
 
     os.makedirs(EXPORT_DIR, exist_ok=True)
     stamp = datetime.now(timezone.utc).date().isoformat()
