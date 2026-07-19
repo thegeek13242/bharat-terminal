@@ -525,6 +525,209 @@ async def _store_stub(SessionFactory, r, symbol: str, status: str) -> None:
         await db.commit()
 
 
+# ── Letter-link recovery ───────────────────────────────────────────────────
+# Some companies file only an intimation letter ("transcript available on our
+# website") — the real transcript lives at a link inside the letter. Recovery
+# re-reads the letter PDF's link annotations (immune to text-extraction URL
+# mangling), falls back to a text regex, follows IR-page HTML one hop, and
+# runs every candidate through the SAME gates as normal ingestion (PDF magic,
+# density floor, zero-turn classification) — a wrong document cannot land.
+
+_URL_RE = re.compile(r"https?://[^\s<>\")\]]{8,200}")
+_SKIP_HOSTS = ("nseindia", "bseindia", "sebi.gov", "twitter", "facebook",
+               "linkedin", "youtube", "instagram")
+RECOVERY_MIN_CHARS = int(os.getenv("TRANSCRIPT_RECOVERY_MIN_CHARS", "5000"))
+
+
+def _letter_urls(letter_pdf: bytes, letter_text: str) -> list[str]:
+    """Candidate URLs from a letter: PDF link annotations first (reliable),
+    then text-regex finds (may be truncated by extraction)."""
+    import pypdf
+
+    urls: list[str] = []
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(letter_pdf))
+        for page in reader.pages:
+            annots = page.get("/Annots")
+            if annots is None:
+                continue
+            # /Annots is often an IndirectObject — resolve before iterating,
+            # or the loop silently yields nothing.
+            for annot in annots.get_object() or []:
+                try:
+                    uri = annot.get_object().get("/A", {}).get("/URI")
+                    if uri:
+                        urls.append(str(uri))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    # Text-regex fallback. PDF extraction wraps long URLs across lines, so a
+    # raw match is often truncated ("…Transcript-of-Q4-of-FY-" ⏎ "2025-26.pdf")
+    # — also emit variants with the following tokens spliced back on.
+    for m in _URL_RE.finditer(letter_text or ""):
+        urls.append(m.group(0))
+        acc = m.group(0)
+        tail = (letter_text or "")[m.end():m.end() + 120]
+        for tok in tail.split()[:3]:
+            if not re.fullmatch(r"[\w.%/–—-]+", tok) or ":" in tok:
+                break
+            acc += tok
+            urls.append(acc)
+    out, seen = [], set()
+    for u in urls:
+        u = u.strip().rstrip(".,;)'\"").replace("\xad", "")
+        low = u.lower()
+        if low in seen or low.startswith("mailto:"):
+            continue
+        if any(h in low for h in _SKIP_HOSTS):
+            continue
+        seen.add(low)
+        out.append(u)
+    # Most-promising first: explicit transcript links, then PDFs; among
+    # variants of a wrapped URL, longest (fully re-joined) first.
+    out.sort(key=lambda u: ("transcript" not in u.lower(),
+                            ".pdf" not in u.lower(), -len(u)))
+    return out
+
+
+def _html_transcript_links(base_url: str, html: str) -> list[str]:
+    """One-hop scrape of an IR page: anchors that look like transcript PDFs,
+    recent-period first."""
+    from urllib.parse import urljoin
+    from bs4 import BeautifulSoup
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return []
+    scored: list[tuple[int, str]] = []
+    for a in soup.find_all("a", href=True):
+        blob = f"{a['href']} {a.get_text(' ', strip=True)}".lower()
+        if "transcript" not in blob:
+            continue
+        url = urljoin(base_url, a["href"])
+        if any(h in url.lower() for h in _SKIP_HOSTS):
+            continue
+        score = 0
+        score += 2 if ".pdf" in url.lower() else 0
+        score += 1 if re.search(r"q4|q1|fy[\s-]?26|fy[\s-]?27|2026", blob) else 0
+        scored.append((-score, url))
+    scored.sort()
+    seen, out = set(), []
+    for _, u in scored:
+        if u.lower() not in seen:
+            seen.add(u.lower())
+            out.append(u)
+    return out
+
+
+async def _fetch_any(client: httpx.AsyncClient, url: str):
+    """Fetch an arbitrary (company-site) URL. Returns ('pdf'|'html', bytes)
+    or (None, b''). No exchange Referer — these are third-party hosts."""
+    try:
+        resp = await client.get(url, headers={
+            "User-Agent": _PDF_HEADERS["User-Agent"],
+            "Accept": "text/html,application/pdf,*/*",
+        }, timeout=FETCH_TIMEOUT_S, follow_redirects=True)
+        if resp.status_code != 200:
+            return None, b""
+        data = resp.content
+        if len(data) > TRANSCRIPT_PDF_MAX_BYTES:
+            return None, b""
+        if data[:5].startswith(b"%PDF"):
+            return "pdf", data
+        ctype = (resp.headers.get("content-type") or "").lower()
+        if "html" in ctype or data[:200].lstrip().lower().startswith(
+                (b"<!doctype", b"<html")):
+            return "html", data
+        return None, b""
+    except Exception as e:
+        logger.debug(f"[transcripts] recovery fetch failed {url}: {e}")
+        return None, b""
+
+
+async def _try_ingest_recovered(SessionFactory, row, pdf_bytes: bytes,
+                                source_url: str) -> bool:
+    """Run a recovered PDF through the normal gates; update the row only if
+    it survives all of them (incl. the zero-turn gate via _structure_row)."""
+    full_text, pages, page_offsets = await asyncio.to_thread(
+        extract_full_text, pdf_bytes)
+    if not full_text or len(full_text) < RECOVERY_MIN_CHARS:
+        return False
+    if pages and len(full_text) / pages < MIN_CHARS_PER_PAGE:
+        return False  # scanned — would only land as needs_ocr; keep looking
+    async with SessionFactory() as db:
+        await db.execute(text("""
+            UPDATE concall_transcripts
+            SET full_text = :t, pdf_url = :url, pdf_bytes = :b,
+                page_count = :p, char_count = :c, parse_status = 'ok',
+                structure = NULL, structure_status = 'pending',
+                updated_at = now()
+            WHERE news_id = :nid
+        """), {"t": full_text, "url": source_url, "b": len(pdf_bytes),
+               "p": pages, "c": len(full_text), "nid": row.news_id})
+        await db.commit()
+    ok = await _structure_row(SessionFactory, row.news_id, row.symbol,
+                              full_text, page_offsets)
+    if not ok:
+        return True  # transcript stored; structure retryable via --restructure
+    async with SessionFactory() as db:
+        status = (await db.execute(text(
+            "SELECT parse_status FROM concall_transcripts WHERE news_id=:n"),
+            {"n": row.news_id})).scalar_one()
+    return status == "ok"  # zero-turn gate may have re-flagged it
+
+
+async def recover_links(limit: Optional[int] = None) -> dict:
+    """Recover real transcripts for letter-only filings (parse_status =
+    'not_transcript') from the links inside the letters."""
+    from bharat_terminal.kb.sync.utils import create_async_session
+
+    stats = {"candidates": 0, "recovered": 0, "no_links": 0, "unrecovered": 0}
+    SessionFactory = create_async_session()
+    async with SessionFactory() as db:
+        rows = (await db.execute(text(f"""
+            SELECT news_id, symbol, pdf_url, full_text
+            FROM concall_transcripts WHERE parse_status = 'not_transcript'
+            ORDER BY symbol
+            {f"LIMIT {int(limit)}" if limit else ""}
+        """))).all()
+    stats["candidates"] = len(rows)
+    logger.info(f"[transcripts] recovery: {len(rows)} letter-only row(s)")
+
+    async with httpx.AsyncClient() as http:
+        for r in rows:
+            letter, _ = await _fetch_pdf(http, r.pdf_url)
+            urls = _letter_urls(letter or b"", r.full_text or "")
+            if not urls:
+                stats["no_links"] += 1
+                logger.info(f"[transcripts] recovery {r.symbol}: no usable links")
+                continue
+            recovered = False
+            tried = 0
+            queue = list(urls)
+            while queue and tried < 8 and not recovered:
+                url = queue.pop(0)
+                tried += 1
+                kind, data = await _fetch_any(http, url)
+                if kind == "pdf":
+                    recovered = await _try_ingest_recovered(
+                        SessionFactory, r, data, url)
+                elif kind == "html":
+                    # one-hop expansion; scraped links go to the front
+                    queue = _html_transcript_links(url, data.decode(
+                        "utf-8", "ignore"))[:4] + queue
+                await asyncio.sleep(POLITENESS_DELAY_S)
+            stats["recovered" if recovered else "unrecovered"] += 1
+            logger.info(f"[transcripts] recovery {r.symbol}: "
+                        f"{'RECOVERED' if recovered else 'unrecovered'} "
+                        f"({tried} url(s) tried)")
+
+    logger.info(f"[transcripts] recovery DONE: {stats}")
+    return stats
+
+
 async def watch(interval_s: int) -> None:
     """Real-time mode: poll for new transcript announcements forever.
     Ingestion lands the announcement (with the PDF URL) within minutes of the
@@ -559,6 +762,9 @@ def main() -> None:
                     help="Recover pre-Jul-04 attachment URLs via the NSE "
                          "announcements API and ingest those transcripts "
                          "(no structuring; run --restructure after).")
+    ap.add_argument("--recover-links", action="store_true",
+                    help="For letter-only filings (not_transcript), fetch the "
+                         "real transcript from the links inside the letter.")
     ap.add_argument("--watch", action="store_true",
                     help="Run forever, syncing new transcripts as they arrive.")
     ap.add_argument("--interval", type=int,
@@ -572,6 +778,9 @@ def main() -> None:
         # Availability-first: never structure inline here; --restructure after.
         stats = asyncio.run(backfill_nse(limit=args.limit, structure=False))
         sys.exit(0 if stats.get("api_failed", 0) == 0 else 1)
+    if args.recover_links:
+        stats = asyncio.run(recover_links(limit=args.limit))
+        sys.exit(0)
     if args.restructure:
         stats = asyncio.run(restructure(limit=args.limit))
         sys.exit(0 if stats.get("fetch_failed", 0) == 0 else 1)
