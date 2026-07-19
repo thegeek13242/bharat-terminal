@@ -110,6 +110,9 @@ export const api = {
 
   getTranscript: (id: number) => request<any>(`/transcripts/id/${id}`),
 
+  getResearchChatHistory: (limit = 20) =>
+    request<{ items: any[] }>(`/research-chat/history?limit=${limit}`),
+
   askResearchChat: (messages: { role: 'user' | 'assistant'; content: string }[]) =>
     request<{
       answer: string; citations: any[]; status: string;

@@ -29,23 +29,79 @@ const KIND_COLOR: Record<string, string> = {
   web: 'var(--warn, #c2a05e)',
 };
 
-/** Render answer text, turning [T1] markers into small citation superscripts. */
+/** Inline renderer: **bold**, `code`, and [T1] citation markers. */
+function Inline({ text, byRef }: { text: string; byRef: Map<string, Citation> }) {
+  const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`|\[T\d+\])/g);
+  return (
+    <>
+      {parts.map((p, i) => {
+        const cite = p.match(/^\[(T\d+)\]$/);
+        if (cite) {
+          const c = byRef.get(cite[1]);
+          if (!c) return null;
+          return (
+            <sup key={i} className="mono" title={c.label} style={{ fontSize: 9, color: KIND_COLOR[c.kind] ?? 'var(--accent)', margin: '0 1px' }}>
+              [{cite[1].slice(1)}]
+            </sup>
+          );
+        }
+        if (p.startsWith('**') && p.endsWith('**'))
+          return <strong key={i} style={{ color: 'var(--ink)' }}>{p.slice(2, -2)}</strong>;
+        if (p.startsWith('`') && p.endsWith('`'))
+          return <code key={i} className="mono" style={{ fontSize: 12, background: 'var(--bg-elev)', padding: '0 4px', borderRadius: 3 }}>{p.slice(1, -1)}</code>;
+        return <span key={i}>{p}</span>;
+      })}
+    </>
+  );
+}
+
+/** Markdown-lite block renderer for the subset the engine is instructed to
+ *  emit: paragraphs, flat bullet/numbered lists, bold, code, [Tn] markers. */
 function AnswerText({ text, citations }: { text: string; citations: Citation[] }) {
   const byRef = new Map(citations.map((c) => [c.ref, c]));
-  const parts = text.split(/(\[T\d+\])/g);
+  const lines = (text || '').split('\n');
+  const blocks: { kind: 'p' | 'ul' | 'ol'; items: string[] }[] = [];
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    const bullet = line.match(/^\s*[*-]\s+(.*)$/);
+    const numbered = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (bullet) {
+      if (blocks[blocks.length - 1]?.kind !== 'ul') blocks.push({ kind: 'ul', items: [] });
+      blocks[blocks.length - 1].items.push(bullet[1]);
+    } else if (numbered) {
+      if (blocks[blocks.length - 1]?.kind !== 'ol') blocks.push({ kind: 'ol', items: [] });
+      blocks[blocks.length - 1].items.push(numbered[1]);
+    } else if (line.trim() === '') {
+      if (blocks[blocks.length - 1]?.kind === 'p') blocks.push({ kind: 'p', items: [] });
+    } else {
+      // Strip stray heading markers rather than rendering giant headers.
+      const cleaned = line.replace(/^\s*#+\s*/, '');
+      const last = blocks[blocks.length - 1];
+      if (last?.kind === 'p') last.items.push(cleaned);
+      else blocks.push({ kind: 'p', items: [cleaned] });
+    }
+  }
   return (
-    <div style={{ fontSize: 13, lineHeight: 1.68, color: 'var(--ink-2)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-      {parts.map((p, i) => {
-        const m = p.match(/^\[(T\d+)\]$/);
-        if (!m) return <span key={i}>{p}</span>;
-        const c = byRef.get(m[1]);
-        if (!c) return null;
-        return (
-          <sup key={i} className="mono" title={c.label} style={{ fontSize: 9, color: KIND_COLOR[c.kind] ?? 'var(--accent)', margin: '0 1px' }}>
-            [{m[1].slice(1)}]
-          </sup>
-        );
-      })}
+    <div style={{ fontSize: 13, lineHeight: 1.68, color: 'var(--ink-2)', wordBreak: 'break-word' }}>
+      {blocks.filter((b) => b.items.length).map((b, i) =>
+        b.kind === 'p' ? (
+          <p key={i} style={{ margin: '0 0 10px' }}>
+            <Inline text={b.items.join(' ')} byRef={byRef} />
+          </p>
+        ) : b.kind === 'ul' ? (
+          <ul key={i} style={{ margin: '0 0 10px', paddingLeft: 18 }}>
+            {b.items.map((it, j) => (
+              <li key={j} style={{ marginBottom: 4 }}><Inline text={it} byRef={byRef} /></li>
+            ))}
+          </ul>
+        ) : (
+          <ol key={i} style={{ margin: '0 0 10px', paddingLeft: 18 }}>
+            {b.items.map((it, j) => (
+              <li key={j} style={{ marginBottom: 4 }}><Inline text={it} byRef={byRef} /></li>
+            ))}
+          </ol>
+        ),
+      )}
     </div>
   );
 }
@@ -87,10 +143,37 @@ export function Research() {
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [budget, setBudget] = useState<{ remaining_usd: number; budget_usd: number } | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Hydrate previous exchanges from the audit log (the log IS the history).
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
+    let cancelled = false;
+    api
+      .getResearchChatHistory(20)
+      .then(({ items }) => {
+        if (cancelled) return;
+        const turns: ChatTurn[] = [];
+        for (const it of items) {
+          turns.push({ role: 'user', content: it.question });
+          turns.push({
+            role: 'assistant',
+            content: it.answer,
+            citations: it.citations,
+            meta: `${new Date(it.asked_at).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })} · ${it.turns} tool turn${it.turns === 1 ? '' : 's'}`,
+          });
+        }
+        setThread(turns);
+      })
+      .catch(() => {})
+      .finally(() => !cancelled && setHistoryLoading(false));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: busy ? 'smooth' : 'auto' });
   }, [thread, busy]);
 
   async function send() {
@@ -174,7 +257,12 @@ export function Research() {
 
         <div ref={scrollRef} style={{ flex: 1, overflow: 'auto', minHeight: 0, padding: '18px 24px' }}>
           <div style={{ maxWidth: 780, margin: '0 auto' }}>
-            {thread.length === 0 && (
+            {historyLoading && (
+              <div className="mono" style={{ marginTop: 60, textAlign: 'center', fontSize: 11, color: 'var(--ink-mute)' }}>
+                Loading history…
+              </div>
+            )}
+            {!historyLoading && thread.length === 0 && (
               <div style={{ marginTop: 60, textAlign: 'center' }}>
                 <div className="mono" style={{ fontSize: 12, color: 'var(--ink-mute)' }}>
                   Ask about any covered company.

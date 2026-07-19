@@ -174,6 +174,8 @@ SCOPE (SEBI research-analyst boundary — absolute):
 STYLE:
 - Terminal-brief. Lead with the answer. Short paragraphs, no headers
   unless genuinely needed. Numbers exactly as sourced ("as stated" units).
+- Markdown: ONLY **bold** and flat bullet (*) or numbered lists — never
+  tables, headers, nested lists, or links.
 - When quoting a transcript, quote verbatim and keep it short."""
 
 

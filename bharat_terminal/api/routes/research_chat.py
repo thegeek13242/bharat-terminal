@@ -45,6 +45,37 @@ class ChatMessage(BaseModel):
     content: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
 
 
+@router.get("/history")
+async def history(
+    limit: int = 20,
+    user: dict = Depends(require_internal_user),
+):
+    """The user's own recent exchanges, oldest→newest — the audit log IS the
+    history store. Failures and empty answers are excluded from display
+    (they remain in the log)."""
+    session_factory = get_session_factory()
+    email = (user.get("email") or "?").lower()
+    async with session_factory() as session:
+        rows = (await session.execute(text("""
+            SELECT question, answer, citations, asked_at, model, turns,
+                   latency_ms
+            FROM research_chat_log
+            WHERE user_email = :e AND status = 'ok'
+              AND answer IS NOT NULL AND answer != ''
+            ORDER BY id DESC
+            LIMIT :lim
+        """), {"e": email, "lim": max(1, min(int(limit), 100))})).all()
+    return {"items": [{
+        "question": r.question,
+        "answer": r.answer,
+        "citations": r.citations or [],
+        "asked_at": r.asked_at.isoformat(),
+        "model": r.model,
+        "turns": r.turns,
+        "latency_ms": r.latency_ms,
+    } for r in reversed(rows)]}
+
+
 @router.post("/ask")
 async def ask(
     messages: List[ChatMessage] = Body(..., embed=True),
