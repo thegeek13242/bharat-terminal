@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { NavSidebar } from '@/components/NavSidebar';
-import { api } from '@/lib/api';
+import { api, ApiError } from '@/lib/api';
 
 interface Citation {
   ref: string;
@@ -86,6 +86,7 @@ export function Research() {
   const [thread, setThread] = useState<ChatTurn[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
+  const [budget, setBudget] = useState<{ remaining_usd: number; budget_usd: number } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -103,19 +104,28 @@ export function Research() {
       const res = await api.askResearchChat(
         next.map((t) => ({ role: t.role, content: t.content })),
       );
+      setBudget(res.budget ?? null);
       setThread((cur) => [
         ...cur,
         {
           role: 'assistant',
           content: res.answer || '(no answer)',
           citations: res.citations,
-          meta: `${res.turns} tool turn${res.turns === 1 ? '' : 's'} · ${(res.latency_ms / 1000).toFixed(1)}s · ${res.model}`,
+          meta: `${res.turns} tool turn${res.turns === 1 ? '' : 's'} · ${(res.latency_ms / 1000).toFixed(1)}s · ${res.model}`
+            + (res.budget ? ` · $${res.budget.remaining_usd.toFixed(2)} left this month` : ''),
         },
       ]);
-    } catch {
+    } catch (e) {
+      const exceeded = e instanceof ApiError && e.status === 429;
       setThread((cur) => [
         ...cur,
-        { role: 'assistant', content: 'Chat unavailable — the engine errored. The attempt is audit-logged.', error: true },
+        {
+          role: 'assistant',
+          content: exceeded
+            ? `Monthly research budget exhausted ($${budget?.budget_usd?.toFixed(0) ?? '5'}). It resets on the first of next month.`
+            : 'Chat unavailable — the engine errored. The attempt is audit-logged.',
+          error: true,
+        },
       ]);
     } finally {
       setBusy(false);
@@ -137,6 +147,11 @@ export function Research() {
           <div className="mono upper" style={{ marginTop: 14, fontSize: 9, letterSpacing: '0.12em', color: 'var(--warn, #c2a05e)' }}>
             Internal dogfood — not customer-facing
           </div>
+          {budget && (
+            <div className="mono" style={{ marginTop: 8, fontSize: 10, color: 'var(--ink-dim)' }}>
+              ${budget.remaining_usd.toFixed(2)} of ${budget.budget_usd.toFixed(0)} left this month
+            </div>
+          )}
           {thread.length > 0 && (
             <button
               onClick={() => setThread([])}

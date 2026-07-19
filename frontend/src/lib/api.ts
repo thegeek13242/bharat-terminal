@@ -114,6 +114,7 @@ export const api = {
     request<{
       answer: string; citations: any[]; status: string;
       model: string; turns: number; latency_ms: number;
+      budget: { spent_usd: number; budget_usd: number; remaining_usd: number };
     }>('/research-chat/ask', { method: 'POST', body: JSON.stringify({ messages }) }),
 
   searchTranscripts: (q: string, symbol?: string, k = 10) => {
