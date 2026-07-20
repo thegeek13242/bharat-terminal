@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 import logging
 from abc import ABC, abstractmethod
@@ -24,6 +25,12 @@ MARKET_CLOSE_IST = dtime(16, 0)
 
 # Redis key prefix for persistent seen-id sets
 SEEN_IDS_KEY_PREFIX = "news:seen:"
+
+# Backstop on the per-item publish callback. The 2026-07-20 stall parked
+# adapter loops forever inside the callback with no exception and no log —
+# this converts any such park into a loud TimeoutError, which the run loop
+# logs and fix-5d2cfde's post-publish seen-marking then turns into a retry.
+ADAPTER_CALLBACK_TIMEOUT_S = float(os.getenv("ADAPTER_CALLBACK_TIMEOUT_S", "120"))
 SEEN_IDS_TTL_SECONDS = 48 * 3600
 
 logger = logging.getLogger(__name__)
@@ -181,7 +188,12 @@ class BaseAdapter(ABC):
             f"slow={self.poll_interval_slow or self.poll_interval_seconds}s)"
         )
         await self._hydrate_seen()
+        self.last_cycle_ts = time.time()
         while True:
+            # Liveness heartbeat: proves the loop itself is iterating. The
+            # watchdog in main alerts when this freezes (stall ≠ crash — the
+            # crash alert never fires for a silent park).
+            self.last_cycle_ts = time.time()
             if self._is_circuit_open():
                 logger.warning(
                     f"[{self.source_name}] Circuit open, sleeping {self._recovery_timeout}s"
@@ -210,7 +222,15 @@ class BaseAdapter(ABC):
                             # refetched every cycle until it ages out.
                             await self.seen_add(item.id)
                             continue
-                    await callback(item)
+                    try:
+                        await asyncio.wait_for(
+                            callback(item), timeout=ADAPTER_CALLBACK_TIMEOUT_S)
+                    except asyncio.TimeoutError:
+                        logger.error(
+                            f"[{self.source_name}] publish callback timed out "
+                            f"after {ADAPTER_CALLBACK_TIMEOUT_S:.0f}s for "
+                            f"{item.id} — item stays unmarked and will retry")
+                        raise
                     # 2026-07-20 stall postmortem: marking seen BEFORE publish
                     # turned any downstream hang into permanent item loss
                     # (fetched, marked, never published, skipped forever).

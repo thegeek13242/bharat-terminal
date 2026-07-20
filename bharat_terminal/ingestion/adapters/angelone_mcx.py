@@ -322,6 +322,8 @@ class AngelOneMCXAdapter:
             self._redis = _aioredis.from_url(
                 os.getenv("REDIS_URL", "redis://redis:6379/0"),
                 encoding="utf-8", decode_responses=True,
+                # 2026-07-20 postmortem: wedged connections must raise, not park.
+                socket_timeout=10, socket_connect_timeout=5,
             )
         return self._redis
 

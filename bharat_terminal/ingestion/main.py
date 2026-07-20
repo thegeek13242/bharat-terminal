@@ -69,7 +69,11 @@ def _should_fetch_body(item: NewsItem) -> bool:
 async def _build_redis_client() -> Optional[aioredis.Redis]:
     """Connect to Redis with a quick ping. Returns None if unavailable (degraded mode)."""
     try:
-        client = aioredis.from_url(REDIS_URL, decode_responses=False)
+        # Socket timeouts (2026-07-20 postmortem): a wedged connection must
+        # raise, not park callers forever. No blocking redis commands are used
+        # in this service, so a hard socket_timeout is safe.
+        client = aioredis.from_url(REDIS_URL, decode_responses=False,
+                                   socket_timeout=10, socket_connect_timeout=5)
         pong = await client.ping()
         if pong:
             logger.info(f"Redis connected at {REDIS_URL}")
@@ -285,7 +289,53 @@ async def main():
         finally:
             await adapter.close()
 
+    def check_adapter_liveness(adapter_list, now, stall_after):
+        """Pure: [(source_name, idle_s)] for adapters whose loop froze."""
+        stalled = []
+        for a in adapter_list:
+            ts = getattr(a, "last_cycle_ts", None)
+            if ts is None:
+                continue
+            idle = now - ts
+            slow = a.poll_interval_slow or a.poll_interval_seconds or 60
+            if idle > max(3 * slow, stall_after):
+                stalled.append((a.source_name, idle))
+        return stalled
+
+    async def liveness_watchdog():
+        """Per-adapter stall detection (2026-07-20 postmortem): the crash
+        alert only fires on exceptions; a silently parked loop needs a
+        heartbeat check. Alerts name the adapter so triage starts at the
+        right stage instead of 'pipeline'."""
+        import time as _time
+        stall_after = float(os.getenv("ADAPTER_STALL_ALERT_S", "300"))
+        hb_every = float(os.getenv("ADAPTER_HEARTBEAT_LOG_S", "900"))
+        last_hb = 0.0
+        while True:
+            await asyncio.sleep(60)
+            now = _time.time()
+            for name, idle in check_adapter_liveness(adapters, now, stall_after):
+                logger.error(f"[liveness] {name} loop stalled — no cycle "
+                             f"for {idle:.0f}s")
+                try:
+                    from bharat_terminal.alerts import get_monitor
+                    get_monitor().alert_now(
+                        f"INGESTION_ADAPTER_STALLED_{name}",
+                        f"{name} adapter loop has not completed a cycle for "
+                        f"{idle:.0f}s. Items are safe (post-publish seen "
+                        f"marking) but ingestion for this source is DOWN. "
+                        f"docker kill -s USR1 bharat-ingestion for task stacks.")
+                except Exception:
+                    pass
+            if now - last_hb >= hb_every:
+                last_hb = now
+                beats = ", ".join(
+                    f"{a.source_name}={now - getattr(a, 'last_cycle_ts', now):.0f}s"
+                    for a in adapters)
+                logger.info(f"[liveness] adapter cycles: {beats}")
+
     tasks = [asyncio.create_task(adapter_task(a)) for a in adapters]
+    tasks.append(asyncio.create_task(liveness_watchdog(), name="liveness-watchdog"))
     logger.info(
         f"Started {len(tasks)} news adapter tasks + 1 sentiment adapter "
         f"(dedup={'on' if dedup else 'off'}, fetcher={'on' if fetcher else 'off'}, "
