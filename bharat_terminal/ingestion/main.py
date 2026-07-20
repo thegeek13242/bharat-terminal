@@ -216,6 +216,30 @@ async def main():
     else:
         logger.info("[BSE_FILINGS] disabled via BSE_FILINGS_ENABLED=0")
 
+    # SIGUSR1 → dump every asyncio task's stack to the log. Added during the
+    # 2026-07-20 pipeline-stall incident: adapter coroutines were parking
+    # forever with zero log output, and thread-level tools (py-spy) cannot see
+    # awaiting tasks. `docker kill -s USR1 bharat-ingestion` at any time.
+    def _dump_tasks(sig=None, frame=None):
+        import traceback
+        tasks = asyncio.all_tasks(loop)
+        logger.warning(f"[taskdump] {len(tasks)} task(s)")
+        for t in tasks:
+            # Task.get_stack() returns ONE frame for suspended coroutines —
+            # walk the cr_await chain manually to see the true parked leaf.
+            lines, obj, depth = [], t.get_coro(), 0
+            while obj is not None and depth < 12:
+                fr = getattr(obj, "cr_frame", None) or getattr(obj, "gi_frame", None)
+                if fr is not None:
+                    lines.append(f"    {fr.f_code.co_filename.split('/')[-1]}"
+                                 f":{fr.f_lineno} {fr.f_code.co_name}")
+                nxt = getattr(obj, "cr_await", None) or getattr(obj, "gi_yieldfrom", None)
+                if nxt is None:
+                    lines.append(f"    -> awaiting {type(obj).__name__}: {obj!r:.90}")
+                obj, depth = nxt, depth + 1
+            logger.warning(f"[taskdump] {t.get_name()} done={t.done()}\n"
+                           + "\n".join(lines or ["    <no frames>"]))
+
     shutdown_event = asyncio.Event()
 
     def _handle_shutdown(sig):
@@ -225,6 +249,7 @@ async def main():
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda s=sig: _handle_shutdown(s))
+    loop.add_signal_handler(signal.SIGUSR1, _dump_tasks)
 
     async def adapter_task(adapter):
         try:
