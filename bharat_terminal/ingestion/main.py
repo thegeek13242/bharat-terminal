@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 import redis.asyncio as aioredis
 
 from bharat_terminal.ingestion.kafka_producer import NewsKafkaProducer
-from bharat_terminal.ingestion.dedup import DedupFilter
+from bharat_terminal.ingestion.dedup import DedupFilter, url_fingerprint
 from bharat_terminal.ingestion.article_fetcher import ArticleFetcher
 from bharat_terminal.ingestion.adapters.nse_filings import NSEFilingsAdapter
 from bharat_terminal.ingestion.adapters.bse_filings import BSEFilingsAdapter
@@ -156,8 +156,11 @@ async def main():
                         f"Dedup [{reason}] {item.source}: {item.headline[:70]}"
                     )
                     return
-                dedup_hash = await dedup.mark_seen(item)
-                item = item.model_copy(update={"dedup_hash": dedup_hash})
+                # Hash computed WITHOUT persisting — dedup marks are written
+                # only after publish succeeds (2026-07-20 stall postmortem:
+                # mark-before-publish turned hangs into permanent item loss).
+                item = item.model_copy(
+                    update={"dedup_hash": url_fingerprint(item.url)})
             except Exception as e:
                 # Never let dedup failures block ingest — log and fall through
                 logger.warning(f"Dedup check failed for {item.id}: {e}")
@@ -181,6 +184,16 @@ async def main():
                 "body_extraction_method": item.body_extraction_method or "rss",
             })
             await producer.publish_enriched(enriched)
+
+        # Persist the dedup marks (URL fingerprint + simhash) only now, after
+        # every publish above has succeeded. A duplicate arriving in the tiny
+        # window before persistence would double-publish — accepted trade:
+        # duplicates are visible and harmless, silent loss is neither.
+        if dedup:
+            try:
+                await dedup.mark_seen(item)
+            except Exception as e:
+                logger.warning(f"Dedup persist failed for {item.id}: {e}")
 
     adapters = [
         NSEFilingsAdapter(redis_client=redis_client),

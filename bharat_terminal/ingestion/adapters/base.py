@@ -206,8 +206,18 @@ class BaseAdapter(ABC):
                                 f"[{self.source_name}] Dropping stale item "
                                 f"({age_h:.0f}h old): {item.headline[:70]}"
                             )
+                            # Deliberate drop — mark seen so it is not
+                            # refetched every cycle until it ages out.
+                            await self.seen_add(item.id)
                             continue
                     await callback(item)
+                    # 2026-07-20 stall postmortem: marking seen BEFORE publish
+                    # turned any downstream hang into permanent item loss
+                    # (fetched, marked, never published, skipped forever).
+                    # Seen is now recorded only after the callback — publish
+                    # included — has succeeded; a failed/hung item is simply
+                    # refetched next cycle.
+                    await self.seen_add(item.id)
                 self._record_success()
             except Exception as e:
                 logger.error(f"[{self.source_name}] Fetch error: {e}", exc_info=True)

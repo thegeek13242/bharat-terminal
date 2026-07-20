@@ -186,16 +186,20 @@ class BSEFilingsAdapter(BaseAdapter):
                     if self.seen_contains(uid):
                         continue
                     unseen += 1
-                    # Mark ALL rows seen (not just universe hits): lets the
-                    # pagination stop at the first fully-seen page, which is
-                    # what bounds steady-state cycles to ~1 request per day slot.
-                    await self.seen_add(uid)
-
+                    # FILTERED rows (non-universe / no headline) are marked
+                    # seen here — no publish obligation, and marking them is
+                    # what lets pagination stop at the first fully-seen page.
+                    # YIELDABLE rows are NOT marked here: since the 2026-07-20
+                    # stall postmortem, base.run() marks them only after the
+                    # publish callback succeeds, so a hang means retry — not
+                    # silent loss.
                     symbol = self._scrip_map.get(str(row.get("SCRIP_CD") or "").strip())
                     if not symbol:
+                        await self.seen_add(uid)
                         continue
                     headline = self._clean_headline(row.get("NEWSSUB") or "")
                     if not headline:
+                        await self.seen_add(uid)
                         continue
                     attachment = (row.get("ATTACHMENTNAME") or "").strip()
                     pending.append({

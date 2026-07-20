@@ -106,8 +106,9 @@ class NSEFilingsAdapter(BaseAdapter):
                         uid = f"NSE_{category}_{symbol}_{item.get(ts_field, '')}"
                         if self.seen_contains(uid):
                             continue
-                        await self.seen_add(uid)
-
+                        # Seen-marking for yieldable items moved to base.run()
+                        # post-publish (2026-07-20 stall postmortem). Only
+                        # filtered rows are marked here.
                         headline = (
                             item.get("attchmntText")
                             or item.get("bm_purpose")
@@ -115,6 +116,7 @@ class NSEFilingsAdapter(BaseAdapter):
                             or item.get("subject")
                         )
                         if not headline or not headline.strip():
+                            await self.seen_add(uid)
                             continue
 
                         ts_str = item.get(ts_field, "")
