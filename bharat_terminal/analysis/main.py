@@ -210,11 +210,15 @@ async def main():
             try:
                 lag = await consumer.lag()
                 idle_s = time.monotonic() - _state["last_publish"]
-                # Stall: nothing published for too long while work is pending
-                # (or during market hours, when steady flow is expected).
-                if idle_s >= STALL_NO_PUBLISH_MIN * 60 and (
-                    is_market_hours() or lag >= STALL_LAG_THRESHOLD
-                ):
+                # Stall = nothing published while work is PENDING. The old
+                # `or is_market_hours()` branch assumed steady market-hours
+                # flow — true in the news-firehose era, false since the
+                # primary-source doctrine (2026-07-19) made filings-only flow
+                # bursty: quiet pre-open/midday stretches are normal, and that
+                # branch paged CRITICAL on every 15-min lull (2026-07-22
+                # phantom-stall postmortem; upstream-dead detection now
+                # belongs to ingestion's per-adapter liveness watchdog).
+                if idle_s >= STALL_NO_PUBLISH_MIN * 60 and lag >= STALL_LAG_THRESHOLD:
                     get_monitor().alert_now(
                         "PIPELINE_STALL",
                         f"no analysis output for {idle_s / 60:.0f}min with {lag} "
