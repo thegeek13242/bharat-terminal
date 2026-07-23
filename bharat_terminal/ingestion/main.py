@@ -156,9 +156,10 @@ async def main():
             try:
                 is_dup, reason = await dedup.is_duplicate(item)
                 if is_dup:
-                    logger.debug(
-                        f"Dedup [{reason}] {item.source}: {item.headline[:70]}"
-                    )
+                    # "content" = the other exchange's copy of a dual-listed
+                    # filing — INFO so the cross-exchange win stays observable.
+                    log = logger.info if reason == "content" else logger.debug
+                    log(f"Dedup [{reason}] {item.source}: {item.headline[:70]}")
                     return
                 # Hash computed WITHOUT persisting — dedup marks are written
                 # only after publish succeeds (2026-07-20 stall postmortem:

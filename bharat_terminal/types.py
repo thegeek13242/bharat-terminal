@@ -30,6 +30,11 @@ class NewsItem(BaseModel):
     body_fetch_status: BodyFetchStatus = "pending"
     body_extraction_method: Optional[str] = None   # "trafilatura" | "readability" | "rss"
     dedup_hash: Optional[str] = None               # sha256 of normalized URL
+    # sha256 of the normalized attachment text (filings only; set by the
+    # adapter when body came from the filing PDF). Dual-listed companies file
+    # the SAME document on NSE and BSE — first exchange to publish wins, the
+    # later copy is dropped by the content dedup layer (see ingestion/dedup.py).
+    content_fingerprint: Optional[str] = None
     tier: NewsTier = "tier2"                       # Latency tier
 
 

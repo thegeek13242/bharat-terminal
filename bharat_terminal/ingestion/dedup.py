@@ -1,9 +1,15 @@
 """
 Redis-backed deduplication for cross-adapter news items.
 
-Two layers:
-  1. URL dedup  — sha256(normalized URL) in a Redis SET with 48h TTL
-  2. Content dedup — SimHash of (headline + first 200 chars of body);
+Three layers:
+  1. URL dedup      — sha256(normalized URL) in a Redis SET with 48h TTL
+  2. Exchange-copy dedup — exact sha256 of (symbol + normalized attachment
+                     text). Dual-listed companies file the SAME document on
+                     NSE and BSE (verified 2026-07-23: 7/7 sampled attachment
+                     pairs byte-identical) and both filings adapters extract
+                     text through the same code path, so equal text ⇒ same
+                     filing. First exchange to publish wins.
+  3. SimHash dedup  — SimHash of (headline + first 200 chars of body);
                      Hamming distance < 3 between two hashes means duplicate.
 
 Used by the Kafka producer *before* publishing, and by adapters before
@@ -26,10 +32,12 @@ logger = logging.getLogger(__name__)
 
 # Redis key prefixes
 URL_KEY_PREFIX = "news:dedup:url:"
+CONTENT_KEY_PREFIX = "news:dedup:content:"
 SIMHASH_KEY_PREFIX = "news:dedup:simhash:"
 SIMHASH_INDEX_KEY = "news:dedup:simhash:index"  # ZSET for nearby-hash lookup
 
 URL_TTL_SECONDS = 48 * 3600
+CONTENT_TTL_SECONDS = 48 * 3600
 SIMHASH_TTL_SECONDS = 48 * 3600
 SIMHASH_HAMMING_THRESHOLD = 3  # distances below this are considered duplicates
 
@@ -64,6 +72,31 @@ def url_fingerprint(url: str) -> str:
     return hashlib.sha256(normalize_url(url).encode("utf-8")).hexdigest()
 
 
+def text_fingerprint(text: str) -> Optional[str]:
+    """sha256 of whitespace-normalized text — the exchange-copy dedup key.
+
+    Exact-match by design: both filings adapters run the identical
+    pdf_fetch extraction (same pypdf, same cleanup, same char cap), so the
+    byte-identical PDF a dual-listed company uploads to both exchanges
+    always yields the same string. Anything fuzzier risks merging two
+    genuinely different filings — parse-failure over wrong data."""
+    norm = re.sub(r"\s+", " ", (text or "")).strip()
+    if not norm:
+        return None
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+
+def _content_key(item: NewsItem) -> Optional[str]:
+    """Redis key for the exchange-copy layer; None when not applicable.
+
+    Scoped by symbol: group companies legitimately file the same document
+    under several tickers (e.g. one Adani-cement concall filed by ACC,
+    AMBUJACEM and ORIENTCEM) — each must still be analyzed per company."""
+    if not item.content_fingerprint or not item.symbols_mentioned:
+        return None
+    return f"{CONTENT_KEY_PREFIX}{item.symbols_mentioned[0]}:{item.content_fingerprint}"
+
+
 def _content_tokens(item: NewsItem) -> str:
     """Tokens used for SimHash content fingerprint."""
     text = (item.headline or "") + " " + (item.body or "")[:200]
@@ -93,9 +126,9 @@ class DedupFilter:
 
     async def is_duplicate(self, item: NewsItem) -> Tuple[bool, Optional[str]]:
         """
-        Return (is_duplicate, reason). Reason is one of: "url", "simhash", None.
-        Does NOT mark the item as seen — caller must call mark_seen separately
-        after a successful publish.
+        Return (is_duplicate, reason). Reason is one of: "url", "content",
+        "simhash", None. Does NOT mark the item as seen — caller must call
+        mark_seen separately after a successful publish.
         """
         # URL layer
         fp = url_fingerprint(item.url)
@@ -103,6 +136,13 @@ class DedupFilter:
             exists = await self._redis.exists(f"{URL_KEY_PREFIX}{fp}")
             if exists:
                 return True, "url"
+
+        # Exchange-copy layer — the other exchange already published this
+        # company's identical attachment (exact match, so it runs before the
+        # fuzzy SimHash layer).
+        ck = _content_key(item)
+        if ck and await self._redis.exists(ck):
+            return True, "content"
 
         # SimHash layer — cheap near-duplicate check within a bucket
         sh = content_simhash(item)
@@ -129,6 +169,10 @@ class DedupFilter:
             await self._redis.set(
                 f"{URL_KEY_PREFIX}{fp}", "1", ex=URL_TTL_SECONDS
             )
+
+        ck = _content_key(item)
+        if ck:
+            await self._redis.set(ck, item.source, ex=CONTENT_TTL_SECONDS)
 
         sh = content_simhash(item)
         if sh:

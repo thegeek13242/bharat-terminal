@@ -1,9 +1,14 @@
-"""BSE corporate announcements adapter — BSE-only universe.
+"""BSE corporate announcements adapter — every company with a BSE listing.
 
-Polls api.bseindia.com's announcement feed and emits filings for companies
-onboarded with exchange='BSE' (see kb/sync/bse_sync.py). Dual-listed
-companies are deliberately NOT matched here — their filings arrive via
-NSE_FILINGS, so nothing is analyzed twice.
+Polls api.bseindia.com's announcement feed and emits filings for ALL
+companies carrying a bse_scrip_code: the BSE-only universe (exchange='BSE',
+see kb/sync/bse_sync.py) AND dual-listed NSE names. Dual-listed coverage is
+deliberate (2026-07-23): BSE publishes most filings minutes to hours before
+NSE (measured live: 2-50 min, including results), so waiting for NSE_FILINGS
+meant analyzing after the price had already moved. Nothing is analyzed
+twice — companies upload the byte-identical PDF to both exchanges, and the
+content-fingerprint dedup layer (ingestion/dedup.py) drops whichever
+exchange's copy arrives second.
 
 The feed is market-wide (every BSE listing), so the adapter filters by a
 SCRIP_CD → companies.symbol map loaded from Postgres. Cost control is
@@ -26,6 +31,7 @@ from zoneinfo import ZoneInfo
 
 from bharat_terminal.types import NewsItem
 from bharat_terminal.ingestion.pdf_fetch import fetch_pdf_text
+from bharat_terminal.ingestion.dedup import text_fingerprint
 from .base import BaseAdapter
 from .nse_filings import gather_pdf_texts
 
@@ -50,9 +56,12 @@ SCRIP_MAP_REFRESH_S = 6 * 3600
 class BSEFilingsAdapter(BaseAdapter):
     source_name = "BSE_FILINGS"
     poll_interval_seconds = 120.0
-    # These are smallcaps and the feed is per-day (not a rolling head like
-    # NSE's) — 60s is ample and keeps us polite on api.bseindia.com.
-    poll_interval_fast = 60.0
+    # BSE is now the LEADING source for dual-listed names (it publishes
+    # minutes before NSE), so market-hours polling matters: 30s halves our
+    # added latency vs the old 60s while staying polite on api.bseindia.com
+    # (steady state = 2 requests/cycle: today's first fully-seen page stops
+    # pagination, plus yesterday's page 1).
+    poll_interval_fast = 30.0
     poll_interval_slow = 300.0
     rate_limit_per_minute = 10
 
@@ -73,8 +82,10 @@ class BSEFilingsAdapter(BaseAdapter):
     # ── SCRIP_CD → symbol map (the universe filter) ───────────────────────
 
     async def _refresh_scrip_map(self) -> None:
-        """(Re)load the BSE-only universe from Postgres. Keeps the stale map
-        on failure; the adapter stays fail-closed until the first success."""
+        """(Re)load every BSE-listed company from Postgres. Keeps the stale
+        map on failure; the adapter stays fail-closed until the first
+        success. For dual-listed rows the value is the NSE ticker
+        (companies.symbol), so downstream symbol joins are exchange-agnostic."""
         if self._scrip_map and (time.time() - self._scrip_map_loaded_at) < SCRIP_MAP_REFRESH_S:
             return
         dsn = (os.getenv("DATABASE_URL") or "").replace("postgresql+asyncpg://", "postgresql://")
@@ -87,7 +98,7 @@ class BSEFilingsAdapter(BaseAdapter):
             try:
                 rows = await conn.fetch(
                     "SELECT bse_scrip_code, symbol FROM companies "
-                    "WHERE bse_scrip_code IS NOT NULL AND exchange = 'BSE' AND is_active"
+                    "WHERE bse_scrip_code IS NOT NULL AND is_active"
                 )
             finally:
                 await conn.close()
@@ -95,7 +106,8 @@ class BSEFilingsAdapter(BaseAdapter):
                 self._scrip_map = {str(r["bse_scrip_code"]): r["symbol"] for r in rows}
                 self._scrip_map_loaded_at = time.time()
                 logger.info(
-                    f"[{self.source_name}] scrip map loaded: {len(self._scrip_map)} BSE-only companies"
+                    f"[{self.source_name}] scrip map loaded: "
+                    f"{len(self._scrip_map)} BSE-listed companies (incl. dual-listed)"
                 )
             else:
                 # Universe not seeded yet — stay fail-closed, retry next refresh window.
@@ -237,6 +249,11 @@ class BSEFilingsAdapter(BaseAdapter):
                             ingest_latency_ms=ingest_latency,
                             category=p["category"],
                             symbols_mentioned=[p["symbol"]],
+                            # PDF-derived text only: the fallback fields differ
+                            # between exchanges and must never dedup.
+                            content_fingerprint=(
+                                text_fingerprint(pdf_text) if pdf_text else None
+                            ),
                             tier="tier1",
                         )
 

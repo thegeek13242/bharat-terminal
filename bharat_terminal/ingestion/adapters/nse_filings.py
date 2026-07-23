@@ -9,6 +9,7 @@ from typing import AsyncIterator, Awaitable, Callable, Optional
 
 from bharat_terminal.types import NewsItem
 from bharat_terminal.ingestion.pdf_fetch import fetch_pdf_text
+from bharat_terminal.ingestion.dedup import text_fingerprint
 from .base import BaseAdapter
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -193,6 +194,11 @@ class NSEFilingsAdapter(BaseAdapter):
                             ingest_latency_ms=ingest_latency,
                             category=category,
                             symbols_mentioned=[p["symbol"]] if p["symbol"] else [],
+                            # PDF-derived text only: the fallback fields differ
+                            # between exchanges and must never dedup.
+                            content_fingerprint=(
+                                text_fingerprint(pdf_text) if pdf_text else None
+                            ),
                             tier="tier1",
                         )
 
