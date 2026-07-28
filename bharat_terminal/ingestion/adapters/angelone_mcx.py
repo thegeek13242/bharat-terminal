@@ -64,6 +64,12 @@ SCRIP_MASTER_URL = (
     "https://margincalculator.angelbroking.com/OpenAPI_File/files/"
     "OpenAPIScripMaster.json"
 )
+# The scrip master is ~35MB and the CDN can serve it as slow as ~250KB/s from
+# this VM (measured 137s on 2026-07-23, when the old total=60s deadline made
+# every refresh time out after a restart: login OK, refresh forever retrying,
+# websocket never opened, MCX ticks silently absent). The generous total only
+# caps slow-but-progressing downloads; sock_read bounds a truly stalled stream.
+SCRIP_MASTER_TIMEOUT_S = float(os.getenv("SCRIP_MASTER_TIMEOUT_S", "600"))
 
 # Universe of MCX commodities we care about. Keys are the `name` field in the
 # scrip master; values are the canonical name we publish to Kafka.
@@ -357,7 +363,8 @@ class AngelOneMCXAdapter:
         can build a CommodityTick for each incoming tick.
         """
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=60)
+            timeout=aiohttp.ClientTimeout(
+                total=SCRIP_MASTER_TIMEOUT_S, sock_read=60)
         ) as session:
             async with session.get(SCRIP_MASTER_URL) as resp:
                 resp.raise_for_status()
