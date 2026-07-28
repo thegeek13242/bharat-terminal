@@ -22,30 +22,55 @@ interface EquityPoint {
 
 interface StrategyStats {
   strategy: string;
-  n_trades?: number | null;
   n_open?: number | null;
   n_closed?: number | null;
   n_rejected?: number | null;
   realized_pnl?: number | null;
   unrealized_pnl?: number | null;
   total_pnl?: number | null;
+  gross_exposure?: number | null;
+  utilised_capital?: number | null;
   hit_rate?: number | null;
-  avg_pnl?: number | null;
+  avg_win?: number | null;
+  avg_loss?: number | null;
+  profit_factor?: number | null;
+}
+
+/** The `totals` sub-object of /papertrading/summary. */
+interface SummaryTotals {
+  realized_pnl?: number | null;
+  unrealized_pnl?: number | null;
+  total_pnl?: number | null;
+  capital?: number | null;
+  equity?: number | null;
+  gross_exposure?: number | null;
+  /** Σ qty×entry over OPEN positions (capital deployed at entry). */
+  utilised_capital?: number | null;
+  /** utilised_capital / capital, already 0–100. */
+  utilisation_pct?: number | null;
+  n_open?: number | null;
+  n_closed?: number | null;
+  n_rejected?: number | null;
 }
 
 interface Summary {
+  totals?: SummaryTotals;
+  // Genuinely top-level in the API response:
+  max_drawdown_pct?: number | null;
+  sharpe?: number | null;
+  hit_rate?: number | null;
+  n_daily_points?: number | null;
+  equity_curve?: EquityPoint[];
+  per_strategy?: StrategyStats[];
+  // Legacy flat shape — kept only as a backward-tolerant fallback; the API
+  // serves these under `totals` (and names capital, not starting_capital).
   equity?: number | null;
   starting_capital?: number | null;
   total_pnl?: number | null;
   realized_pnl?: number | null;
   unrealized_pnl?: number | null;
-  max_drawdown_pct?: number | null;
-  sharpe?: number | null;
-  hit_rate?: number | null;
   n_open?: number | null;
   gross_exposure?: number | null;
-  equity_curve?: EquityPoint[];
-  per_strategy?: StrategyStats[];
 }
 
 type TradeStatus = 'PENDING' | 'OPEN' | 'CLOSED' | 'REJECTED';
@@ -70,15 +95,21 @@ interface Position {
   mtm_at: string | null;
   pnl: number | null;
   provenance: Record<string, unknown> | null;
+  // Triggering filing (LEFT JOIN news_items) — null on rows with no news link.
+  filing_headline?: string | null;
+  filing_url?: string | null;
+  filing_source?: 'NSE_FILINGS' | 'BSE_FILINGS' | null;
+  filing_at?: string | null;
 }
 
 // ── Local fetch (same semantics as lib/api request(); endpoints are new and
 //    internal-only, so they live here until the shapes settle) ────────────────
 
-async function apiGet<T>(path: string): Promise<T> {
+async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`/api${path}`, {
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
+    ...init,
   });
   if (!res.ok) {
     const text = await res.text();
@@ -264,6 +295,46 @@ function ProvenancePanel({ p }: { p: Position }) {
           impact {p.impact_id ?? DASH} · news {p.news_id ?? DASH} · trade #{p.id}
         </span>
       </div>
+      {(p.filing_headline || p.filing_url) && (
+        <div
+          style={{
+            marginBottom: 8,
+            padding: '9px 12px',
+            background: 'var(--bg-elev)',
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+          }}
+        >
+          <div className="mono upper" style={{ fontSize: 9, letterSpacing: '0.14em', color: 'var(--ink-dim)', marginBottom: 5 }}>
+            Triggering filing
+          </div>
+          {p.filing_headline && (
+            <div style={{ fontSize: 12, lineHeight: 1.55, color: 'var(--ink)', overflowWrap: 'anywhere' }}>
+              {p.filing_headline}
+            </div>
+          )}
+          <div className="mono" style={{ marginTop: 5, fontSize: 9.5, color: 'var(--ink-mute)', display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'baseline' }}>
+            {p.filing_source && (
+              <span className="upper" style={{ letterSpacing: '0.1em' }}>
+                {p.filing_source === 'NSE_FILINGS' ? 'NSE'
+                  : p.filing_source === 'BSE_FILINGS' ? 'BSE'
+                    : p.filing_source}
+              </span>
+            )}
+            {p.filing_at && <span>{dayLabel(p.filing_at)} {clockTime(p.filing_at)}</span>}
+            {p.filing_url && (
+              <a
+                href={p.filing_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: 'var(--accent)', textDecoration: 'none' }}
+              >
+                View filing ↗
+              </a>
+            )}
+          </div>
+        </div>
+      )}
       {highlights.length > 0 && (
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>
           {highlights.map(({ k, v }) => (
@@ -324,6 +395,12 @@ export function PaperTrading() {
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const [tab, setTab] = useState<TradeStatus>('OPEN');
   const [expanded, setExpanded] = useState<number | null>(null);
+  // Manual exit/cancel: trade id in flight (button disabled) + last failure.
+  const [actionBusy, setActionBusy] = useState<number | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  // Bumped after a successful manual action → the poll effect re-arms and
+  // reloads summary + positions immediately.
+  const [refreshNonce, setRefreshNonce] = useState(0);
 
   // 15s polling, visibility-aware: the timer is not rescheduled while the tab
   // is hidden; coming back to the tab refreshes immediately and resumes.
@@ -348,8 +425,8 @@ export function PaperTrading() {
       inflight = true;
       try {
         const [s, p] = await Promise.all([
-          apiGet<Summary>('/papertrading/summary'),
-          apiGet<{ items?: Position[] } | Position[]>('/papertrading/positions'),
+          apiFetch<Summary>('/papertrading/summary'),
+          apiFetch<{ items?: Position[] } | Position[]>('/papertrading/positions'),
         ]);
         if (cancelled) return;
         setSummary(s ?? null);
@@ -384,21 +461,50 @@ export function PaperTrading() {
       if (timer !== undefined) window.clearTimeout(timer);
       document.removeEventListener('visibilitychange', onVisibility);
     };
-  }, []);
+  }, [refreshNonce]);
+
+  // Manual exit (OPEN → close at LTP) / cancel (PENDING → reject). The API
+  // returns {id, action: 'closed'|'cancelled', ...}; failures are FastAPI
+  // {detail} — e.g. 409 market_closed — surfaced verbatim near the table.
+  const manualExit = async (p: Position) => {
+    if (actionBusy != null) return; // serialize — no double-fires
+    const prompt = p.status === 'PENDING'
+      ? `Cancel queued ${p.symbol} signal?`
+      : `Exit ${p.symbol} at market?`;
+    if (!window.confirm(prompt)) return;
+    setActionBusy(p.id);
+    setActionError(null);
+    try {
+      await apiFetch<{ id: number; action: 'closed' | 'cancelled'; exit_price?: number | null; pnl?: number | null }>(
+        `/papertrading/trades/${p.id}/exit`,
+        { method: 'POST' },
+      );
+      setRefreshNonce((n) => n + 1); // immediate summary + positions reload
+    } catch (e) {
+      setActionError(e instanceof ApiError ? e.detail : 'network error');
+    } finally {
+      setActionBusy(null);
+    }
+  };
 
   // ── Derived ────────────────────────────────────────────────────────────────
 
-  const start = summary?.starting_capital ?? null;
-  const totalPnl = summary?.total_pnl
-    ?? (summary?.realized_pnl != null && summary?.unrealized_pnl != null
-      ? summary.realized_pnl + summary.unrealized_pnl
-      : null);
+  // The API nests portfolio totals under `totals` (capital, not
+  // starting_capital). Flat reads remain as a backward-tolerant fallback only.
+  const totals = summary?.totals;
+  const start = totals?.capital ?? summary?.starting_capital ?? null;
+  const realized = totals?.realized_pnl ?? summary?.realized_pnl ?? null;
+  const unrealized = totals?.unrealized_pnl ?? summary?.unrealized_pnl ?? null;
+  const totalPnl = totals?.total_pnl ?? summary?.total_pnl
+    ?? (realized != null && unrealized != null ? realized + unrealized : null);
+  const equity = totals?.equity ?? summary?.equity ?? null;
+  const grossExposure = totals?.gross_exposure ?? summary?.gross_exposure ?? null;
   const totalReturnPct = totalPnl != null && start ? (totalPnl / start) * 100 : null;
   const hitRatePct = normPct(summary?.hit_rate);
-  const openCount = summary?.n_open
+  const openCount = totals?.n_open ?? summary?.n_open
     ?? (positions ? positions.filter((p) => p.status === 'OPEN').length : null);
-  const grossPctOfEquity = summary?.gross_exposure != null && summary?.equity
-    ? (summary.gross_exposure / summary.equity) * 100
+  const grossPctOfEquity = grossExposure != null && equity
+    ? (grossExposure / equity) * 100
     : null;
 
   const chartData = useMemo(() => {
@@ -450,9 +556,12 @@ export function PaperTrading() {
   }, [positions, tab]);
 
   const showReason = tab !== 'OPEN';
-  const GRID = showReason
-    ? 'minmax(96px, 1fr) 130px 58px 52px 64px 118px 118px 132px 104px'
-    : 'minmax(96px, 1fr) 130px 58px 52px 64px 118px 118px 132px';
+  const showAction = tab === 'OPEN' || tab === 'PENDING'; // manual exit/cancel
+  const GRID = [
+    'minmax(96px, 1fr) 130px 58px 52px 64px 118px 118px 132px',
+    ...(showReason ? ['104px'] : []),
+    ...(showAction ? ['72px'] : []),
+  ].join(' ');
 
   const strategies = summary?.per_strategy ?? [];
 
@@ -535,15 +644,15 @@ export function PaperTrading() {
                   size={13.5}
                   value={
                     <span style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap', alignItems: 'baseline' }}>
-                      <span style={{ color: pnlColor(summary?.realized_pnl) }}>{inrSigned(summary?.realized_pnl)}</span>
+                      <span style={{ color: pnlColor(realized) }}>{inrSigned(realized)}</span>
                       <span style={{ color: 'var(--ink-faint)' }}>/</span>
-                      <span style={{ color: pnlColor(summary?.unrealized_pnl) }}>{inrSigned(summary?.unrealized_pnl)}</span>
+                      <span style={{ color: pnlColor(unrealized) }}>{inrSigned(unrealized)}</span>
                     </span>
                   }
                 />
                 <Tile
                   label="Equity"
-                  value={inr(summary?.equity)}
+                  value={inr(equity)}
                   sub={start != null ? `start ${inr(start)}` : undefined}
                 />
                 <Tile
@@ -568,8 +677,13 @@ export function PaperTrading() {
                 />
                 <Tile
                   label="Gross exposure"
-                  value={inr(summary?.gross_exposure)}
+                  value={inr(grossExposure)}
                   sub={grossPctOfEquity != null ? `${num(grossPctOfEquity, 0)}% of equity` : undefined}
+                />
+                <Tile
+                  label="Utilised capital"
+                  value={inr(totals?.utilised_capital)}
+                  sub={totals?.utilisation_pct != null ? `${pct(totals.utilisation_pct, 1)} of capital` : undefined}
                 />
               </div>
 
@@ -651,7 +765,7 @@ export function PaperTrading() {
                   {TABS.map((t) => (
                     <button
                       key={t}
-                      onClick={() => { setTab(t); setExpanded(null); }}
+                      onClick={() => { setTab(t); setExpanded(null); setActionError(null); }}
                       className="mono upper"
                       style={{
                         fontSize: 9.5,
@@ -668,6 +782,12 @@ export function PaperTrading() {
                     </button>
                   ))}
                 </div>
+
+                {actionError && (
+                  <div className="mono" style={{ padding: '7px 20px', borderBottom: '1px solid var(--border)', fontSize: 10.5, color: 'var(--head)' }}>
+                    Manual {tab === 'PENDING' ? 'cancel' : 'exit'} failed — {actionError}
+                  </div>
+                )}
 
                 <div
                   className="mono upper"
@@ -692,6 +812,7 @@ export function PaperTrading() {
                   <span style={{ textAlign: 'right' }}>{tab === 'OPEN' ? 'Mark' : 'Exit'}</span>
                   <span style={{ textAlign: 'right' }}>P&L</span>
                   {showReason && <span>Reason</span>}
+                  {showAction && <span />}
                 </div>
 
                 {rows.length === 0 && (
@@ -755,6 +876,31 @@ export function PaperTrading() {
                             {p.exit_reason ?? DASH}
                           </span>
                         )}
+                        {showAction && (
+                          <span style={{ textAlign: 'right' }}>
+                            <button
+                              onClick={(e) => { e.stopPropagation(); void manualExit(p); }}
+                              disabled={actionBusy === p.id}
+                              title={p.status === 'PENDING'
+                                ? 'Cancel this queued signal'
+                                : 'Close this position at the live market price'}
+                              className="mono upper"
+                              style={{
+                                fontSize: 9,
+                                letterSpacing: '0.08em',
+                                padding: '3px 9px',
+                                borderRadius: 3,
+                                color: 'var(--head)',
+                                background: 'transparent',
+                                border: '1px solid var(--head)',
+                                cursor: actionBusy === p.id ? 'default' : 'pointer',
+                                opacity: actionBusy === p.id ? 0.5 : 1,
+                              }}
+                            >
+                              {actionBusy === p.id ? '…' : p.status === 'PENDING' ? 'Cancel' : 'Exit'}
+                            </button>
+                          </span>
+                        )}
                       </div>
                       {isExpanded && <ProvenancePanel p={p} />}
                     </div>
@@ -790,13 +936,12 @@ export function PaperTrading() {
                           </div>
                           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                             <StatRow
-                              k="Trades"
-                              v={s.n_trades != null ? num(s.n_trades, 0) : DASH}
+                              k="Open / Closed / Rej"
+                              v={[s.n_open, s.n_closed, s.n_rejected]
+                                .map((n) => (n != null ? num(n, 0) : DASH))
+                                .join(' / ')}
                             />
-                            <StatRow
-                              k="Open / Closed"
-                              v={`${s.n_open != null ? num(s.n_open, 0) : DASH} / ${s.n_closed != null ? num(s.n_closed, 0) : DASH}`}
-                            />
+                            <StatRow k="Utilised capital" v={inr(s.utilised_capital)} />
                             <StatRow k="Hit rate" v={pct(normPct(s.hit_rate), 1)} />
                             <StatRow
                               k="Realized"
@@ -809,9 +954,18 @@ export function PaperTrading() {
                               color={pnlColor(s.unrealized_pnl)}
                             />
                             <StatRow
-                              k="Avg P&L / trade"
-                              v={inrSigned(s.avg_pnl)}
-                              color={pnlColor(s.avg_pnl)}
+                              k="Avg win / loss"
+                              v={
+                                <span style={{ display: 'inline-flex', gap: 5, alignItems: 'baseline' }}>
+                                  <span style={{ color: pnlColor(s.avg_win) }}>{inrSigned(s.avg_win)}</span>
+                                  <span style={{ color: 'var(--ink-faint)' }}>/</span>
+                                  <span style={{ color: pnlColor(s.avg_loss) }}>{inrSigned(s.avg_loss)}</span>
+                                </span>
+                              }
+                            />
+                            <StatRow
+                              k="Profit factor"
+                              v={s.profit_factor != null ? num(s.profit_factor, 2) : DASH}
                             />
                           </div>
                         </div>

@@ -186,6 +186,17 @@ WHERE sue_composite IS NOT NULL
   AND announced_at >= now() - interval '{SUE_LOOKBACK_DAYS} days'
 """
 
+# Concentration guard: one live position per (symbol, strategy). Companies
+# file several negative documents in one evening (VSTIND filed two on
+# 2026-07-28); each is a distinct impact_id so idempotency alone lets
+# exposure stack to 2x+ notional on one name. Second signals become
+# auditable REJECTED rows, not silent skips.
+_LIVE_POS_SQL = """
+SELECT 1 FROM paper_trades
+WHERE symbol = $1 AND strategy = $2 AND status IN ('PENDING', 'OPEN')
+LIMIT 1
+"""
+
 
 class RulesEngine:
     """Stateful evaluator: holds the DB pool, the materiality artifact and a
@@ -272,6 +283,11 @@ class RulesEngine:
                 provenance={**base_prov, "gate_flags": flags},
                 rejected_reason="stale_event")]
 
+        dup = await self._dup_reject("headwind_short", "SHORT", "CASH",
+                                     report, ci, base_prov, flags)
+        if dup is not None:
+            return dup
+
         p, fallback = await self._materiality_p(report, ci, etype)
         flags["materiality_p"] = p
         flags["materiality_pass"] = (
@@ -312,6 +328,11 @@ class RulesEngine:
                 report.id, report.news_id,
                 provenance={**base_prov, "gate_flags": flags},
                 rejected_reason="stale_event")]
+
+        dup = await self._dup_reject("pead_long", "LONG", "CASH",
+                                     report, ci, base_prov, flags)
+        if dup is not None:
+            return dup
 
         sue = await self._fetch_pead_sue(ci.symbol, event_ts)
         thr = await self._sue_threshold()
@@ -360,6 +381,11 @@ class RulesEngine:
                 provenance={**base_prov, "gate_flags": flags},
                 rejected_reason="stale_event")]
 
+        dup = await self._dup_reject("orderwin_long", "LONG", "CASH",
+                                     report, ci, base_prov, flags)
+        if dup is not None:
+            return dup
+
         p, fallback = await self._materiality_p(report, ci, etype)
         flags["materiality_p"] = p       # measured, deliberately NOT gated
         prov = {**base_prov, "materiality_p": p, "gate_flags": flags}
@@ -390,6 +416,11 @@ class RulesEngine:
                 provenance={**base_prov, "gate_flags": flags},
                 rejected_reason="stale_event")]
 
+        dup = await self._dup_reject("tailwind_long", "LONG", "CASH",
+                                     report, ci, base_prov, flags)
+        if dup is not None:
+            return dup
+
         fno = await self._fno_supplier()
         in_fno = ci.symbol.upper() in fno
         flags["fno"] = in_fno
@@ -399,6 +430,22 @@ class RulesEngine:
                     f"mag={ci.magnitude}")
         return [SignalIntent("tailwind_long", ci.symbol, "LONG", instrument,
                              report.id, report.news_id, provenance=prov)]
+
+    async def _dup_reject(self, strategy: str, side: str, instrument: str,
+                          report, ci: CompanyImpact, base_prov,
+                          flags) -> Optional[list[SignalIntent]]:
+        """None when no live position exists; else the REJECTED intent."""
+        row = await self._pool.fetchrow(_LIVE_POS_SQL, ci.symbol, strategy)
+        if row is None:
+            return None
+        flags["duplicate_position"] = True
+        logger.info(f"[REJECT] {strategy} {ci.symbol}: duplicate_position "
+                    f"(a PENDING/OPEN {strategy} position already exists)")
+        return [SignalIntent(
+            strategy, ci.symbol, side, instrument,
+            report.id, report.news_id,
+            provenance={**base_prov, "gate_flags": flags},
+            rejected_reason="duplicate_position")]
 
     # ── materiality features ─────────────────────────────────────────────────
 

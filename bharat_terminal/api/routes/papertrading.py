@@ -17,16 +17,21 @@ Design rules encoded here:
   contributes null unrealized P&L, not a fabricated 0.
 - Aggregation happens in SQL; Python only derives ratios. No pandas.
 """
+import json
 import logging
 import math
 import os
 import statistics
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 
+from bharat_terminal.analysis.market_hours import is_market_hours
 from bharat_terminal.api.auth import require_internal_user
 from bharat_terminal.api.db import get_session_factory
+
+KB_SERVICE_URL = os.getenv("KB_SERVICE_URL", "http://kb-service:8001")
 
 logger = logging.getLogger(__name__)
 router = APIRouter(
@@ -63,6 +68,8 @@ _STATS_SQL = f"""
         AS unrealized_pnl,
     coalesce(sum(qty * coalesce(mtm_price, entry_price))
              FILTER (WHERE status = 'OPEN'), 0)::float8 AS gross_exposure,
+    coalesce(sum(qty * entry_price)
+             FILTER (WHERE status = 'OPEN'), 0)::float8 AS utilised_capital,
     count(*) FILTER (WHERE status = 'CLOSED' AND pnl > 0) AS n_wins,
     count(*) FILTER (WHERE status = 'CLOSED' AND pnl IS NOT NULL)
         AS n_evaluated,
@@ -78,7 +85,7 @@ _TRADE_COLUMNS = """
     mtm_price, mtm_at, pnl, provenance
 """
 
-_TS_KEYS = ("created_at", "entry_at", "exit_at", "mtm_at")
+_TS_KEYS = ("created_at", "entry_at", "exit_at", "mtm_at", "filing_at")
 
 
 def _rnd(v, nd: int = 2):
@@ -127,14 +134,14 @@ async def positions(
     REJECTED rows are excluded by default (they are gate-audit records, not
     positions) — ask for status=REJECTED or status=all to see them.
     """
-    where = "WHERE status != 'REJECTED'"
+    where = "WHERE pt.status != 'REJECTED'"
     params: dict = {"lim": limit}
     if status is not None:
         s = status.strip().upper()
         if s == "ALL":
             where = ""
         elif s in _STATUSES:
-            where = "WHERE status = :status"
+            where = "WHERE pt.status = :status"
             params["status"] = s
         else:
             raise HTTPException(
@@ -142,18 +149,26 @@ async def positions(
 
     factory = get_session_factory()
     async with factory() as session:
+        # LEFT JOIN the triggering filing (news_items) so every trade cites
+        # its source document — headline + the actual exchange PDF URL.
+        cols = ", ".join(f"pt.{c.strip()}" for c in _TRADE_COLUMNS.split(","))
         rows = (await session.execute(text(f"""
-            SELECT {_TRADE_COLUMNS},
-                   CASE WHEN status = 'OPEN'
+            SELECT {cols},
+                   ni.headline AS filing_headline,
+                   ni.url AS filing_url,
+                   ni.source AS filing_source,
+                   ni.timestamp_utc AS filing_at,
+                   CASE WHEN pt.status = 'OPEN'
                         THEN ({_UNREALIZED_SQL})::float8
                    END AS unrealized_pnl,
-                   CASE WHEN status = 'OPEN'
+                   CASE WHEN pt.status = 'OPEN'
                         THEN EXTRACT(EPOCH FROM
-                             (now() - coalesce(entry_at, created_at)))::float8
+                             (now() - coalesce(pt.entry_at, pt.created_at)))::float8
                    END AS age_seconds
-            FROM paper_trades
+            FROM paper_trades pt
+            LEFT JOIN news_items ni ON ni.id = pt.news_id
             {where}
-            ORDER BY created_at DESC, id DESC
+            ORDER BY pt.created_at DESC, pt.id DESC
             LIMIT :lim
         """), params)).mappings().all()
 
@@ -255,6 +270,7 @@ async def summary():
             "total_pnl": _rnd(
                 float(r["realized_pnl"]) + float(r["unrealized_pnl"])),
             "gross_exposure": _rnd(r["gross_exposure"]),
+            "utilised_capital": _rnd(r["utilised_capital"]),
         }
         entry.update(_closed_stats(r))
         per_strategy.append(entry)
@@ -267,6 +283,12 @@ async def summary():
             "capital": PAPER_CAPITAL,
             "equity": _rnd(PAPER_CAPITAL + total_pnl),
             "gross_exposure": _rnd(t["gross_exposure"]),
+            # Capital deployed at entry (Σ qty×entry over OPEN) — distinct
+            # from gross_exposure, which marks the same book to market.
+            "utilised_capital": _rnd(t["utilised_capital"]),
+            "utilisation_pct": _rnd(
+                float(t["utilised_capital"]) / PAPER_CAPITAL * 100
+                if PAPER_CAPITAL else None, 1),
             "n_open": t["n_open"],
             "n_closed": t["n_closed"],
             "n_rejected": t["n_rejected"],
@@ -301,3 +323,86 @@ async def trade_detail(trade_id: int):
     if row is None:
         raise HTTPException(404, "trade_not_found")
     return _row_out(row)
+
+
+@router.post("/trades/{trade_id}/exit")
+async def manual_exit(trade_id: int,
+                      user: dict = Depends(require_internal_user)):
+    """Manual intervention, audit-logged with the actor's email.
+
+    OPEN  → close at the live LTP with exit_reason='manual'. Market-hours
+            only: an off-session manual exit would fill at a stale price,
+            which this pilot never does (409 explains; the engine's own
+            exit rules keep running regardless).
+    PENDING → cancel the queued signal (REJECTED / 'manual_cancel') — no
+            price involved, allowed any time.
+
+    Both writes are guarded by the row's current status, so a race with the
+    engine's MTM close is harmless: exactly one writer wins.
+    """
+    factory = get_session_factory()
+    async with factory() as session:
+        row = (await session.execute(text(
+            "SELECT id, symbol, side, status FROM paper_trades WHERE id = :id"
+        ), {"id": trade_id})).mappings().one_or_none()
+        if row is None:
+            raise HTTPException(404, "trade_not_found")
+        actor = (user.get("email") or "internal").lower()
+
+        if row["status"] == "PENDING":
+            res = await session.execute(text("""
+                UPDATE paper_trades
+                SET status = 'REJECTED', exit_reason = 'manual_cancel',
+                    provenance = provenance || cast(:prov AS jsonb)
+                WHERE id = :id AND status = 'PENDING'
+                RETURNING id
+            """), {"id": trade_id,
+                   "prov": json.dumps({"cancelled_by": actor})})
+            await session.commit()
+            if res.scalar_one_or_none() is None:
+                raise HTTPException(409, "trade_changed_state_retry")
+            logger.info(f"[MANUAL] #{trade_id} PENDING cancelled by {actor}")
+            return {"id": trade_id, "action": "cancelled"}
+
+        if row["status"] != "OPEN":
+            raise HTTPException(409, f"trade_is_{row['status'].lower()}")
+
+        if not is_market_hours():
+            raise HTTPException(
+                409, "market_closed — a manual exit now would fill at a "
+                     "stale price; retry during market hours (the engine's "
+                     "own exit rules keep running)")
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{KB_SERVICE_URL}/ltp/{row['symbol']}")
+                resp.raise_for_status()
+                ltp = float((resp.json() or {}).get("ltp") or 0)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(502, f"ltp_unavailable: {e}")
+        if ltp <= 0:
+            raise HTTPException(502, "ltp_unavailable")
+
+        res = await session.execute(text("""
+            UPDATE paper_trades
+            SET status = 'CLOSED', exit_price = :px, exit_at = now(),
+                exit_reason = 'manual', mtm_price = :px, mtm_at = now(),
+                pnl = (CASE WHEN side = 'LONG' THEN (:px - entry_price)
+                            ELSE (entry_price - :px) END) * qty,
+                provenance = provenance || cast(:prov AS jsonb)
+            WHERE id = :id AND status = 'OPEN'
+            RETURNING pnl
+        """), {"id": trade_id, "px": ltp,
+               "prov": json.dumps({"exited_by": actor,
+                                   "exit_ltp_raw": ltp})})
+        await session.commit()
+        pnl = res.scalar_one_or_none()
+        if pnl is None:
+            raise HTTPException(409, "trade_changed_state_retry")
+        logger.info(f"[MANUAL] #{trade_id} {row['symbol']} closed by {actor} "
+                    f"@ {ltp} pnl={pnl}")
+        return {"id": trade_id, "action": "closed",
+                "exit_price": ltp, "pnl": _rnd(pnl)}
