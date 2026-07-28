@@ -35,10 +35,12 @@ MATERIALITY_ARTIFACT = os.getenv(
     "MATERIALITY_ARTIFACT", "exports/materiality_lab/materiality_v4_1_tax22.joblib")
 ENABLE_HEADWIND_SHORT = os.getenv("PAPER_ENABLE_HEADWIND_SHORT", "1") == "1"
 ENABLE_PEAD_LONG = os.getenv("PAPER_ENABLE_PEAD_LONG", "1") == "1"
-# D0 (2026-07-28, 400d drift-adjusted): medium-band negatives carry
-# +19.3pp edge (n=180), nearly matching high's +22.2pp — shorts take
-# magnitude >= 3, not just 4-5.
-HEADWIND_MIN_MAG = int(os.getenv("PAPER_HEADWIND_MIN_MAG", "3"))
+# S0 (2026-07-29, TRADE-SPACE relabel — supersedes D0's close-to-close
+# read): medium-band negatives' +19.3pp edge was entirely the untradeable
+# overnight gap; on the capturable component (next-open fill) it is
+# +1.6pp ≈ zero, while high-band survives at +14.5pp. Shorts take
+# magnitude >= 4 only.
+HEADWIND_MIN_MAG = int(os.getenv("PAPER_HEADWIND_MIN_MAG", "4"))
 # D0T: order_win is the ONLY positive class with real directional edge
 # (64.1% hit, +11.5pp over drift, n=237). Long the event, hold ~5 sessions.
 ENABLE_ORDERWIN_LONG = os.getenv("PAPER_ENABLE_ORDERWIN_LONG", "1") == "1"

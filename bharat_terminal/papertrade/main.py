@@ -24,7 +24,8 @@ from aiokafka import AIOKafkaConsumer
 from bharat_terminal.analysis.market_hours import is_market_hours
 from bharat_terminal.papertrade import marks
 from bharat_terminal.papertrade.engine import PaperEngine
-from bharat_terminal.papertrade.rules import RulesEngine
+from bharat_terminal.papertrade.rules import (ENABLE_PEAD_LONG, RulesEngine,
+                                              SignalIntent)
 from bharat_terminal.types import ImpactReport
 
 logging.basicConfig(
@@ -44,6 +45,29 @@ SNAPSHOT_INTERVAL_S = 300
 # much of the reaction our ~90s latency can actually reach, per cell.
 # Off-session filings are covered by the OHLC gap decomposition instead.
 MARK_OFFSETS = ((300, "t5"), (900, "t15"), (1800, "t30"), (3600, "t60"))
+
+# PEAD entry on surprise-row ARRIVAL (S0, 2026-07-29): PIT SUE coverage at
+# filing time is 3.7% — the XBRL that produces earnings_surprises lags the
+# press-release filing by hours, so the filing-time pead path in rules.py
+# almost never fires. The validated drift is 20 DAYS; entering when the
+# surprise row lands (hours later) is immaterial to the edge. The filing-
+# time path stays enabled for the 3.7% — the NOT EXISTS guard prevents
+# double entry.
+PEAD_SCAN_INTERVAL_S = int(os.getenv("PAPER_PEAD_SCAN_S", "600"))
+PEAD_SCAN_WINDOW_H = int(os.getenv("PAPER_PEAD_SCAN_WINDOW_H", "24"))
+
+_PEAD_SCAN_SQL = """
+SELECT es.id, es.symbol, es.sue_composite, es.announced_at, es.period_end
+FROM earnings_surprises es
+WHERE es.announced_at >= now() - make_interval(hours => $1)
+  AND es.sue_composite >= $2
+  AND coalesce(es.liquidity_pass, true)
+  AND NOT EXISTS (SELECT 1 FROM paper_trades pt
+                  WHERE pt.symbol = es.symbol
+                    AND pt.strategy = 'pead_long'
+                    AND pt.status IN ('PENDING', 'OPEN'))
+ORDER BY es.announced_at
+"""
 
 
 async def main():
@@ -223,14 +247,60 @@ async def main():
             except Exception as e:
                 logger.error(f"[MARKS] follow-up marks failed: {e}")
 
+    async def pead_scan_loop():
+        """Open pead_long positions when qualifying SURPRISE ROWS arrive
+        (top-decile trailing SUE + liquidity_pass), independent of the
+        filing-time Kafka path. Off-session hits queue as PENDING."""
+        while not shutdown_event.is_set():
+            await asyncio.sleep(PEAD_SCAN_INTERVAL_S)
+            if not ENABLE_PEAD_LONG:
+                continue
+            try:
+                thr = await rules._sue_threshold()
+                if thr is None:
+                    continue
+                rows = await engine.pool.fetch(
+                    _PEAD_SCAN_SQL, PEAD_SCAN_WINDOW_H, thr)
+                if not rows:
+                    continue
+                market_open = is_market_hours()
+                ltps: dict[str, float] = {}
+                if market_open:
+                    try:
+                        ltps = await marks.get_ltps({r["symbol"] for r in rows})
+                    except Exception as e:
+                        logger.warning(f"[PEAD-SCAN] LTP fetch failed: {e}")
+                for r in rows:
+                    intent = SignalIntent(
+                        "pead_long", r["symbol"], "LONG", "CASH",
+                        f"SUE_{r['id']}", None,
+                        provenance={
+                            "trigger": "surprise_row",
+                            "sue_composite": float(r["sue_composite"]),
+                            "sue_threshold": round(float(thr), 3),
+                            "surprise_announced_at": str(r["announced_at"]),
+                            "period_end": str(r["period_end"]),
+                            "gate_flags": {"liquidity_pass": True,
+                                           "sue_pass": True},
+                        })
+                    if market_open:
+                        await engine.open_position(
+                            intent, ltps.get(r["symbol"]))
+                    else:
+                        await engine.queue_position(intent)
+            except Exception as e:
+                logger.error(f"[PEAD-SCAN] cycle failed: {e}", exc_info=True)
+
     consumer_task = asyncio.create_task(consume_loop())
     mtm_task = asyncio.create_task(mtm_loop())
     snapshot_task = asyncio.create_task(snapshot_loop())
     marks_task = asyncio.create_task(marks_loop())
+    pead_task = asyncio.create_task(pead_scan_loop())
     shutdown_task = asyncio.create_task(shutdown_event.wait())
 
     done, pending = await asyncio.wait(
-        [consumer_task, mtm_task, snapshot_task, marks_task, shutdown_task],
+        [consumer_task, mtm_task, snapshot_task, marks_task, pead_task,
+         shutdown_task],
         return_when=asyncio.FIRST_COMPLETED,
     )
     for task in pending:
