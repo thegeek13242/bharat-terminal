@@ -35,6 +35,22 @@ PAPER_STOP_PCT = float(os.getenv("PAPER_STOP_PCT", "5.0"))
 PAPER_SHORT_HOLD_DAYS = int(os.getenv("PAPER_SHORT_HOLD_DAYS", "5"))
 PAPER_PEAD_HOLD_DAYS = int(os.getenv("PAPER_PEAD_HOLD_DAYS", "20"))
 PAPER_ORDERWIN_HOLD_DAYS = int(os.getenv("PAPER_ORDERWIN_HOLD_DAYS", "5"))
+# Vol-scaled trailing stop (founder decision 2026-07-28): trail distance =
+# PAPER_TRAIL_SIGMA x entry sigma60, anchored to the position's favorable
+# extreme. Replaces the flat 5% stop — a 5% stop is 8 sigma on a staid
+# largecap and 1 sigma on an SME; vol scaling makes "limited loss" mean the
+# same thing everywhere. pead_long is EXEMPT: its validated edge is an
+# unconditional 20d hold and a trailing stop would gut exactly that.
+PAPER_TRAIL_SIGMA = float(os.getenv("PAPER_TRAIL_SIGMA", "2.0"))
+
+_VOL60_SQL = """
+SELECT stddev_samp(ret) AS vol60 FROM (
+    SELECT close / nullif(lag(close) OVER (ORDER BY date), 0) - 1 AS ret
+    FROM price_points
+    WHERE symbol = $1 AND date >= CURRENT_DATE - 120
+    ORDER BY date DESC LIMIT 61
+) t
+"""
 
 # Cash shorts must be flat before close; 15:15 IST leaves a 15-min buffer.
 SQUAREOFF_IST = dtime(15, 15)
@@ -42,8 +58,9 @@ SQUAREOFF_IST = dtime(15, 15)
 _OPEN_SQL = """
 INSERT INTO paper_trades
     (strategy, impact_id, news_id, symbol, side, instrument, qty,
-     entry_price, entry_at, status, provenance)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8::float8, now(), 'OPEN', $9::jsonb)
+     entry_price, entry_at, status, provenance, trail_extreme, entry_vol60)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8::float8, now(), 'OPEN', $9::jsonb,
+        $8::float8, $10::float8)
 ON CONFLICT (impact_id, symbol, strategy) DO NOTHING
 RETURNING id
 """
@@ -77,7 +94,8 @@ FROM paper_trades WHERE status = 'PENDING'
 _FILL_SQL = """
 UPDATE paper_trades
 SET qty = $2, entry_price = $3::float8, entry_at = now(), status = 'OPEN',
-    provenance = provenance || $4::jsonb
+    provenance = provenance || $4::jsonb,
+    trail_extreme = $3::float8, entry_vol60 = $5::float8
 WHERE id = $1 AND status = 'PENDING'
 """
 
@@ -91,7 +109,11 @@ _MARK_SQL = """
 UPDATE paper_trades
 SET mtm_price = $2::float8, mtm_at = now(),
     pnl = (CASE WHEN side = 'LONG' THEN ($2::float8 - entry_price)
-                ELSE (entry_price - $2::float8) END) * qty
+                ELSE (entry_price - $2::float8) END) * qty,
+    trail_extreme = CASE WHEN side = 'SHORT'
+                         THEN LEAST(coalesce(trail_extreme, entry_price), $2::float8)
+                         ELSE GREATEST(coalesce(trail_extreme, entry_price), $2::float8)
+                    END
 WHERE id = $1 AND status = 'OPEN'
 """
 
@@ -106,7 +128,8 @@ RETURNING pnl
 """
 
 _OPEN_ROWS_SQL = """
-SELECT id, strategy, symbol, side, instrument, qty, entry_price, entry_at
+SELECT id, strategy, symbol, side, instrument, qty, entry_price, entry_at,
+       trail_extreme, entry_vol60
 FROM paper_trades WHERE status = 'OPEN'
 """
 
@@ -191,10 +214,11 @@ class PaperEngine:
                         f"{intent.symbol}: zero_qty at entry {entry:.2f}")
             return await self._insert_rejected(intent, "zero_qty", prov)
 
+        vol60 = await self._fetch_vol60(intent.symbol)
         row = await self._pool.fetchrow(
             _OPEN_SQL, intent.strategy, intent.impact_id, intent.news_id,
             intent.symbol, intent.side, intent.instrument, qty, entry,
-            json.dumps(prov, default=str))
+            json.dumps(prov, default=str), vol60)
         if row is None:
             logger.info(
                 f"[DUP] {intent.strategy}/{intent.symbol}/"
@@ -251,14 +275,37 @@ class PaperEngine:
                 logger.info(f"[REJECT] #{r['id']} {r['symbol']}: zero_qty "
                             f"at pending fill {entry:.2f}")
                 continue
+            vol60 = await self._fetch_vol60(r["symbol"])
             await self._pool.execute(
                 _FILL_SQL, r["id"], qty, entry,
-                json.dumps(fill_prov, default=str))
+                json.dumps(fill_prov, default=str), vol60)
             filled += 1
             logger.info(f"[FILL] #{r['id']} {r['strategy']} {r['side']} "
                         f"{r['symbol']} x{qty} @ {entry:.2f} "
                         f"(queued {r['created_at']:%H:%M} UTC, ltp {ltp:.2f})")
         return filled
+
+    async def _fetch_vol60(self, symbol: str) -> float | None:
+        """Trailing-60-session daily vol for stop scaling; None if thin."""
+        try:
+            row = await self._pool.fetchrow(_VOL60_SQL, symbol.upper())
+            v = row["vol60"] if row else None
+            return float(v) if v and v > 0 else None
+        except Exception as e:
+            logger.warning(f"vol60 fetch failed for {symbol}: {e}")
+            return None
+
+    async def record_signal_mark(self, impact_id: str, symbol: str, mark: str,
+                                 ltp: float, magnitude: int | None = None,
+                                 sentiment: str | None = None) -> None:
+        """Absorption-curve exhaust: LTP snapshot for a during-session
+        filing signal (t0 at decision, then t5/t15/t30/t60). Idempotent."""
+        await self._pool.execute(
+            """INSERT INTO paper_signal_marks
+                   (impact_id, symbol, magnitude, sentiment, mark, ltp)
+               VALUES ($1, $2, $3, $4, $5, $6::float8)
+               ON CONFLICT (impact_id, symbol, mark) DO NOTHING""",
+            impact_id, symbol, magnitude, sentiment, mark, ltp)
 
     async def record_rejected(self, intent: SignalIntent,
                               reason: str) -> int | None:
@@ -334,16 +381,27 @@ class PaperEngine:
             if now_ist.time() >= SQUAREOFF_IST or held_days > 0:
                 return "squareoff"
 
-        # 2. Stop on adverse move (shorts; and the symmetric long stop for the
-        #    env-gated tailwind branch). pead_long deliberately has NO stop —
-        #    the validated PEAD result is an unconditional 20-day hold.
-        if ltp and r["entry_price"]:
-            stop = PAPER_STOP_PCT / 100.0
-            if r["side"] == "SHORT" and ltp >= r["entry_price"] * (1 + stop):
-                return "stop"
-            if (r["side"] == "LONG" and r["strategy"] == "tailwind_long"
-                    and ltp <= r["entry_price"] * (1 - stop)):
-                return "stop"
+        # 2. Vol-scaled TRAILING stop anchored to the favorable extreme
+        #    (founder decision 2026-07-28: wrong classifications must cause
+        #    limited, vol-comparable loss; winners keep running). pead_long
+        #    is EXEMPT — its validated edge is an unconditional 20d hold.
+        #    Flat PAPER_STOP_PCT remains only as the fallback when entry
+        #    vol60 was unavailable.
+        if ltp and r["entry_price"] and r["strategy"] != "pead_long":
+            vol = r["entry_vol60"]
+            anchor = r["trail_extreme"] or r["entry_price"]
+            if vol and vol > 0:
+                dist = PAPER_TRAIL_SIGMA * float(vol)
+                if r["side"] == "SHORT" and ltp >= anchor * (1 + dist):
+                    return "trail_stop"
+                if r["side"] == "LONG" and ltp <= anchor * (1 - dist):
+                    return "trail_stop"
+            else:
+                stop = PAPER_STOP_PCT / 100.0
+                if r["side"] == "SHORT" and ltp >= r["entry_price"] * (1 + stop):
+                    return "stop"
+                if r["side"] == "LONG" and ltp <= r["entry_price"] * (1 - stop):
+                    return "stop"
 
         # 3. Calendar-day holding periods. orderwin_long, like pead_long,
         #    is an unconditional hold (no stop) — the validated D0T stat has
