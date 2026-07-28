@@ -42,6 +42,16 @@ PAPER_ORDERWIN_HOLD_DAYS = int(os.getenv("PAPER_ORDERWIN_HOLD_DAYS", "5"))
 # same thing everywhere. pead_long is EXEMPT: its validated edge is an
 # unconditional 20d hold and a trailing stop would gut exactly that.
 PAPER_TRAIL_SIGMA = float(os.getenv("PAPER_TRAIL_SIGMA", "2.0"))
+# Gross-exposure cap (founder decision 2026-07-29): total OPEN notional may
+# never exceed this; breaching entries become auditable 'gross_cap' rejects.
+# Defaults to PAPER_CAPITAL — no implicit leverage in the pilot.
+PAPER_GROSS_CAP = float(os.getenv("PAPER_GROSS_CAP", "0")) or float(
+    os.getenv("PAPER_CAPITAL", "1000000"))
+
+_GROSS_SQL = """
+SELECT coalesce(sum(abs(qty) * coalesce(mtm_price, entry_price)), 0)::float8
+FROM paper_trades WHERE status = 'OPEN'
+"""
 
 _VOL60_SQL = """
 SELECT stddev_samp(ret) AS vol60 FROM (
@@ -214,6 +224,14 @@ class PaperEngine:
                         f"{intent.symbol}: zero_qty at entry {entry:.2f}")
             return await self._insert_rejected(intent, "zero_qty", prov)
 
+        gross = float(await self._pool.fetchval(_GROSS_SQL))
+        if gross + qty * entry > PAPER_GROSS_CAP:
+            logger.info(f"[REJECT] {intent.strategy} {intent.side} "
+                        f"{intent.symbol}: gross_cap "
+                        f"({gross:.0f} + {qty * entry:.0f} > {PAPER_GROSS_CAP:.0f})")
+            prov["gross_at_reject"] = round(gross)
+            return await self._insert_rejected(intent, "gross_cap", prov)
+
         vol60 = await self._fetch_vol60(intent.symbol)
         row = await self._pool.fetchrow(
             _OPEN_SQL, intent.strategy, intent.impact_id, intent.news_id,
@@ -274,6 +292,15 @@ class PaperEngine:
                     json.dumps(fill_prov, default=str))
                 logger.info(f"[REJECT] #{r['id']} {r['symbol']}: zero_qty "
                             f"at pending fill {entry:.2f}")
+                continue
+            gross = float(await self._pool.fetchval(_GROSS_SQL))
+            if gross + qty * entry > PAPER_GROSS_CAP:
+                await self._pool.execute(
+                    _PENDING_REJECT_SQL, r["id"], "gross_cap",
+                    json.dumps({**fill_prov, "gross_at_reject": round(gross)},
+                               default=str))
+                logger.info(f"[REJECT] #{r['id']} {r['symbol']}: gross_cap "
+                            f"at pending fill")
                 continue
             vol60 = await self._fetch_vol60(r["symbol"])
             await self._pool.execute(
