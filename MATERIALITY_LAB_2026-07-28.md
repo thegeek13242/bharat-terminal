@@ -117,6 +117,33 @@ Human summary of each loop iteration appended below.
 
 ### Iterations
 
+- **2026-07-29 #5 (S0 — TRADE-SPACE RELABEL + PIT fixes; supersedes all
+  close-to-close cell claims for trading decisions):** every event
+  decomposed into gap (untradeable) vs capturable (next-open→close for
+  off-session, close-to-close for during-session), market-adjusted by
+  universe medians, multi-horizon CARs added. Findings: (1) **look-ahead
+  inflation confirmed** — champion refit with PIT-correct SUE on the old
+  cc label: AUC 0.674 (was 0.7242 with the +1d SUE leak); honest
+  capturable-label baseline: AUC 0.665 / Brier 0.086 / top-decile 0.236.
+  (2) **PIT SUE coverage at decision time = 3.7%** — XBRL lags the press
+  release, so SUE is effectively unavailable live; it inflated training
+  only. Consequence: pead_long as implemented can almost never fire at
+  filing time — its entry must move to surprise-row ARRIVAL (post-XBRL).
+  (3) Direction on capturable (test window): **high_negative survives
+  (+14.5pp, 66.7%, n=51); medium_negative COLLAPSES (+1.6pp, was +19.3
+  cc)** — the medium-band short edge was all gap; paper trader's
+  HEADWIND_MIN_MAG should revert 3→4. results_negative shrinks +32.2→
+  +8.7pp; order_win_positive +11.5→+4.8pp. Anti-signals PERSIST in
+  capturable space: results_positive −8.8, investor_presentation_positive
+  −8.9, procedural −10.7, regulation_generic_positive −6.9 — a fade
+  (short-the-spin) family, F&O-constrained. (4) **The move lives in
+  multi-day drift, not day-0**: median |CAR z| at h5 is 2-3× day-0
+  capturable |z| everywhere (concall 1.82, inv_presentation 1.66,
+  results 1.42) — horizon extension beats latency for most cells;
+  latency matters mainly for during-session high-band events. Capturable
+  materiality concentrates in results .127 / inv_presentation .180 /
+  concall .121; order_win .030 and rating .036 are gap-dominated.
+
 - **2026-07-28 #1**: Lab established. E0–E3 launched (single DB pass →
   cached frame → sequential experiments). Results in the next entry.
 - **2026-07-28 #2 (E4 calibration/blends + E5 stability)**: dataset now

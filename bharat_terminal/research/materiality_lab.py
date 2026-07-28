@@ -792,11 +792,261 @@ def exp_ex(df):
     return [{"exp": "EX", "variant": "v4_1_artifact", "n": int(len(y))}]
 
 
+# ── S-series: STEP 0 of the SOTA revision (§8, 2026-07-28) ───────────────
+# Relabel in TRADE-SPACE: decompose every event into the untradeable gap
+# (base close -> reaction-day open) and the capturable component (open ->
+# close for off-session filings; same-day close-to-close for
+# during-session ones, where we can act at t). Market-adjust with the
+# universe cross-sectional median. Fix the PIT bug review found: the SUE
+# join accepted rows announced up to +1 DAY after the event (training saw
+# surprise data the live gate never has).
+
+_JOIN_SQL_V3 = """
+SELECT e.*, b.close AS base_close, b.vol60, b.adv_cr, b.ret5_pre,
+       r.close AS react_close, r.open AS react_open, r.date AS react_date,
+       r3.close AS close_h3, r5.close AS close_h5, r20.close AS close_h20,
+       c.mcap_cr,
+       es.sue_abs, es.sue_signed, es.sue_found
+FROM _cal_events e
+JOIN LATERAL (
+    SELECT close, vol60, adv_cr, nret, ret5_pre FROM _cal_px p
+    WHERE p.symbol = e.symbol AND p.date < e.public_day
+    ORDER BY date DESC LIMIT 1
+) b ON b.nret >= :min_vol_obs AND b.vol60 IS NOT NULL AND b.vol60 > 0
+JOIN LATERAL (
+    SELECT close, open, date FROM _cal_px p
+    WHERE p.symbol = e.symbol AND p.date >= e.public_day
+    ORDER BY date ASC LIMIT 1
+) r ON r.date <= e.public_day + 7
+LEFT JOIN LATERAL (
+    SELECT close FROM _cal_px p
+    WHERE p.symbol = e.symbol AND p.date >= e.public_day
+    ORDER BY date ASC OFFSET 3 LIMIT 1) r3 ON true
+LEFT JOIN LATERAL (
+    SELECT close FROM _cal_px p
+    WHERE p.symbol = e.symbol AND p.date >= e.public_day
+    ORDER BY date ASC OFFSET 5 LIMIT 1) r5 ON true
+LEFT JOIN LATERAL (
+    SELECT close FROM _cal_px p
+    WHERE p.symbol = e.symbol AND p.date >= e.public_day
+    ORDER BY date ASC OFFSET 20 LIMIT 1) r20 ON true
+LEFT JOIN companies c ON c.symbol = e.symbol
+LEFT JOIN LATERAL (
+    SELECT abs(s.sue_composite) AS sue_abs, s.sue_composite AS sue_signed,
+           1 AS sue_found
+    FROM earnings_surprises s
+    WHERE s.symbol = e.symbol AND s.sue_composite IS NOT NULL
+      -- PIT: only surprise rows announced AT OR BEFORE analysis time.
+      AND s.announced_at BETWEEN e.created_at - interval '3 days'
+                             AND e.created_at
+    ORDER BY abs(extract(epoch FROM s.announced_at - e.created_at)) ASC
+    LIMIT 1
+) es ON true
+WHERE e.magnitude > 0
+"""
+
+_MKT_MEDIANS_SQL = """
+SELECT date,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY ret) AS med_ret,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY gap) AS med_gap,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY oc) AS med_oc
+FROM (
+    SELECT date,
+           close / nullif(lag(close) OVER w, 0) - 1 AS ret,
+           open / nullif(lag(close) OVER w, 0) - 1 AS gap,
+           close / nullif(open, 0) - 1 AS oc
+    FROM price_points
+    WHERE date >= cast(:d0 AS date)
+    WINDOW w AS (PARTITION BY symbol ORDER BY date)
+) t
+WHERE ret IS NOT NULL
+GROUP BY date
+"""
+
+
+async def build_cache_v3(days: int):
+    """v3 cache: body + signed PIT-correct SUE + reaction OHLC decomposition
+    + h3/h5/h20 closes, and a per-date universe-median adjustment table."""
+    import pandas as pd
+    from sqlalchemy import text
+    from bharat_terminal.kb.sync.utils import create_async_session
+
+    mc._EVENTS_SQL = _EVENTS_SQL_WITH_BODY
+    _px_with_open = mc._PX_SQL.replace(
+        "SELECT symbol, date, close, ret5_pre,",
+        "SELECT symbol, date, close, open, ret5_pre,", 1).replace(
+        "    SELECT symbol, date, close,\n",
+        "    SELECT symbol, date, close, open,\n", 1)
+    assert _px_with_open.count("open") == 2, "PX_SQL anchor moved"
+    mc._PX_SQL = _px_with_open
+    mc._JOIN_SQL = _JOIN_SQL_V3
+    df = await mc.build_dataset(days, filings_only=True)
+
+    SF = create_async_session()
+    async with SF() as db:
+        rows = (await db.execute(
+            text(_MKT_MEDIANS_SQL),
+            {"d0": pd.Timestamp(df["public_day"].min()).date()})).mappings().all()
+        await db.rollback()
+    mkt = pd.DataFrame([dict(r) for r in rows])
+
+    os.makedirs(LAB_DIR, exist_ok=True)
+    df.to_pickle(f"{LAB_DIR}/dataset_{days}d_v3.pkl.gz", compression="gzip")
+    mkt.to_pickle(f"{LAB_DIR}/mkt_medians.pkl.gz", compression="gzip")
+    logger.info(f"cached v3 {len(df)} rows + {len(mkt)} market-median dates")
+    return df, mkt
+
+
+def _tradespace_frame(df, mkt):
+    """Attach market-adjusted, vol-scaled components to every event.
+
+    capturable = what a next-open fill (off-session) or an at-t entry
+    (during-session, close-to-close proxy) could actually earn.
+    """
+    import numpy as np
+    import pandas as pd
+    df = df.copy()
+    mkt = mkt.copy()
+    mkt["date"] = pd.to_datetime(mkt["date"])
+    df["react_date"] = pd.to_datetime(df["react_date"])
+    df = df.merge(mkt, left_on="react_date", right_on="date", how="left")
+    for c in ("med_ret", "med_gap", "med_oc"):
+        df[c] = df[c].fillna(0.0).astype(float)
+
+    df["gap_ar"] = (df["react_open"] / df["base_close"] - 1) - df["med_gap"]
+    df["postopen_ar"] = (df["react_close"] / df["react_open"] - 1) - df["med_oc"]
+    df["cc_ar"] = (df["react_close"] / df["base_close"] - 1) - df["med_ret"]
+    # during-session events: public_day == filing day, so cc_ar IS the
+    # from-decision reaction; off-session events: only open->close is ours.
+    df["capturable_ar"] = np.where(df["market_hours"], df["cc_ar"],
+                                   df["postopen_ar"])
+    for h, col in ((3, "close_h3"), (5, "close_h5"), (20, "close_h20")):
+        df[f"car_h{h}"] = df[col] / df["base_close"] - 1 - df["med_ret"]
+    for c in ("gap_ar", "postopen_ar", "cc_ar", "capturable_ar",
+              "car_h3", "car_h5", "car_h20"):
+        df[c.replace("_ar", "_z").replace("car_", "car_z_")] = (
+            df[c] / df["vol60"])
+    df["material_capturable"] = (
+        df["capturable_ar"].abs()
+        >= np.maximum(mc.K_SIGMA * df["vol60"], mc.MIN_ABS_MOVE)).astype(int)
+    df["event_type"] = df["headline"].map(event_type_v2)
+    df["band"] = np.where(df["magnitude"] >= 4, "high",
+                          np.where(df["magnitude"] == 3, "medium", "low"))
+    return df
+
+
+def exp_s0(df, mkt=None):
+    """Step 0: the trade-space failure map. Direction + materiality on the
+    CAPTURABLE component, time-split, plus the PIT-fix impact and a
+    champion-family refit on the capturable label."""
+    import numpy as np
+    import pandas as pd
+    if mkt is None:
+        mkt = pd.read_pickle(f"{LAB_DIR}/mkt_medians.pkl.gz",
+                             compression="gzip")
+    d = _tradespace_frame(df, mkt)
+    cutoff = d["created_at"].quantile(1 - SPLIT_FRAC)
+    test = d[d["created_at"] > cutoff]
+    rows = []
+
+    # T1: where does the move LIVE per type — gap vs capturable (all rows).
+    for et, g in d.groupby("event_type"):
+        if len(g) < 60:
+            continue
+        rec = {"exp": "S0_MAP", "variant": et, "n": int(len(g)),
+               "mat_capturable": round(float(g["material_capturable"].mean()), 3),
+               "med_abs_gap_z": round(float(g["gap_z"].abs().median()), 2),
+               "med_abs_capturable_z": round(float(g["capturable_z"].abs().median()), 2),
+               "med_abs_car_z_h5": round(float(g["car_z_h5"].abs().median()), 2),
+               "run_at": datetime.now(timezone.utc).isoformat(), "seed": SEED}
+        _ledger_write(rec); rows.append(rec)
+        logger.info(f"[S0_MAP] {et:22s} n={len(g):5d} "
+                    f"matC={rec['mat_capturable']:.3f} "
+                    f"|gapZ|={rec['med_abs_gap_z']:.2f} "
+                    f"|capZ|={rec['med_abs_capturable_z']:.2f} "
+                    f"|carZ5|={rec['med_abs_car_z_h5']:.2f}")
+
+    # T2: direction on the capturable component, TEST WINDOW, hop-0,
+    # drift-adjusted vs same-window neutral controls.
+    t = test[test["hop"] == 0].copy()
+    t["cap_up"] = (t["capturable_ar"] > 0).astype(int)
+    neutral_up = float(t.loc[t["sentiment"] == "neutral", "cap_up"].mean())
+    for (band, sent), g in t.groupby(["band", "sentiment"]):
+        if sent not in ("positive", "negative") or len(g) < 25:
+            continue
+        hit = float(g["cap_up"].mean()) if sent == "positive" \
+            else 1 - float(g["cap_up"].mean())
+        base = neutral_up if sent == "positive" else 1 - neutral_up
+        rec = {"exp": "S0_DIR", "variant": f"{band}_{sent}", "n": int(len(g)),
+               "hit_capturable": round(hit, 3), "drift_base": round(base, 3),
+               "edge_pp": round(100 * (hit - base), 1),
+               "med_dir_cap_z": round(float(
+                   (g["capturable_z"] * np.where(
+                       g["sentiment"] == "positive", 1, -1)).median()), 2),
+               "split_cutoff": str(cutoff), "seed": SEED,
+               "run_at": datetime.now(timezone.utc).isoformat()}
+        _ledger_write(rec); rows.append(rec)
+        logger.info(f"[S0_DIR] {band:6s} {sent:8s} n={len(g):4d} "
+                    f"hit={hit:.3f} edge={100 * (hit - base):+.1f}pp "
+                    f"medZ={rec['med_dir_cap_z']:+.2f}")
+    for (et, sent), g in t.groupby(["event_type", "sentiment"]):
+        if sent not in ("positive", "negative") or len(g) < 30:
+            continue
+        hit = float(g["cap_up"].mean()) if sent == "positive" \
+            else 1 - float(g["cap_up"].mean())
+        base = neutral_up if sent == "positive" else 1 - neutral_up
+        rec = {"exp": "S0_DIRT", "variant": f"{et}_{sent}", "n": int(len(g)),
+               "hit_capturable": round(hit, 3),
+               "edge_pp": round(100 * (hit - base), 1),
+               "split_cutoff": str(cutoff), "seed": SEED,
+               "run_at": datetime.now(timezone.utc).isoformat()}
+        _ledger_write(rec); rows.append(rec)
+        logger.info(f"[S0_DIRT] {et:22s} {sent:8s} n={len(g):4d} "
+                    f"hit={hit:.3f} edge={100 * (hit - base):+.1f}pp")
+
+    # T3: champion-family refit. (a) old close-to-close label with PIT-fixed
+    # features -> isolates the look-ahead inflation; (b) capturable label ->
+    # the honest trading-relevant baseline for the node program.
+    d2 = d.copy()
+    orig_et = mc.event_type
+    try:
+        mc.event_type = event_type_v2
+        for label_name, series in (
+                ("cc_pitfix", None),          # featurize computes cc label
+                ("capturable", d2["material_capturable"])):
+            X, y, dff = mc.featurize(d2)
+            if series is not None:
+                y = series.loc[X.index]
+            tr = dff["created_at"] <= cutoff
+            te = dff["created_at"] > cutoff
+            p = (_lr_c01(dff, X, y, tr, te)
+                 + _svdhgb_full(dff, X, y, tr, te)) / 2
+            m = evaluate(p, y[te].values, float(y[te].mean()))
+            rec = {"exp": "S0_GATE", "variant": f"blend_{label_name}",
+                   "n_test": int(te.sum()),
+                   "base_rate_test": round(float(y[te].mean()), 4),
+                   **m, "split_cutoff": str(cutoff), "seed": SEED,
+                   "run_at": datetime.now(timezone.utc).isoformat()}
+            _ledger_write(rec); rows.append(rec)
+            logger.info(f"[S0_GATE] {label_name}: auc={m['auc']} "
+                        f"brier={m['brier']} top_obs={m['top_decile_obs']}")
+    finally:
+        mc.event_type = orig_et
+
+    pit_cov = float(d["sue_found"].fillna(0).mean())
+    logger.info(f"[S0] PIT SUE coverage (announced<=analysis): {pit_cov:.3f}")
+    _ledger_write({"exp": "S0_PIT", "variant": "sue_coverage",
+                   "value": round(pit_cov, 4), "seed": SEED,
+                   "run_at": datetime.now(timezone.utc).isoformat()})
+    return rows
+
+
 V2_EXPS = {"D0", "D1", "D2", "EX"}
+V3_EXPS = {"S0"}
 EXPERIMENTS = {"E0": exp_e0, "E1": exp_e1, "E2": exp_e2, "E3": exp_e3,
                "E4": exp_e4, "E5": exp_e5, "E6": exp_e6, "E7": exp_e7,
                "E8": exp_e8, "D0": exp_d0, "D1": exp_d1, "D2": exp_d2,
-               "EX": exp_ex}
+               "EX": exp_ex, "S0": exp_s0}
 
 
 def main() -> None:
@@ -813,12 +1063,17 @@ def main() -> None:
     wanted = (list(EXPERIMENTS) if args.exp == "all"
               else [e.strip().upper() for e in args.exp.split(",") if e.strip()])
     need_v2 = any(e in V2_EXPS for e in wanted)
+    need_v3 = any(e in V3_EXPS for e in wanted)
     if args.build:
-        df = asyncio.run(build_cache_v2(args.days) if need_v2
-                         else build_cache(args.days))
+        if need_v3:
+            df, _ = asyncio.run(build_cache_v3(args.days))
+        elif need_v2:
+            df = asyncio.run(build_cache_v2(args.days))
+        else:
+            df = asyncio.run(build_cache(args.days))
     else:
         import pandas as pd
-        suffix = "_v2" if need_v2 else ""
+        suffix = "_v3" if need_v3 else ("_v2" if need_v2 else "")
         df = pd.read_pickle(f"{LAB_DIR}/dataset_{args.days}d{suffix}.pkl.gz",
                             compression="gzip")
     logger.info(f"dataset: {len(df)} rows, "

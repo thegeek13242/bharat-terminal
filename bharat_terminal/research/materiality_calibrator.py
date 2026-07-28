@@ -109,8 +109,12 @@ LEFT JOIN LATERAL (
     SELECT abs(s.sue_composite) AS sue_abs, 1 AS sue_found
     FROM earnings_surprises s
     WHERE s.symbol = e.symbol AND s.sue_composite IS NOT NULL
+      -- PIT (fixed 2026-07-29): only surprise rows announced AT OR BEFORE
+      -- analysis time. The old "+ interval '1 day'" upper bound leaked
+      -- next-day XBRL into training (~0.05 AUC inflation, S0_GATE) while
+      -- live serving saw has_sue=0 — the press release precedes the XBRL.
       AND s.announced_at BETWEEN e.created_at - interval '3 days'
-                             AND e.created_at + interval '1 day'
+                             AND e.created_at
     ORDER BY abs(extract(epoch FROM s.announced_at - e.created_at)) ASC
     LIMIT 1
 ) es ON true
