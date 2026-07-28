@@ -57,6 +57,36 @@ ON CONFLICT (impact_id, symbol, strategy) DO NOTHING
 RETURNING id
 """
 
+# Off-session signal: queue with qty=0/no entry — filled at the first live
+# LTP after the next open (filling at the pre-news stale LTP would fabricate
+# an impossible price; most results filings land after 15:30 IST).
+_QUEUE_SQL = """
+INSERT INTO paper_trades
+    (strategy, impact_id, news_id, symbol, side, instrument, qty,
+     status, provenance)
+VALUES ($1, $2, $3, $4, $5, $6, 0, 'PENDING', $7::jsonb)
+ON CONFLICT (impact_id, symbol, strategy) DO NOTHING
+RETURNING id
+"""
+
+_PENDING_ROWS_SQL = """
+SELECT id, strategy, symbol, side, instrument, created_at
+FROM paper_trades WHERE status = 'PENDING'
+"""
+
+_FILL_SQL = """
+UPDATE paper_trades
+SET qty = $2, entry_price = $3::float8, entry_at = now(), status = 'OPEN',
+    provenance = provenance || $4::jsonb
+WHERE id = $1 AND status = 'PENDING'
+"""
+
+_PENDING_REJECT_SQL = """
+UPDATE paper_trades
+SET status = 'REJECTED', exit_reason = $2, provenance = provenance || $3::jsonb
+WHERE id = $1 AND status = 'PENDING'
+"""
+
 _MARK_SQL = """
 UPDATE paper_trades
 SET mtm_price = $2::float8, mtm_at = now(),
@@ -125,6 +155,10 @@ class PaperEngine:
     async def reconcile_on_boot(self) -> None:
         """Crash-safe reconciliation = read the OPEN rows and say so. The DB
         is the ledger; nothing else needs rebuilding."""
+        pending = await self._pool.fetch(_PENDING_ROWS_SQL)
+        if pending:
+            logger.info(f"[BOOT] {len(pending)} PENDING signal(s) awaiting "
+                        f"next-open fill")
         rows = await self._pool.fetch(_OPEN_ROWS_SQL)
         logger.info(f"[BOOT] {len(rows)} OPEN paper position(s) carried over")
         for r in rows:
@@ -171,6 +205,60 @@ class PaperEngine:
             f"{intent.symbol} {intent.instrument} x{qty} @ {entry:.2f} "
             f"(ltp {ltp:.2f}, slip {PAPER_SLIPPAGE_BPS}bps)")
         return row["id"]
+
+    async def queue_position(self, intent: SignalIntent) -> int | None:
+        """Market closed at signal time: queue as PENDING for next-open fill.
+        Same idempotency key as open_position, so an off-hours replay is
+        equally harmless."""
+        prov = dict(intent.provenance)
+        prov["queued_off_session"] = True
+        row = await self._pool.fetchrow(
+            _QUEUE_SQL, intent.strategy, intent.impact_id, intent.news_id,
+            intent.symbol, intent.side, intent.instrument,
+            json.dumps(prov, default=str))
+        if row is None:
+            logger.info(f"[DUP] {intent.strategy}/{intent.symbol}/"
+                        f"{intent.impact_id} already recorded — idempotent skip")
+            return None
+        logger.info(f"[QUEUE] #{row['id']} {intent.strategy} {intent.side} "
+                    f"{intent.symbol} {intent.instrument} — market closed, "
+                    f"fills at next open")
+        return row["id"]
+
+    async def pending_symbols(self) -> set[str]:
+        rows = await self._pool.fetch(_PENDING_ROWS_SQL)
+        return {r["symbol"] for r in rows}
+
+    async def fill_pending(self, ltps: dict[str, float]) -> int:
+        """Fill PENDING rows at the first live LTP (adverse slippage, same
+        math as immediate fills). No LTP → stays PENDING and retries next
+        cycle; a made-up fill price would corrupt the pilot."""
+        filled = 0
+        for r in await self._pool.fetch(_PENDING_ROWS_SQL):
+            ltp = ltps.get(r["symbol"])
+            if ltp is None or ltp <= 0:
+                continue
+            slip = PAPER_SLIPPAGE_BPS / 1e4
+            entry = (ltp * (1 - slip) if r["side"] == "SHORT"
+                     else ltp * (1 + slip))
+            qty = math.floor(PAPER_NOTIONAL_PER_TRADE / entry)
+            fill_prov = {"fill_ltp_raw": ltp, "slippage_bps": PAPER_SLIPPAGE_BPS,
+                         "filled_from_pending": True}
+            if qty < 1:
+                await self._pool.execute(
+                    _PENDING_REJECT_SQL, r["id"], "zero_qty",
+                    json.dumps(fill_prov, default=str))
+                logger.info(f"[REJECT] #{r['id']} {r['symbol']}: zero_qty "
+                            f"at pending fill {entry:.2f}")
+                continue
+            await self._pool.execute(
+                _FILL_SQL, r["id"], qty, entry,
+                json.dumps(fill_prov, default=str))
+            filled += 1
+            logger.info(f"[FILL] #{r['id']} {r['strategy']} {r['side']} "
+                        f"{r['symbol']} x{qty} @ {entry:.2f} "
+                        f"(queued {r['created_at']:%H:%M} UTC, ltp {ltp:.2f})")
+        return filled
 
     async def record_rejected(self, intent: SignalIntent,
                               reason: str) -> int | None:

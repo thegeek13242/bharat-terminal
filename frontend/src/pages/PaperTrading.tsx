@@ -48,7 +48,7 @@ interface Summary {
   per_strategy?: StrategyStats[];
 }
 
-type TradeStatus = 'OPEN' | 'CLOSED' | 'REJECTED';
+type TradeStatus = 'PENDING' | 'OPEN' | 'CLOSED' | 'REJECTED';
 
 interface Position {
   id: number;
@@ -306,9 +306,10 @@ function StatRow({ k, v, color }: { k: string; v: ReactNode; color?: string }) {
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 const POLL_MS = 15_000;
-const TABS: TradeStatus[] = ['OPEN', 'CLOSED', 'REJECTED'];
+const TABS: TradeStatus[] = ['PENDING', 'OPEN', 'CLOSED', 'REJECTED'];
 
 const EMPTY_TAB_TEXT: Record<TradeStatus, string> = {
+  PENDING: 'No queued signals. Signals arriving while the market is closed (evening results) queue here and fill at the next open.',
   OPEN: 'No open positions. The engine opens simulated trades automatically when an impact passes its gates.',
   CLOSED: 'No closed trades yet.',
   REJECTED: 'No rejected orders — rejections land here with the gate that blocked them.',
@@ -432,7 +433,9 @@ export function PaperTrading() {
       : new Date(t).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
 
   const tabCounts = useMemo(() => {
-    const c: Record<TradeStatus, number> = { OPEN: 0, CLOSED: 0, REJECTED: 0 };
+    const c: Record<TradeStatus, number> = {
+      PENDING: 0, OPEN: 0, CLOSED: 0, REJECTED: 0,
+    };
     for (const p of positions ?? []) if (c[p.status] !== undefined) c[p.status] += 1;
     return c;
   }, [positions]);

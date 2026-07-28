@@ -39,7 +39,7 @@ router = APIRouter(
 # pilot can be re-based without a code change; must match the executor's value.
 PAPER_CAPITAL = float(os.getenv("PAPER_CAPITAL", "1000000"))
 
-_STATUSES = ("OPEN", "CLOSED", "REJECTED")
+_STATUSES = ("PENDING", "OPEN", "CLOSED", "REJECTED")
 
 # Mark-to-market P&L of an OPEN row. A NULL entry_price or mtm_price
 # propagates to NULL (and SUM skips it): a position that has never been

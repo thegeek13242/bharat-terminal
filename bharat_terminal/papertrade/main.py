@@ -88,8 +88,9 @@ async def main():
             return
 
         live = [i for i in intents if i.rejected_reason is None]
+        market_open = is_market_hours()
         ltps: dict[str, float] = {}
-        if live:
+        if live and market_open:
             try:
                 ltps = await marks.get_ltps({i.symbol for i in live})
             except Exception as e:
@@ -100,6 +101,12 @@ async def main():
                 if intent.rejected_reason:
                     # e.g. stale_event: recorded, never silently dropped.
                     await engine.record_rejected(intent, intent.rejected_reason)
+                elif not market_open:
+                    # Off-session (most results filings land after 15:30 IST):
+                    # the pre-news LTP would be a fabricated fill — queue as
+                    # PENDING; the MTM loop fills it at the first LTP after
+                    # the next open.
+                    await engine.queue_position(intent)
                 else:
                     await engine.open_position(intent, ltps.get(intent.symbol))
             except Exception as e:
@@ -117,21 +124,25 @@ async def main():
                 break
 
     async def mtm_loop():
-        """Mark OPEN positions and apply exit rules (stop / holding period /
-        the >=15:15 IST cash-short squareoff) every 60s during market hours."""
+        """Fill queued PENDING signals, then mark OPEN positions and apply
+        exit rules (stop / holding period / the >=15:15 IST cash-short
+        squareoff) every 60s during market hours."""
         while not shutdown_event.is_set():
             await asyncio.sleep(MTM_INTERVAL_S)
             if not is_market_hours():
                 continue
             try:
                 symbols = await engine.open_symbols()
-                if not symbols:
+                pending = await engine.pending_symbols()
+                todo = symbols | pending
+                if not todo:
                     continue
-                ltps = await marks.get_ltps(symbols)
+                ltps = await marks.get_ltps(todo)
+                filled = (await engine.fill_pending(ltps)) if pending else 0
                 marked = await engine.mark_open_positions(ltps)
                 closed = await engine.run_exits(ltps)
-                logger.info(f"[MTM] open_symbols={len(symbols)} "
-                            f"marked={marked} closed={closed}")
+                logger.info(f"[MTM] open={len(symbols)} pending={len(pending)} "
+                            f"filled={filled} marked={marked} closed={closed}")
             except Exception as e:
                 logger.error(f"[MTM] cycle failed: {e}", exc_info=True)
 
