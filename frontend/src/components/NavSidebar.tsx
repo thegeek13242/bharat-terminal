@@ -33,7 +33,11 @@ export function NavSidebar({ children, counts, connected = false, statusLabel = 
   const { pathname } = useLocation();
   const { user, logout } = useAuth();
   const navItems = user?.internal
-    ? [...NAV, { to: '/research', label: 'Research', key: 'research' }]
+    ? [
+        ...NAV,
+        { to: '/research', label: 'Research', key: 'research' },
+        { to: '/papertrading', label: 'Paper Trading', key: 'papertrading' },
+      ]
     : NAV;
 
   const monogram = (user?.name || user?.email || 'AM')

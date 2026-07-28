@@ -1,0 +1,15 @@
+# Paper-trading service: Kafka consumer + asyncpg ledger + LTP marks +
+# materiality-gate inference. Core entries mirror requirements/research.txt
+# (same sklearn family the gate artifact was fit with); aiokafka/redis/aiohttp
+# pins match the other services (analysis/ingestion).
+pydantic>=2.6,<3
+httpx>=0.27,<1
+asyncpg>=0.29,<1
+# Materiality artifact (exports/materiality_lab/*.joblib): sklearn lr+hgb
+# blend over tfidf/svd text. scikit-learn pulls numpy/scipy/joblib.
+scikit-learn>=1.4,<2
+pandas>=2.0,<3
+aiokafka==0.10.0
+redis==5.0.8
+# Scrip-master download (35MB, slow CDN — long-timeout pattern).
+aiohttp==3.9.3

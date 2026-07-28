@@ -297,6 +297,33 @@ services:
     restart: unless-stopped
     logging: *default-logging
 
+  papertrade:
+    # INTERNAL paper-trading pilot (Phase C of the trading-system plan):
+    # consumes analysed.impact.in, applies the D-series signal rules +
+    # v4.1 materiality gate, and records simulated positions with full
+    # decision provenance into paper_trades. NO broker connection — paper
+    # only. Requires migration 030 (boot reconciliation reads paper_trades).
+    build:
+      context: .
+      dockerfile: docker/papertrade/Dockerfile
+    container_name: bharat-papertrade
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      kb-migrate:
+        condition: service_completed_successfully
+    env_file: [".env"]
+    environment:
+      <<: *common-env
+      KB_SERVICE_URL: "http://kb-service:8001"
+    volumes:
+      # The v4.1 materiality-gate artifact (research-lab export, read-only).
+      - ./exports:/app/exports:ro
+    restart: unless-stopped
+    logging: *default-logging
+
   analysis-worker:
     build:
       context: .

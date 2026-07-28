@@ -7,6 +7,7 @@ import { Starred } from './pages/Starred';
 import { Surprises } from './pages/Surprises';
 import { Transcripts } from './pages/Transcripts';
 import { Research } from './pages/Research';
+import { PaperTrading } from './pages/PaperTrading';
 import { Investors } from './pages/Investors';
 import { Universe } from './pages/Universe';
 
@@ -21,6 +22,7 @@ export default function App() {
         <Route path="/surprises" element={<Surprises />} />
         <Route path="/transcripts" element={<Transcripts />} />
         <Route path="/research" element={<Research />} />
+        <Route path="/papertrading" element={<PaperTrading />} />
         <Route path="/investors" element={<Investors />} />
         <Route path="/universe" element={<Universe />} />
         <Route path="/" element={<Navigate to="/terminal" replace />} />
