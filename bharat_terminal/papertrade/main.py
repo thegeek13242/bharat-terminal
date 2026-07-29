@@ -38,7 +38,11 @@ KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 TOPIC_ANALYSED = "analysed.impact.in"
 CONSUMER_GROUP = "papertrade"
 
-MTM_INTERVAL_S = 60
+# 5s marks (2026-07-29, founder ask: live PnL on the dashboard) — also
+# tightens trailing-stop and squareoff reaction from 60s to 5s. One batched
+# kb-service/Angel One quote call per cycle; per-cycle logging is DEBUG
+# unless a fill/close happened.
+MTM_INTERVAL_S = int(os.getenv("PAPER_MTM_INTERVAL_S", "5"))
 SNAPSHOT_INTERVAL_S = 300
 # Absorption-curve marks: LTP at decision (t0) then +5/15/30/60 min for
 # every DURING-SESSION hop-0 filing impact, traded or not. Measures how
@@ -233,8 +237,9 @@ async def main():
                 filled = (await engine.fill_pending(ltps)) if pending else 0
                 marked = await engine.mark_open_positions(ltps)
                 closed = await engine.run_exits(ltps)
-                logger.info(f"[MTM] open={len(symbols)} pending={len(pending)} "
-                            f"filled={filled} marked={marked} closed={closed}")
+                log = logger.info if (filled or closed) else logger.debug
+                log(f"[MTM] open={len(symbols)} pending={len(pending)} "
+                    f"filled={filled} marked={marked} closed={closed}")
             except Exception as e:
                 logger.error(f"[MTM] cycle failed: {e}", exc_info=True)
 

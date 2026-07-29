@@ -376,7 +376,7 @@ function StatRow({ k, v, color }: { k: string; v: ReactNode; color?: string }) {
 
 // ── Page ──────────────────────────────────────────────────────────────────────
 
-const POLL_MS = 15_000;
+const POLL_MS = 5_000;
 const TABS: TradeStatus[] = ['PENDING', 'OPEN', 'CLOSED', 'REJECTED'];
 
 const EMPTY_TAB_TEXT: Record<TradeStatus, string> = {
@@ -604,7 +604,7 @@ export function PaperTrading() {
 
         {error && (
           <div className="mono" style={{ padding: '7px 20px', borderBottom: '1px solid var(--border)', fontSize: 10.5, color: 'var(--head)' }}>
-            Refresh failed ({error}) — showing last loaded data. Retrying every 15s.
+            Refresh failed ({error}) — showing last loaded data. Retrying every 5s.
           </div>
         )}
 
@@ -625,7 +625,7 @@ export function PaperTrading() {
             <div className="mono" style={{ marginTop: 60, textAlign: 'center', fontSize: 11.5, color: 'var(--ink-mute)', lineHeight: 1.8 }}>
               Could not reach the paper-trading API yet.
               <br />
-              Retrying every 15 seconds while this tab is visible.
+              Retrying every 5 seconds while this tab is visible.
             </div>
           )}
 
