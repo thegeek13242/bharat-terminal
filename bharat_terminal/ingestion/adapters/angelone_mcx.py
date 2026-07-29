@@ -33,8 +33,9 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timezone
 from typing import Awaitable, Callable, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -70,6 +71,16 @@ SCRIP_MASTER_URL = (
 # websocket never opened, MCX ticks silently absent). The generous total only
 # caps slow-but-progressing downloads; sock_read bounds a truly stalled stream.
 SCRIP_MASTER_TIMEOUT_S = float(os.getenv("SCRIP_MASTER_TIMEOUT_S", "600"))
+
+# Daily pre-open re-login (2026-07-29 incident): Angel One force-expires the
+# REST JWT overnight while the WEBSOCKET keeps streaming on the old session —
+# so the supervisor never re-logged in, kept republishing yesterday's dead
+# token, and equity LTP served AG8001 "Invalid Token" all morning (blocked
+# the paper trader's at-open fills). Refresh the session every day at this
+# IST time regardless of websocket health.
+_IST = ZoneInfo("Asia/Kolkata")
+_RELOGIN_HHMM = os.getenv("ANGELONE_RELOGIN_IST", "08:40")
+RELOGIN_IST = dtime(*(int(x) for x in _RELOGIN_HHMM.split(":")))
 
 # Universe of MCX commodities we care about. Keys are the `name` field in the
 # scrip master; values are the canonical name we publish to Kafka.
@@ -159,6 +170,7 @@ class AngelOneMCXAdapter:
         self._jwt_token: Optional[str] = None
         self._refresh_token: Optional[str] = None
         self._feed_token: Optional[str] = None
+        self._last_login_ist_date = None    # set on each _smartapi_login
         # token (str) → metadata dict.
         #   MCX: {"exch": "MCX", "commodity": str, "symbol": str, "expiry": str, "divisor": float}
         self._token_metadata: Dict[str, Dict] = {}
@@ -286,6 +298,19 @@ class AngelOneMCXAdapter:
                     if time.time() - last_session_publish > self._session_refresh_s:
                         await self._publish_session()
                         last_session_publish = time.time()
+                    # Daily pre-open REST-token refresh (see RELOGIN_IST note
+                    # at top). If the fresh session invalidates the running
+                    # websocket, the thread exits and the supervisor loop
+                    # rebuilds it — either way the JWT in Redis is valid at
+                    # the equity open.
+                    now_ist = datetime.now(_IST)
+                    if (now_ist.date() != self._last_login_ist_date
+                            and now_ist.time() >= RELOGIN_IST):
+                        logger.info(f"[{self.source_name}] daily pre-open "
+                                    f"re-login (REST JWT refresh)")
+                        await asyncio.to_thread(self._smartapi_login)
+                        await self._publish_session()
+                        last_session_publish = time.time()
 
                 logger.warning(f"[{self.source_name}] WebSocket loop exited")
                 # Reset backoff after a clean run >5min
@@ -318,6 +343,7 @@ class AngelOneMCXAdapter:
         self._jwt_token = data.get("jwtToken")
         self._refresh_token = data.get("refreshToken")
         self._feed_token = sc.getfeedToken()
+        self._last_login_ist_date = datetime.now(_IST).date()
         if not all([self._jwt_token, self._feed_token]):
             raise RuntimeError(f"SmartAPI login returned incomplete tokens: {data}")
         logger.info(f"[{self.source_name}] SmartAPI login OK ({self._client_code})")
