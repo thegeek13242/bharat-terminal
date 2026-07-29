@@ -202,7 +202,10 @@ async def main():
             try:
                 symbols = await engine.open_symbols()
                 pending = await engine.pending_symbols()
-                todo = symbols | pending
+                # open_symbols() returns a list, pending_symbols() a set —
+                # `list | set` crashed every MTM cycle (2026-07-29 hotfix;
+                # it blocked the at-open pending fills).
+                todo = set(symbols) | set(pending)
                 if not todo:
                     continue
                 ltps = await marks.get_ltps(todo)
