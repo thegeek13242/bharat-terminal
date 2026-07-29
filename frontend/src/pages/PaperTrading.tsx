@@ -140,14 +140,15 @@ function inrSigned(v: number | null | undefined, digits = 0): string {
   return v > 0 ? `+${inr(v, digits)}` : inr(v, digits);
 }
 
-/** Compact ₹ for the chart y-axis: ₹1.05Cr / ₹8.2L / ₹45K. */
-function inrCompact(v: number): string {
-  const sign = v < 0 ? '-' : '';
-  const a = Math.abs(v);
-  if (a >= 1e7) return `${sign}₹${(a / 1e7).toFixed(2)}Cr`;
-  if (a >= 1e5) return `${sign}₹${(a / 1e5).toFixed(1)}L`;
-  if (a >= 1e3) return `${sign}₹${(a / 1e3).toFixed(0)}K`;
-  return `${sign}₹${a.toFixed(0)}`;
+/** Axis formatter locked to ONE unit chosen from the axis maximum. Per-tick
+ * unit switching put ₹100.0L and ₹1.00Cr on the same axis when the domain
+ * straddled 1e7 (equity hovers at the 1 Cr baseline) — same quantity, two
+ * spellings. */
+function inrAxisTick(maxAbs: number): (v: number) => string {
+  if (maxAbs >= 1e7) return (v) => `${v < 0 ? '-' : ''}₹${(Math.abs(v) / 1e7).toFixed(2)}Cr`;
+  if (maxAbs >= 1e5) return (v) => `${v < 0 ? '-' : ''}₹${(Math.abs(v) / 1e5).toFixed(1)}L`;
+  if (maxAbs >= 1e3) return (v) => `${v < 0 ? '-' : ''}₹${(Math.abs(v) / 1e3).toFixed(0)}K`;
+  return (v) => `${v < 0 ? '-' : ''}₹${Math.abs(v).toFixed(0)}`;
 }
 
 function signedPct(v: number | null | undefined, digits = 1): string {
@@ -531,6 +532,11 @@ export function PaperTrading() {
     return [lo - pad, hi + pad];
   }, [chartData, start]);
 
+  const yTick = useMemo(
+    () => inrAxisTick(
+      yDomain ? Math.max(Math.abs(yDomain[0]), Math.abs(yDomain[1])) : 0),
+    [yDomain]);
+
   const intraday = chartData.length >= 2
     && chartData[chartData.length - 1].t - chartData[0].t <= 48 * 3600 * 1000;
   const xTick = (t: number) =>
@@ -726,7 +732,7 @@ export function PaperTrading() {
                         />
                         <YAxis
                           domain={yDomain}
-                          tickFormatter={inrCompact}
+                          tickFormatter={yTick}
                           tick={{ fill: CHART.inkMute, fontSize: 10, fontFamily: 'IBM Plex Mono, monospace' }}
                           stroke={CHART.border}
                           tickLine={false}
