@@ -195,6 +195,7 @@ async def main():
         """Fill queued PENDING signals, then mark OPEN positions and apply
         exit rules (stop / holding period / the >=15:15 IST cash-short
         squareoff) every 60s during market hours."""
+        ltp_dry_cycles = 0
         while not shutdown_event.is_set():
             await asyncio.sleep(MTM_INTERVAL_S)
             if not is_market_hours():
@@ -209,6 +210,26 @@ async def main():
                 if not todo:
                     continue
                 ltps = await marks.get_ltps(todo)
+                # Fail LOUD when the whole book gets zero quotes (2026-07-29:
+                # Angel One's expired REST JWT silently returned empty quotes
+                # and the at-open fills sat pending for 10 minutes with only
+                # INFO logs to show for it). 3 consecutive dry cycles during
+                # market hours is an incident, not noise.
+                if todo and not ltps:
+                    ltp_dry_cycles += 1
+                    if ltp_dry_cycles == 3:
+                        msg = (f"no LTPs for {len(todo)} tracked symbols for "
+                               f"{ltp_dry_cycles} consecutive market-hours "
+                               f"cycles — fills/marks/exits are BLOCKED "
+                               f"(Angel One session dead?)")
+                        logger.error(f"[LTP-DRY] {msg}")
+                        try:
+                            from bharat_terminal.alerts import get_monitor
+                            get_monitor().alert_now("PAPERTRADE_LTP_DRY", msg)
+                        except Exception as e:
+                            logger.error(f"[LTP-DRY] alert failed: {e}")
+                else:
+                    ltp_dry_cycles = 0
                 filled = (await engine.fill_pending(ltps)) if pending else 0
                 marked = await engine.mark_open_positions(ltps)
                 closed = await engine.run_exits(ltps)
