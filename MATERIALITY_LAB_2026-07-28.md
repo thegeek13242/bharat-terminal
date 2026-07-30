@@ -115,7 +115,55 @@ Human summary of each loop iteration appended below.
 | v4 (2026-07-28) | mean(lr_C0.1, svd128_hgb) | 0.7227 | 0.0935 | wins ALL 4 splits (0.718–0.723); body text via TF-IDF→SVD-128 is the new signal; ~5pp overconfident in top decile (ranking unaffected) |
 | **v4.1 (2026-07-28)** | **v4 + 22-bucket taxonomy** | **0.7242** | **0.0933** | beats v4 on AUC on all 4 splits (0.7195–0.7263, +0.001–0.003), top-decile obs 0.2587 @0.3 (lift 2.32); extra buckets mined from the 'other' mass (press_release, investor_presentation, business_update, litigation_insolvency, procedural_report, general_updates) |
 
+### Pre-registered: Tier-B (router v2 rubrics) promotion criteria
+Written 2026-07-30 BEFORE the replay runs. Population: routing-diff-affected
+hop-0 filings (v2 vs v3 selection differs), paired arms, identical
+grounding, seed 42, one shot — no re-rolls on the same window.
+- **RB-1 (primary, non-inferiority):** paired hard-wrong delta (v3 − v2)
+  on capturable AR ≤ 0, with 95% bootstrap CI upper bound < +2.0pp.
+- **RB-2:** fund_raise-class magnitude monotonicity not worsened;
+  target: P(material|high) ≥ P(material|low) restored within the class.
+- **RB-3:** frozen v4.1-gate AUC on affected rows: v3 not worse than v2
+  by > 0.02.
+- **RB-4 (protect):** among affected results rows classified negative,
+  direction hit-rate non-inferior (v3 ≥ v2 − 3pp).
+- Decision: ALL four pass → flip ROUTER_V2_RUBRICS=1 (with deploy
+  approval); any fail → Tier B stays off, findings drive iteration on a
+  FRESH window only.
+
+### Pre-registration amendment — PEAD (founder-directed 2026-07-30)
+From 2026-07-31 fills onward: (1) **gap guard** — pead_long fills are
+rejected when the fill price exceeds the previous close by >2%
+(PAPER_PEAD_MAX_GAP_PCT; batch-1 forensics: entries that paid +3 to +6.6%
+pops are the concentrated losers, and the validated close-to-close drift
+INCLUDES the gap); (2) **beta-hedge** — a notional-matched index short
+(pead_hedge, NIFTYBEES proxy for NIFTY futures) is maintained against the
+open pead_long book, so the evaluated strategy becomes the D10-minus-
+market SPREAD — the form actually validated. Evaluation basis: primary =
+pead_long + pead_hedge combined net expectancy; the unhedged leg remains
+separately observable. Events before this amendment (16 entries, incl.
+the 9 gap-wounded batch-1 fills) are reported both included and excluded.
+
 ### Iterations
+
+- **2026-07-30 #6 (RB — Tier-B replay verdict: FAIL, rubrics stay OFF):**
+  paired replay of all 206 routing-diff filings (182 pairs called, 161
+  scored, 25 parse failures noted, $4.94). Against the pre-registered
+  criteria: **RB-1 FAIL** — paired hard-wrong delta +3.6pp v3-worse
+  (34.0%→37.6%, CI [−0.9, +8.5]pp; adverse point estimate, not a width
+  failure); **RB-4 FAIL** — results-negative protect 72.7%→55.6%
+  (n=11/9, tiny but registered); RB-2 unjudgeable (fund_raise class n=3);
+  RB-3 pass (frozen-gate AUC −0.007). Per-class diagnostic: the dominant
+  wrapper_content_sniff class (n=93) is 32-33% hard-wrong under BOTH
+  rubrics with direction hit 47%→43% — the statutory results rubric does
+  NOT fix wrapper filings, exactly the genre-mismatch the LLM-systems
+  critic predicted ("guidance/outlook slides are the content; 'work only
+  from the numbers table' suppresses it"). lender_addendum_change (n=56):
+  +1.8pp, no measurable benefit — body-signature selection was already
+  adequate. Next iteration (FRESH window only, per protocol): genre-
+  variant wrapper rubric (guidance-aware), drop the lender-selection
+  change, revalidate as the window accrues. ROUTER_V2_RUBRICS stays 0;
+  Tier A (deployed) is unaffected.
 
 - **2026-07-29 #5 (S0 — TRADE-SPACE RELABEL + PIT fixes; supersedes all
   close-to-close cell claims for trading decisions):** every event

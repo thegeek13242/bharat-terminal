@@ -53,6 +53,19 @@ SELECT coalesce(sum(abs(qty) * coalesce(mtm_price, entry_price)), 0)::float8
 FROM paper_trades WHERE status = 'OPEN'
 """
 
+# PEAD gap guard (founder decision 2026-07-30, from the batch-1 forensics:
+# entries that paid a +3-6.6% post-surprise pop at fill are the losers —
+# the validated close-to-close drift INCLUDES the overnight gap, so paying
+# the gap forfeits the edge). Fill is rejected when the fill price exceeds
+# the previous close by more than this percentage.
+PAPER_PEAD_MAX_GAP_PCT = float(os.getenv("PAPER_PEAD_MAX_GAP_PCT", "2.0"))
+
+_PREV_CLOSE_SQL = """
+SELECT close FROM price_points
+WHERE symbol = $1 AND date < (now() AT TIME ZONE 'Asia/Kolkata')::date
+ORDER BY date DESC LIMIT 1
+"""
+
 _VOL60_SQL = """
 SELECT stddev_samp(ret) AS vol60 FROM (
     SELECT close / nullif(lag(close) OVER (ORDER BY date), 0) - 1 AS ret
@@ -202,8 +215,8 @@ class PaperEngine:
 
     # ── entries ──────────────────────────────────────────────────────────────
 
-    async def open_position(self, intent: SignalIntent,
-                            ltp: float | None) -> int | None:
+    async def open_position(self, intent: SignalIntent, ltp: float | None,
+                            notional: float | None = None) -> int | None:
         """Fill at LTP with an adverse slippage haircut. No LTP → REJECTED row
         (auditable, never silent). Returns the new row id, or None."""
         prov = dict(intent.provenance)
@@ -215,9 +228,18 @@ class PaperEngine:
                         f"{intent.symbol}: no_ltp")
             return await self._insert_rejected(intent, "no_ltp", prov)
 
+        if intent.strategy == "pead_long":
+            gap_reject = await self._pead_gap_check(intent.symbol, ltp)
+            if gap_reject is not None:
+                prov["gap_pct"] = gap_reject
+                logger.info(f"[REJECT] pead_long {intent.symbol}: gap_guard "
+                            f"(fill {gap_reject:+.2f}% above prev close > "
+                            f"{PAPER_PEAD_MAX_GAP_PCT}%)")
+                return await self._insert_rejected(intent, "gap_guard", prov)
+
         slip = PAPER_SLIPPAGE_BPS / 1e4
         entry = ltp * (1 - slip) if intent.side == "SHORT" else ltp * (1 + slip)
-        qty = math.floor(PAPER_NOTIONAL_PER_TRADE / entry)
+        qty = math.floor((notional or PAPER_NOTIONAL_PER_TRADE) / entry)
         if qty < 1:
             # Price above the whole per-trade notional (rare: MRF-class stock).
             logger.info(f"[REJECT] {intent.strategy} {intent.side} "
@@ -293,6 +315,17 @@ class PaperEngine:
                 logger.info(f"[REJECT] #{r['id']} {r['symbol']}: zero_qty "
                             f"at pending fill {entry:.2f}")
                 continue
+            if r["strategy"] == "pead_long":
+                gap_reject = await self._pead_gap_check(r["symbol"], ltp)
+                if gap_reject is not None:
+                    await self._pool.execute(
+                        _PENDING_REJECT_SQL, r["id"], "gap_guard",
+                        json.dumps({**fill_prov, "gap_pct": gap_reject},
+                                   default=str))
+                    logger.info(f"[REJECT] #{r['id']} {r['symbol']}: "
+                                f"gap_guard at pending fill "
+                                f"({gap_reject:+.2f}%)")
+                    continue
             gross = float(await self._pool.fetchval(_GROSS_SQL))
             if gross + qty * entry > PAPER_GROSS_CAP:
                 await self._pool.execute(
@@ -312,6 +345,20 @@ class PaperEngine:
                         f"(queued {r['created_at']:%H:%M} UTC, ltp {ltp:.2f})")
         return filled
 
+    async def _pead_gap_check(self, symbol: str, ltp: float) -> float | None:
+        """Returns the gap % if the fill price exceeds the previous close by
+        more than PAPER_PEAD_MAX_GAP_PCT (reject), else None (proceed). No
+        prev close available -> proceed (fail-open, paper)."""
+        try:
+            prev = await self._pool.fetchval(_PREV_CLOSE_SQL, symbol.upper())
+        except Exception as e:
+            logger.warning(f"gap check failed for {symbol}: {e}")
+            return None
+        if not prev or prev <= 0:
+            return None
+        gap_pct = 100.0 * (ltp / float(prev) - 1)
+        return round(gap_pct, 2) if gap_pct > PAPER_PEAD_MAX_GAP_PCT else None
+
     async def _fetch_vol60(self, symbol: str) -> float | None:
         """Trailing-60-session daily vol for stop scaling; None if thin."""
         try:
@@ -321,6 +368,20 @@ class PaperEngine:
         except Exception as e:
             logger.warning(f"vol60 fetch failed for {symbol}: {e}")
             return None
+
+    async def open_rows(self, strategy: str) -> list:
+        """OPEN rows for one strategy (hedge_loop rebalance + close)."""
+        return await self._pool.fetch(
+            "SELECT id, strategy, symbol, side, instrument, qty, entry_price, "
+            "entry_at, trail_extreme, entry_vol60 FROM paper_trades "
+            "WHERE status = 'OPEN' AND strategy = $1 ORDER BY id", strategy)
+
+    async def strategy_notional(self, strategy: str) -> float:
+        v = await self._pool.fetchval(
+            "SELECT coalesce(sum(abs(qty) * entry_price), 0)::float8 "
+            "FROM paper_trades WHERE status = 'OPEN' AND strategy = $1",
+            strategy)
+        return float(v or 0)
 
     async def record_signal_mark(self, impact_id: str, symbol: str, mark: str,
                                  ltp: float, magnitude: int | None = None,
@@ -414,6 +475,10 @@ class PaperEngine:
         #    is EXEMPT — its validated edge is an unconditional 20d hold.
         #    Flat PAPER_STOP_PCT remains only as the fallback when entry
         #    vol60 was unavailable.
+        # pead_hedge exists only to offset the PEAD book — the hedge_loop
+        # opens/closes it by rebalance; no stop, no hold, no squareoff.
+        if r["strategy"] == "pead_hedge":
+            return None
         if ltp and r["entry_price"] and r["strategy"] != "pead_long":
             vol = r["entry_vol60"]
             anchor = r["trail_extreme"] or r["entry_price"]

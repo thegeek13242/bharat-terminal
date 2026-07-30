@@ -60,6 +60,17 @@ MARK_OFFSETS = ((300, "t5"), (900, "t15"), (1800, "t30"), (3600, "t60"))
 PEAD_SCAN_INTERVAL_S = int(os.getenv("PAPER_PEAD_SCAN_S", "600"))
 PEAD_SCAN_WINDOW_H = int(os.getenv("PAPER_PEAD_SCAN_WINDOW_H", "24"))
 
+# Beta-hedge for the PEAD book (founder decision 2026-07-30): the validated
+# PEAD edge is the D10-D1 SPREAD (+2.11% @20d); the long-only leg carries
+# the full tape (cohorts: -9% to +6.7% per quarter on beta alone). A
+# notional-matched index short converts the paper strategy into the spread
+# actually validated. NIFTYBEES prices proxy the NIFTY futures a real
+# implementation would use (instrument marked FUT accordingly).
+PAPER_HEDGE_ENABLED = os.getenv("PAPER_PEAD_HEDGE", "1") == "1"
+PAPER_HEDGE_BAND = float(os.getenv("PAPER_HEDGE_BAND", "100000"))
+HEDGE_SYMBOL = os.getenv("PAPER_HEDGE_SYMBOL", "NIFTYBEES")
+HEDGE_INTERVAL_S = int(os.getenv("PAPER_HEDGE_INTERVAL_S", "300"))
+
 _PEAD_SCAN_SQL = """
 SELECT es.id, es.symbol, es.sue_composite, es.announced_at, es.period_end
 FROM earnings_surprises es
@@ -320,16 +331,66 @@ async def main():
             except Exception as e:
                 logger.error(f"[PEAD-SCAN] cycle failed: {e}", exc_info=True)
 
+    async def hedge_loop():
+        """Keep the pead_hedge short's notional matched to the OPEN pead_long
+        book within PAPER_HEDGE_BAND. Grows by opening additional shorts,
+        shrinks by closing whole hedge rows (newest first); fully unwinds
+        when the PEAD book empties."""
+        while not shutdown_event.is_set():
+            await asyncio.sleep(HEDGE_INTERVAL_S)
+            if not PAPER_HEDGE_ENABLED or not is_market_hours():
+                continue
+            try:
+                pead = await engine.strategy_notional("pead_long")
+                hedge = await engine.strategy_notional("pead_hedge")
+                delta = pead - hedge
+                if abs(delta) <= PAPER_HEDGE_BAND and not (
+                        pead == 0 and hedge > 0):
+                    continue
+                ltps = await marks.get_ltps({HEDGE_SYMBOL})
+                ltp = ltps.get(HEDGE_SYMBOL)
+                if not ltp or ltp <= 0:
+                    logger.warning(f"[HEDGE] no LTP for {HEDGE_SYMBOL}")
+                    continue
+                if delta > PAPER_HEDGE_BAND:
+                    intent = SignalIntent(
+                        "pead_hedge", HEDGE_SYMBOL, "SHORT", "FUT",
+                        f"HEDGE_{int(time.time())}", None,
+                        provenance={
+                            "trigger": "hedge_rebalance",
+                            "pead_notional": round(pead),
+                            "hedge_notional_before": round(hedge),
+                            "note": "represents a NIFTY futures hedge; "
+                                    "paper-modeled via NIFTYBEES prices",
+                            "gate_flags": {"hedge": True},
+                        })
+                    await engine.open_position(intent, ltp, notional=delta)
+                    logger.info(f"[HEDGE] extended short by ₹{delta:.0f} "
+                                f"(pead ₹{pead:.0f})")
+                else:
+                    # over-hedged (or book empty): close newest rows first
+                    excess = hedge - pead
+                    for row in reversed(await engine.open_rows("pead_hedge")):
+                        if excess <= PAPER_HEDGE_BAND and pead > 0:
+                            break
+                        await engine.close_position(row, ltp, "hedge_rebal")
+                        excess -= abs(row["qty"]) * float(row["entry_price"])
+                        if pead == 0 and excess <= 0:
+                            break
+            except Exception as e:
+                logger.error(f"[HEDGE] cycle failed: {e}", exc_info=True)
+
     consumer_task = asyncio.create_task(consume_loop())
     mtm_task = asyncio.create_task(mtm_loop())
     snapshot_task = asyncio.create_task(snapshot_loop())
     marks_task = asyncio.create_task(marks_loop())
     pead_task = asyncio.create_task(pead_scan_loop())
+    hedge_task = asyncio.create_task(hedge_loop())
     shutdown_task = asyncio.create_task(shutdown_event.wait())
 
     done, pending = await asyncio.wait(
         [consumer_task, mtm_task, snapshot_task, marks_task, pead_task,
-         shutdown_task],
+         hedge_task, shutdown_task],
         return_when=asyncio.FIRST_COMPLETED,
     )
     for task in pending:
