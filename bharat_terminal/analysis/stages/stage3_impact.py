@@ -10,11 +10,14 @@ import re
 import uuid
 import asyncio
 import httpx
-from typing import List, Optional
+from collections import OrderedDict
+from typing import Dict, List, Optional, Tuple
 from bharat_terminal import llm
 from bharat_terminal.llm import provider_for_model
 from bharat_terminal.types import NewsItem, CompanyImpact
+from bharat_terminal.analysis import router_v2
 from bharat_terminal.analysis.llm_logger import get_llm_logger, LLMCallRecord, compute_cost
+from bharat_terminal.analysis.market_hours import IST
 from bharat_terminal.analysis.scenario_rubrics import (
     detect_scenario, lender_addendum, rubric_for,
 )
@@ -108,6 +111,57 @@ async def fetch_company_context(symbol: str) -> Optional[dict]:
     return None
 
 
+# ── Router-v2 provenance registry ───────────────────────────────────────────
+# score_impacts stashes the per-item router meta here; the report assembler
+# collects it via consume_router_meta(news_id) into ImpactReport.router_meta.
+# Bounded FIFO so an unconsumed entry (error paths, non-pipeline callers) can
+# never grow memory.
+_ROUTER_META: "OrderedDict[str, dict]" = OrderedDict()
+_ROUTER_META_MAX = 1024
+
+
+def stash_router_meta(news_id: str, meta: dict) -> None:
+    _ROUTER_META[news_id] = meta
+    _ROUTER_META.move_to_end(news_id)
+    while len(_ROUTER_META) > _ROUTER_META_MAX:
+        _ROUTER_META.popitem(last=False)
+
+
+def consume_router_meta(news_id: str) -> Optional[dict]:
+    """Pop the router-v2 provenance for a news item ('None' when stage-3 never
+    routed it — pre-router reports, skip paths)."""
+    return _ROUTER_META.pop(news_id, None)
+
+
+def _scenario_for(
+    news_item: NewsItem,
+    symbols: List[str],
+    route_decisions: Optional[Dict[str, "router_v2.RouteDecision"]] = None,
+) -> Tuple[Optional[str], str]:
+    """(scenario_key, scenario prompt block) for this item.
+
+    Flag OFF (ROUTER_V2_RUBRICS=0, the default) or no route decisions: exactly
+    today's behaviour — detect_scenario + rubric_for + body-signature lender
+    addendum. Flag ON: taxonomy-v3-driven selection (router_v2, Tier B) with
+    the company-type addenda; the company_type is only trusted for addenda on
+    single-symbol items (multi-symbol events fall back to body signature —
+    one rubric cannot serve mixed company types).
+    """
+    _body = news_item.full_body or news_item.body or ""
+    _headline = news_item.headline or ""
+    primary = (route_decisions or {}).get(symbols[0]) if symbols else None
+    if router_v2.rubrics_enabled() and primary is not None:
+        addendum_type = primary.company_type if len(symbols) == 1 else None
+        return router_v2.scenario_block_v3(
+            _headline, _body, primary, company_type=addendum_type)
+    # Legacy path — byte-identical to the pre-router composition.
+    key = detect_scenario(_headline, _body)
+    block = rubric_for(_headline, _body)
+    if key:
+        block += lender_addendum(key, _body)
+    return key, block
+
+
 def _format_memory_block(mem: Optional[dict]) -> str:
     """Render the KB memory JSON as a compact prompt block (self-contained — no
     kb/sqlalchemy import, since this runs in the analysis image). '' when empty."""
@@ -131,11 +185,13 @@ def build_impact_prompt(
     company_contexts: dict,
     company_memories: Optional[dict] = None,
     market_sector_backdrop: str = "",
+    route_decisions: Optional[Dict[str, "router_v2.RouteDecision"]] = None,
 ) -> str:
     """Build the impact scoring prompt with market/sector backdrop + company
-    context + recent-event memory."""
+    context + recent-event memory (+ router-v2 factual context when routed)."""
 
     company_memories = company_memories or {}
+    route_decisions = route_decisions or {}
     context_sections = []
     for symbol in symbols:
         ctx = company_contexts.get(symbol)
@@ -156,6 +212,22 @@ Revenue Segments: {json.dumps(ctx.get('business', {}).get('revenue_segments', []
         else:
             context_sections.append(f"\nCompany: {symbol} (no profile available)")
 
+        # Router-v2 Tier-A factual context (always on): SEBI quantitative
+        # materiality thresholds + company-type/market-state line, and the
+        # holdco NAV/dividend-timing fact (the MAHSCOOTER fix). These are
+        # FACTS about the company, not rubric overrides — strictly additive.
+        dec = route_decisions.get(symbol)
+        if dec is not None:
+            fins = (ctx or {}).get("financials", {})
+            sebi_line = router_v2.sebi_context_line(
+                symbol, fins, dec.company_type, dec.type_overlays,
+                dec.market_state)
+            if sebi_line:
+                context_sections.append(sebi_line)
+            hint = router_v2.holdco_hint(dec.company_type)
+            if hint:
+                context_sections.append(hint)
+
         # Recent-event memory gives the assessor the "is this NEW, a continuation,
         # or already-priced/covered?" judgment. Purely additive — omitted if empty.
         if mem_block:
@@ -173,11 +245,10 @@ Revenue Segments: {json.dumps(ctx.get('business', {}).get('revenue_segments', []
     # fund raises, rating actions), plus the lender sector addendum when the
     # results body carries a bank/NBFC statement signature. '' otherwise —
     # see scenario_rubrics.py for the SWSOLAR postmortem that motivated this.
-    _body = news_item.full_body or news_item.body or ""
-    _scenario_key = detect_scenario(news_item.headline or "", _body)
-    scenario_block = rubric_for(news_item.headline or "", _body)
-    if _scenario_key:
-        scenario_block += lender_addendum(_scenario_key, _body)
+    # With ROUTER_V2_RUBRICS=1 (Tier B, default off) selection is taxonomy-v3
+    # driven — see _scenario_for.
+    _scenario_key, scenario_block = _scenario_for(
+        news_item, symbols, route_decisions)
 
     return f"""You are a senior equity analyst on the research desk of an Indian PMS/AIF fund. Your impact assessments feed the fund's position decisions: overstating noise wastes risk budget, missing a material event loses alpha. Both errors cost the fund — be exact, quantified, and skeptical.
 
@@ -255,13 +326,13 @@ async def score_impacts(
     llm_logger = get_llm_logger()
 
     # Fetch company contexts in parallel (up to 5 companies)
-    symbols_to_score = symbols[:5]
+    candidate_symbols = symbols[:5]
 
     contexts = {}
     memories = {}
     backdrop = ""
     if KNOWLEDGE_BASE_URL:
-        context_tasks = [fetch_company_context(sym) for sym in symbols_to_score]
+        context_tasks = [fetch_company_context(sym) for sym in candidate_symbols]
         if MEMORY_CONTEXT_ENABLED:
             # One combined, relevance-ranked fetch: company memories (replacing the
             # recency-only per-symbol path) + market/sector backdrop. Fail-soft.
@@ -270,27 +341,70 @@ async def score_impacts(
                 asyncio.gather(*context_tasks, return_exceptions=True),
                 memory_client.fetch_memory_context(
                     headline=news_item.headline, macro_theme=macro_theme,
-                    sectors=affected_sectors, symbols=symbols_to_score),
+                    sectors=affected_sectors, symbols=candidate_symbols),
             )
             if mem_context:
                 backdrop = memory_client.market_and_sector_backdrop(mem_context)
                 comp_mem = mem_context.get("companies") or {}
-                for sym in symbols_to_score:
+                for sym in candidate_symbols:
                     if isinstance(comp_mem.get(sym), dict):
                         memories[sym] = comp_mem[sym]
         else:
             # Legacy path: per-symbol recency-only company memory.
-            memory_tasks = [fetch_company_memory(sym) for sym in symbols_to_score]
+            memory_tasks = [fetch_company_memory(sym) for sym in candidate_symbols]
             context_results, memory_results = await asyncio.gather(
                 asyncio.gather(*context_tasks, return_exceptions=True),
                 asyncio.gather(*memory_tasks, return_exceptions=True),
             )
-            for sym, mem in zip(symbols_to_score, memory_results):
+            for sym, mem in zip(candidate_symbols, memory_results):
                 if isinstance(mem, dict):
                     memories[sym] = mem
-        for sym, ctx in zip(symbols_to_score, context_results):
+        for sym, ctx in zip(candidate_symbols, context_results):
             if isinstance(ctx, dict):
                 contexts[sym] = ctx
+
+    # ── Router v2 (Tier A, always on): three-axis routing + suppression ────
+    # EVENT (taxonomy v3 + Para-A) × COMPANY-TYPE × MARKET-STATE per symbol,
+    # from the KB payload's classification/market_state (fail-soft: absent
+    # axes route with no suppression). See analysis/router_v2.py.
+    _route_body = news_item.full_body or news_item.body or ""
+    _ts = news_item.timestamp_utc
+    if _ts is not None and _ts.tzinfo is None:
+        from datetime import timezone as _tz
+        _ts = _ts.replace(tzinfo=_tz.utc)
+    filing_ts_ist = _ts.astimezone(IST) if _ts is not None else None
+    route_decisions: Dict[str, router_v2.RouteDecision] = {}
+    for sym in candidate_symbols:
+        ctx = contexts.get(sym) or {}
+        route_decisions[sym] = router_v2.route(
+            news_item.headline or "", _route_body,
+            ctx.get("classification"), ctx.get("market_state"), filing_ts_ist)
+
+    symbols_to_score = []
+    for sym in candidate_symbols:
+        dec = route_decisions[sym]
+        if dec.suppress:
+            logger.info(
+                f"[router_v2] suppressed {sym} ({dec.suppress_reason}) for "
+                f"news {news_item.id}: not routed to impact scoring")
+        else:
+            symbols_to_score.append(sym)
+
+    _scenario_key_meta, _ = _scenario_for(
+        news_item, symbols_to_score, route_decisions)
+    router_meta = router_v2.build_router_meta(
+        route_decisions, symbols_to_score, rubric_scenario=_scenario_key_meta)
+    stash_router_meta(news_item.id, router_meta)
+    logger.info(
+        f"[router_v2] news={news_item.id} bucket={router_meta['event_bucket']}"
+        f" flags={router_meta['bucket_flags']} para_a={router_meta['para_a']}"
+        f" leaf={router_meta['leaf']} suppressed={router_meta['suppressed']}"
+        f" scored={symbols_to_score}")
+
+    if not symbols_to_score:
+        # Everything suppressed (fund schemes / unknown+suspended): the item
+        # is not analyzable as an equity event — no LLM call, empty impacts.
+        return [], DEFAULT_SCOPE
 
     if provider_for_model(LLM_MODEL) == "anthropic" and not ANTHROPIC_API_KEY:
         # latency tracking skipped on degraded path
@@ -310,7 +424,8 @@ async def score_impacts(
         ], DEFAULT_SCOPE
 
     prompt = build_impact_prompt(news_item, symbols_to_score, contexts, memories,
-                                 market_sector_backdrop=backdrop)
+                                 market_sector_backdrop=backdrop,
+                                 route_decisions=route_decisions)
 
     llm_start = time.time()
     try:
@@ -416,14 +531,39 @@ async def score_impacts(
             if canonical in seen_symbols:
                 continue
             seen_symbols.add(canonical)
+
+            # Para-A magnitude FLOOR (router v2, Tier A): SEBI LODR Reg 30
+            # Schedule III Para A deems these leaves material — the model may
+            # not dismiss them below magnitude 3. Deterministic, code-level,
+            # audit-stamped (gate_flags 'para_a_floor' in router_meta + an
+            # explanation note, same convention as priced_in). Sentiment is
+            # NEVER floored — regulation fixes materiality, not direction.
+            magnitude = item["magnitude"]
+            explanation = item["explanation"]
+            dec = route_decisions.get(canonical)
+            if dec is not None and isinstance(magnitude, (int, float)):
+                new_mag, floored = router_v2.apply_para_a_floor(
+                    int(magnitude), dec.para_a)
+                if floored:
+                    logger.info(
+                        f"[router_v2] para_a_floor: {canonical} magnitude "
+                        f"{magnitude}->{new_mag} (leaf={dec.para_a_leaf}, "
+                        f"news={news_item.id})")
+                    router_v2.record_para_a_floor(router_meta, canonical)
+                    explanation = (
+                        f"{explanation} [para_a_floor: SEBI Reg-30 Para-A "
+                        f"leaf '{dec.para_a_leaf}' — deemed material, "
+                        f"magnitude raised to {new_mag}]").strip()
+                    magnitude = new_mag
+
             impacts.append(CompanyImpact(
                 symbol=canonical,
                 company_name=item["company_name"],
                 sentiment=item["sentiment"],
-                magnitude=item["magnitude"],
+                magnitude=magnitude,
                 time_horizon=item["time_horizon"],
                 affected_line_items=item.get("affected_line_items", []),
-                explanation=item["explanation"],
+                explanation=explanation,
                 hop_distance=0,
                 decay_factor=1.0,
             ))

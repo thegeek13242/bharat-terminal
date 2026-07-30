@@ -144,6 +144,11 @@ class ImpactReport(BaseModel):
     # classification; gates stage-4 propagation): company_specific |
     # supply_chain | sector_wide | macro. None on pre-scope reports.
     event_scope: Optional[str] = None
+    # Router-v2 provenance (analysis/router_v2.py): event bucket, Para-A
+    # leaf/floor, company-type/overlays, market-state flags, suppressions.
+    # Additive + optional: None on pre-router reports and for consumers that
+    # never pass it. Populated from stage-3's routed decisions.
+    router_meta: Optional[dict] = None
     processing_latency_ms: float
     created_at: datetime
 

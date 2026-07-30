@@ -246,9 +246,21 @@ f. FUNDING: deposit growth materially lagging advances growth (or rising
    cost of funds for NBFCs) is a constraint worth one sentence."""
 
 
-def lender_addendum(scenario_key: str, body: str) -> str:
-    """Lender sector addendum, '' unless a results scenario with lender body."""
-    if scenario_key != "financial_results" or not is_lender_results(body):
+def lender_addendum(scenario_key: str, body: str,
+                    company_type: Optional[str] = None) -> str:
+    """Lender sector addendum, '' unless a results scenario on a lender.
+
+    Routing PREFERS the derived classification axis (companies.company_type
+    in bank/nbfc_lender — migration 033, router v2) and falls back to the
+    filing body's own statement signature. The preference is monotone-
+    additive: classification can only ADD the addendum for a lender whose
+    body text is atypical, never remove it for a body that carries lender
+    signals — so legacy 2-arg callers (company_type=None) behave exactly as
+    before this parameter existed.
+    """
+    if scenario_key != "financial_results":
+        return ""
+    if company_type not in ("bank", "nbfc_lender") and not is_lender_results(body):
         return ""
     return (
         "\nSECTOR ADDENDUM — LENDER RESULTS (overrides the industrial results "
@@ -256,13 +268,57 @@ def lender_addendum(scenario_key: str, body: str) -> str:
     )
 
 
-def rubric_for(headline: str, body: str = "") -> str:
-    """Full prompt block for a detected scenario, or '' when none applies."""
-    key = detect_scenario(headline, body)
-    if not key:
+# ── Company-type addendum: investment holding companies (router v2, Tier B) ──
+# The MAHSCOOTER founding exhibit: a holdco's standalone P&L is dividend-
+# receipt timing (29→271→6→6 Cr quarterly lumping), so "revenue −81%" is not
+# an operating collapse. The Tier-A factual hint (router_v2.HOLDCO_HINT)
+# always ships; this RUBRIC (judgment rules) is selected only on the
+# ROUTER_V2_RUBRICS path, gated exactly like the taxonomy-v3 selection.
+
+_HOLDCO_RESULTS_ADDENDUM = """\
+a. VALUE DRIVER: an investment holding company's market value derives from
+   the NAV of its group holdings, not from its own P&L. Judge this filing
+   against the NAV lens: did anything change about the underlying holdings,
+   their stakes, or discounts/haircuts to NAV?
+b. DIVIDEND-TIMING RULE: standalone revenue/PAT here is dominated by WHEN
+   group companies pay dividends and by fair-value marks. A revenue or
+   profit swing (however large) that traces to dividend-receipt timing or
+   fair-value movement is NOT an operating change: sentiment neutral and
+   magnitude capped at 2 for such swings.
+c. NAME THE HOLDINGS: if the filing discloses the underlying group holdings
+   (or the dividends' sources), name them in the explanation — the reader
+   values the holdings, not this P&L.
+d. Only a change in the holdings themselves (stake sale/purchase, holding-
+   company-level leverage, restructuring of the structure) can justify
+   magnitude >= 3."""
+
+
+def holdco_results_addendum(scenario_key: str,
+                            company_type: Optional[str]) -> str:
+    """Holdco results addendum, '' unless results scenario on a holdco."""
+    if scenario_key != "financial_results" or company_type != "holdco":
+        return ""
+    return (
+        "\nCOMPANY-TYPE ADDENDUM — INVESTMENT HOLDING COMPANY RESULTS "
+        "(overrides the industrial results mapping where they conflict):\n"
+        + _HOLDCO_RESULTS_ADDENDUM + "\n"
+    )
+
+
+def rubric_block(key: Optional[str]) -> str:
+    """Formatted rubric block for a known scenario key ('' otherwise).
+    Extracted from rubric_for so router v2 (Tier B) can select a rubric by
+    taxonomy-v3 bucket; output is byte-identical to the historic inline
+    formatting."""
+    if not key or key not in _RUBRICS:
         return ""
     return (
         f"\nSCENARIO RUBRIC — {key.upper().replace('_', ' ')} (this filing type has a "
         f"known failure mode; where these rules conflict with the general "
         f"discipline above, THESE RULES WIN):\n{_RUBRICS[key]}\n"
     )
+
+
+def rubric_for(headline: str, body: str = "") -> str:
+    """Full prompt block for a detected scenario, or '' when none applies."""
+    return rubric_block(detect_scenario(headline, body))

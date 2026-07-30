@@ -15,7 +15,8 @@ from langgraph.graph import StateGraph, END
 from bharat_terminal.types import NewsItem, ImpactReport, CompanyImpact, TradeSignal
 from bharat_terminal.analysis.stages.stage1_relevance import classify_relevance
 from bharat_terminal.analysis.stages.stage2_extraction import extract_entities
-from bharat_terminal.analysis.stages.stage3_impact import score_impacts
+from bharat_terminal.analysis.stages.stage3_impact import (consume_router_meta,
+                                                           score_impacts)
 from bharat_terminal.analysis.stages.stage4_propagation import propagate_impacts
 from bharat_terminal.analysis.stages.stage5_signals import generate_signals
 from bharat_terminal.analysis.priced_in import apply_priced_in
@@ -189,6 +190,10 @@ async def finalize_node(state: PipelineState) -> PipelineState:
         company_impacts=state.get("all_impacts", []),
         trade_signals=state.get("trade_signals", []),
         event_scope=state.get("event_scope"),
+        # Router-v2 provenance stashed by stage-3 (bucket, Para-A leaf/floor,
+        # company type, market-state flags, suppressions) — audit trail for
+        # every classification decision.
+        router_meta=consume_router_meta(news_item.id),
         processing_latency_ms=elapsed_ms,
         created_at=datetime.now(timezone.utc),
     )
