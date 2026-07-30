@@ -5,7 +5,9 @@ agent tools and the standalone MCP server, so any agent grounds on the same
 numbers before reaching for web search.
 """
 from bharat_terminal.grounding.queries import (
+    get_company_classification,
     get_financials,
+    get_market_state,
     get_nbfc_metrics,
     get_price_returns,
     get_shareholding,
@@ -16,7 +18,9 @@ from bharat_terminal.grounding.queries import (
 )
 
 __all__ = [
+    "get_company_classification",
     "get_financials",
+    "get_market_state",
     "get_nbfc_metrics",
     "get_price_returns",
     "get_shareholding",

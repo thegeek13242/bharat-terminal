@@ -7,7 +7,7 @@ from typing import Optional, List
 
 from sqlalchemy import (
     String, Integer, BigInteger, Float, Numeric, Boolean, DateTime, Date, Text,
-    ForeignKey, UniqueConstraint, Index,
+    ForeignKey, UniqueConstraint, Index, text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, ARRAY
 from sqlalchemy.orm import DeclarativeBase, relationship, Mapped, mapped_column
@@ -39,6 +39,27 @@ class Company(Base):
     bse_scrip_code: Mapped[Optional[str]] = mapped_column(String(10), nullable=True, index=True)
     mcap_cr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # Market cap in Crores
     listing_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+
+    # Company-type axis (migration 033, Analyst Clone item #0). PRIMARY
+    # accounting-regime axis — what the P&L means: fund_scheme / bank /
+    # insurer_life / insurer_general / holdco / amc / broker_wealth /
+    # nbfc_lender / operating / unknown. NULL = never classified, which stays
+    # distinguishable from a low-confidence 'operating'. Derived weekly by
+    # kb/sync/company_type_sync.py from measured detectors — never hand-set.
+    company_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, index=True)
+    # Non-exclusive modifiers: psu, distress_attached, suspended,
+    # circuit_prone, loss_making, loss_making_growth, recently_listed,
+    # cic_declared (JSONB array of strings).
+    type_overlays: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    type_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    type_detected_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Universe hygiene: mutual-fund scheme listings that must never route to
+    # analysis as equities (243 known offenders in the active universe).
+    is_fund_scheme: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
 
     # Business description
     description_200w: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -130,6 +151,16 @@ class Company(Base):
                 "bse_group": self.bse_group,
                 "mcap_cr": self.mcap_cr,
                 "listing_date": self.listing_date.isoformat() if self.listing_date else None,
+            },
+            # Company-type axis (migration 033). Additive keys only — every
+            # existing consumer of this dict keeps working; all values are
+            # NULL/[] until the first company_type_sync run.
+            "classification": {
+                "company_type": self.company_type,
+                "type_overlays": list(self.type_overlays or []),
+                "type_confidence": self.type_confidence,
+                "type_detected_at": self.type_detected_at.isoformat() if self.type_detected_at else None,
+                "is_fund_scheme": bool(self.is_fund_scheme),
             },
             "business": {
                 "description_200w": self.description_200w,

@@ -12,6 +12,7 @@ Connection follows the same async-SQLAlchemy-per-call pattern as
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -24,7 +25,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from bharat_terminal.kb.models import (
-    CorporateAction, FinancialResult, NseFiling, PricePoint, ShareholdingPattern,
+    Company, CorporateAction, FinancialResult, NseFiling, PricePoint,
+    ShareholdingPattern,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,6 +71,182 @@ async def _session() -> AsyncIterator[AsyncSession]:
         yield session  # read-only: no commit needed
 
 
+# ── Company classification + market state (migration 033) ──────────────────
+#
+# The company-type axis (what the P&L means) and the exchange-surveillance
+# state axis gate how every other number in this module should be read: a
+# holdco's "revenue -81%" is dividend timing, and a GSM-IV name cannot show a
+# normal price reaction by exchange design. Surfaced here — inside the same
+# grounding layer agents already call — so no consumer needs a new tool.
+
+
+def _classification_hints(
+    company_type: Optional[str],
+    overlays: Sequence[str],
+    is_fund_scheme: bool,
+    market_state: Optional[Dict[str, Any]],
+) -> List[str]:
+    """Factual one-line reading aids, built in code (never by an LLM), emitted
+    only when notable. RA compliance: each line states an accounting regime or
+    an exchange rule — descriptive only, no recommendation/advice wording."""
+    hints: List[str] = []
+    if is_fund_scheme:
+        hints.append(
+            "FUND SCHEME LISTING: this symbol is a mutual-fund scheme, not an "
+            "operating company; equity P&L analysis does not apply"
+        )
+    if company_type == "holdco":
+        hints.append(
+            "HOLDING COMPANY: value is NAV of group stakes; own P&L is "
+            "dividend timing — revenue swings reflect dividend receipt dates, "
+            "not operations"
+        )
+    elif company_type == "bank":
+        hints.append(
+            "BANK: revenue_cr is interest earned; the operating lines (net "
+            "interest income, provisions) are in sector_financials — generic "
+            "cost columns do not apply"
+        )
+    elif company_type in ("insurer_life", "insurer_general"):
+        hints.append(
+            "INSURER: revenue_cr is premium income; claims/commission lines "
+            "are in sector_financials — generic cost columns do not apply"
+        )
+    if "cic_declared" in overlays and company_type != "holdco":
+        hints.append(
+            "SELF-DECLARED CORE INVESTMENT COMPANY: consolidated results mix "
+            "subsidiaries; standalone income is group dividends"
+        )
+    if "suspended" in overlays:
+        hints.append(
+            "SUSPENDED/UNTRADED: no exchange price for 30+ days — no price "
+            "reaction is observable for events on this name"
+        )
+    if "circuit_prone" in overlays:
+        hints.append(
+            "CIRCUIT-PRONE ILLIQUID: price band-locked (high==low) on a large "
+            "share of recent days — daily moves are truncated by exchange bands"
+        )
+    ms = market_state or {}
+    gsm = ms.get("gsm_stage")
+    if gsm in ("III", "IV", "V", "VI"):
+        hints.append(
+            f"GSM stage {gsm}: price reaction suppressed by exchange rules "
+            "(stage III trades once a week; stage IV bars upward moves)"
+        )
+    if ms.get("esm_stage") == "II":
+        hints.append(
+            "ESM stage II: settles by periodic call auction — continuous "
+            "price discovery is suspended"
+        )
+    if ms.get("asm_stage"):
+        hints.append(
+            f"ASM {ms['asm_stage']}: additional surveillance measures "
+            "(higher margins / restricted bands) damp normal price reaction"
+        )
+    band = ms.get("price_band")
+    if band in ("2", "5"):
+        hints.append(
+            f"PRICE BAND {band}%: single-day price movement is capped at "
+            f"{band}% by exchange rules"
+        )
+    return hints
+
+
+async def get_market_state(symbol: str) -> Optional[Dict[str, Any]]:
+    """Latest surveillance/band row for `symbol` from `market_state`
+    (daily NSE ASM/GSM/ESM lists + sec_list price bands; migration 033,
+    populated by kb/sync/market_state_sync.py).
+
+    Returns None when the symbol appears on no list (= clean) — which is
+    indistinguishable from "the sync has never run"; check `as_of` freshness
+    on non-None results before trusting a stage. Raises if the table does not
+    exist yet (pre-migration); callers that must survive that wrap us
+    (see _safe_company_classification).
+    """
+    from sqlalchemy import text as sql_text
+
+    symbol = (symbol or "").upper().strip()
+    async with _session() as s:
+        row = (await s.execute(sql_text(
+            "SELECT as_of, asm_stage, gsm_stage, esm_stage, price_band "
+            "FROM market_state WHERE symbol = :sym "
+            "ORDER BY as_of DESC LIMIT 1"
+        ), {"sym": symbol})).first()
+    if row is None:
+        return None
+    return {
+        "as_of": row.as_of.isoformat() if row.as_of else None,
+        "asm_stage": row.asm_stage,
+        "gsm_stage": row.gsm_stage,
+        "esm_stage": row.esm_stage,
+        "price_band": row.price_band,
+    }
+
+
+async def get_company_classification(symbol: str) -> Dict[str, Any]:
+    """Company-type axis + latest market state + code-built interpretation
+    hints for `symbol`. All values NULL/[]/None until migration 033 has been
+    applied AND the first company_type_sync / market_state_sync runs — the
+    shape is stable either way, so consumers never need existence checks.
+    """
+    symbol = (symbol or "").upper().strip()
+    async with _session() as s:
+        row = (await s.execute(
+            select(
+                Company.company_type, Company.type_overlays,
+                Company.type_confidence, Company.type_detected_at,
+                Company.is_fund_scheme,
+            ).where(Company.symbol == symbol)
+        )).first()
+
+    market_state = await get_market_state(symbol)
+
+    if row is None:
+        return {
+            "symbol": symbol,
+            "company_type": None,
+            "type_overlays": [],
+            "type_confidence": None,
+            "type_detected_at": None,
+            "is_fund_scheme": False,
+            "market_state": market_state,
+            "interpretation_hints": _classification_hints(
+                None, [], False, market_state),
+        }
+
+    overlays = row.type_overlays or []
+    if isinstance(overlays, str):  # defensive: raw-SQL writers store via CAST
+        overlays = json.loads(overlays)
+    is_fund = bool(row.is_fund_scheme)
+    return {
+        "symbol": symbol,
+        "company_type": row.company_type,
+        "type_overlays": list(overlays),
+        "type_confidence": row.type_confidence,
+        "type_detected_at": (
+            row.type_detected_at.isoformat() if row.type_detected_at else None),
+        "is_fund_scheme": is_fund,
+        "market_state": market_state,
+        "interpretation_hints": _classification_hints(
+            row.company_type, overlays, is_fund, market_state),
+    }
+
+
+async def _safe_company_classification(symbol: str) -> Optional[Dict[str, Any]]:
+    """get_company_classification that NEVER breaks its caller: pre-migration
+    DBs (missing columns/table) or transient errors return None with a loud
+    log line instead of failing the core financials payload."""
+    try:
+        return await get_company_classification(symbol)
+    except Exception as e:
+        logger.warning(
+            f"company_classification enrich failed for {symbol} "
+            f"(fail-open, migration 033 applied?): {e}"
+        )
+        return None
+
+
 # ── Financials ────────────────────────────────────────────────────────────
 
 async def get_financials(
@@ -106,7 +284,14 @@ async def get_financials(
         all_rows = (await s.execute(_base())).all()
 
     if not all_rows:
-        return {"error": f"No financial_results rows for {symbol}"}
+        # Classification matters MOST here: fund-scheme listings and suspended
+        # shells are precisely the symbols with no financial_results — the
+        # classification explains the absence instead of leaving a bare error.
+        err: Dict[str, Any] = {"error": f"No financial_results rows for {symbol}"}
+        cls = await _safe_company_classification(symbol)
+        if cls is not None:
+            err["company_classification"] = cls
+        return err
 
     # Per quarter (period_end), keep the preferred reporting basis: when
     # `consolidated` is set, a row matching that basis replaces a non-matching one
@@ -164,12 +349,20 @@ async def get_financials(
     all_cons = all(p["consolidated"] for p in out)
     any_cons = any(p["consolidated"] for p in out)
     basis = "consolidated" if all_cons else ("standalone" if not any_cons else "mixed")
+
+    # Company-type + market-state axes (migration 033): the accounting regime
+    # and any exchange surveillance state, with code-built interpretation
+    # hints — so every agent reading financials sees them without a second
+    # tool. Fail-open (None) pre-migration; null-fielded pre-first-sync.
+    classification = await _safe_company_classification(symbol)
+
     return {
         "symbol": symbol,
         "currency": "INR_crore",
         "basis": basis,
         "source": "NSE_DB",  # authoritative; cite our DB, never re-fetch externally
         "count": len(out),
+        "company_classification": classification,
         "periods": out,
     }
 

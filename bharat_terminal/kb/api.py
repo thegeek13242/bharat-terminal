@@ -22,7 +22,7 @@ from bharat_terminal.kb.company_memory import build_company_memory
 from bharat_terminal.kb.memory.sector import build_sector_memory
 from bharat_terminal.kb.memory.market import build_market_memory
 from bharat_terminal.kb.memory import core as memory_core
-from bharat_terminal.grounding.queries import get_price_returns
+from bharat_terminal.grounding.queries import get_market_state, get_price_returns
 from bharat_terminal.kb.live_price import get_current_ltps
 
 logger = logging.getLogger(__name__)
@@ -174,6 +174,19 @@ async def get_company(symbol: str):
             raise HTTPException(status_code=404, detail=f"Company {symbol} not found")
 
         data = company.to_dict()
+        resolved_symbol = company.symbol  # may differ from path (name fallback)
+
+    # Latest exchange surveillance/band state (migration 033). Additive and
+    # fail-open: a missing market_state table (pre-migration) or a transient
+    # error must not take down the profile — the key is then null, the same
+    # shape as "symbol on no surveillance list". Note the 6h profile cache:
+    # market_state inside a cached profile can lag the daily sync by up to
+    # CACHE_TTL; the embedded as_of keeps that staleness visible.
+    try:
+        data["market_state"] = await get_market_state(resolved_symbol)
+    except Exception as e:
+        logger.warning(f"market_state fetch failed for {resolved_symbol} (fail-open): {e}")
+        data["market_state"] = None
 
     # Cache the result
     if redis_client:
