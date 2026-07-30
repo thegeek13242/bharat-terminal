@@ -18,6 +18,8 @@ import logging
 import os
 import signal
 import time
+from datetime import datetime, time as dtime
+from zoneinfo import ZoneInfo
 
 from aiokafka import AIOKafkaConsumer
 
@@ -231,7 +233,22 @@ async def main():
                 todo = set(symbols) | set(pending)
                 if not todo:
                     continue
-                ltps = await marks.get_ltps(todo)
+                quotes = await marks.get_quotes(todo)
+                ltps = {s: q["ltp"] for s, q in quotes.items()}
+                # Queued (overnight) signals fill at the day's OPEN — the
+                # pre-open auction equilibrium price, straight from Angel One
+                # (founder 2026-07-30: a real next-open order executes in the
+                # 09:07 auction, not at whatever LTP prints minutes later).
+                # After 09:45 IST the auction price is stale — live LTP wins.
+                fill_prices = dict(ltps)
+                fill_sources: dict[str, str] = {}
+                now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+                if pending and now_ist.time() < dtime(9, 45):
+                    for s in pending:
+                        q = quotes.get(s)
+                        if q and q.get("open"):
+                            fill_prices[s] = q["open"]
+                            fill_sources[s] = "auction_open_angelone"
                 # Fail LOUD when the whole book gets zero quotes (2026-07-29:
                 # Angel One's expired REST JWT silently returned empty quotes
                 # and the at-open fills sat pending for 10 minutes with only
@@ -252,7 +269,8 @@ async def main():
                             logger.error(f"[LTP-DRY] alert failed: {e}")
                 else:
                     ltp_dry_cycles = 0
-                filled = (await engine.fill_pending(ltps)) if pending else 0
+                filled = (await engine.fill_pending(
+                    fill_prices, price_sources=fill_sources)) if pending else 0
                 marked = await engine.mark_open_positions(ltps)
                 closed = await engine.run_exits(ltps)
                 log = logger.info if (filled or closed) else logger.debug

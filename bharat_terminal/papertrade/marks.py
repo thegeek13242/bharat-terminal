@@ -87,13 +87,14 @@ async def close() -> None:
 
 # ── Live LTPs ────────────────────────────────────────────────────────────────
 
-async def get_ltps(symbols) -> dict[str, float]:
-    """Batch live LTPs via kb-service. Returns {symbol: ltp}; symbols with no
-    live quote are simply ABSENT (no EOD fallback here — a stale close is a
-    wrong fill price, and wrong-but-confident is this project's failure mode).
-    """
+async def get_quotes(symbols) -> dict[str, dict]:
+    """Batch quotes via kb-service (Angel One underneath — the ONLY price
+    source per founder policy 2026-07-30). Returns {symbol: {ltp, open,
+    prev_close}}; symbols with no live quote are ABSENT (no EOD fallback —
+    a stale close is a wrong fill price). `open` is today's opening price,
+    i.e. the pre-open auction equilibrium once the session is live."""
     syms = sorted({s.strip().upper() for s in symbols if s and s.strip()})
-    out: dict[str, float] = {}
+    out: dict[str, dict] = {}
     if not syms:
         return out
     client = _get_client()
@@ -105,12 +106,21 @@ async def get_ltps(symbols) -> dict[str, float]:
             resp.raise_for_status()
             quotes = resp.json().get("quotes", {})
             for sym, q in quotes.items():
-                ltp = q.get("ltp")
-                if ltp:
-                    out[sym.upper()] = float(ltp)
+                if q.get("ltp"):
+                    out[sym.upper()] = {
+                        "ltp": float(q["ltp"]),
+                        "open": float(q["open"]) if q.get("open") else None,
+                        "prev_close": (float(q["prev_close"])
+                                       if q.get("prev_close") else None),
+                    }
         except Exception as e:
             logger.warning(f"[LTP] batch fetch failed for {chunk}: {e}")
     return out
+
+
+async def get_ltps(symbols) -> dict[str, float]:
+    """LTP-only view of get_quotes (most callers: marks, exits, hedge)."""
+    return {s: q["ltp"] for s, q in (await get_quotes(symbols)).items()}
 
 
 # ── F&O universe ─────────────────────────────────────────────────────────────

@@ -86,7 +86,8 @@ async def get_ltp_batch(symbols: str):
                 "asof": datetime.utcnow().isoformat()}
     live = await get_current_ltps(syms, redis_client)
     return {
-        "quotes": {s: {"ltp": i["ltp"], "prev_close": i.get("prev_close")}
+        "quotes": {s: {"ltp": i["ltp"], "prev_close": i.get("prev_close"),
+                       "open": i.get("open")}
                    for s, i in live.items() if i.get("ltp")},
         "source": "angelone_live",
         "asof": datetime.utcnow().isoformat(),

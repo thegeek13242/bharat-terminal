@@ -310,10 +310,13 @@ class PaperEngine:
         rows = await self._pool.fetch(_PENDING_ROWS_SQL)
         return {r["symbol"] for r in rows}
 
-    async def fill_pending(self, ltps: dict[str, float]) -> int:
-        """Fill PENDING rows at the first live LTP (adverse slippage, same
-        math as immediate fills). No LTP → stays PENDING and retries next
-        cycle; a made-up fill price would corrupt the pilot."""
+    async def fill_pending(self, ltps: dict[str, float],
+                           price_sources: dict[str, str] | None = None) -> int:
+        """Fill PENDING rows at the supplied fill prices (morning cycles pass
+        the day's OPEN — the pre-open auction equilibrium, via Angel One —
+        for queued signals; otherwise live LTP). Adverse slippage, same math
+        as immediate fills. No price → stays PENDING and retries next cycle;
+        a made-up fill price would corrupt the pilot."""
         filled = 0
         for r in await self._pool.fetch(_PENDING_ROWS_SQL):
             ltp = ltps.get(r["symbol"])
@@ -324,7 +327,9 @@ class PaperEngine:
                      else ltp * (1 + slip))
             qty = math.floor(PAPER_NOTIONAL_PER_TRADE / entry)
             fill_prov = {"fill_ltp_raw": ltp, "slippage_bps": PAPER_SLIPPAGE_BPS,
-                         "filled_from_pending": True}
+                         "filled_from_pending": True,
+                         "fill_price_source": (price_sources or {}).get(
+                             r["symbol"], "live_ltp")}
             if qty < 1:
                 await self._pool.execute(
                     _PENDING_REJECT_SQL, r["id"], "zero_qty",

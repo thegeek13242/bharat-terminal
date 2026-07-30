@@ -152,9 +152,11 @@ async def get_current_ltps(symbols: List[str], redis_client) -> Dict[str, Dict[s
             sym = token_to_symbol.get((exch, tok))
             ltp = row.get("ltp")
             prev_close = row.get("close")  # Angel One OHLC 'close' = previous close
+            day_open = row.get("open")     # today's open = pre-open auction price
             if sym and ltp is not None:
                 out[sym] = {"ltp": float(ltp),
-                            "prev_close": float(prev_close) if prev_close is not None else None}
+                            "prev_close": float(prev_close) if prev_close is not None else None,
+                            "open": float(day_open) if day_open else None}
     except Exception as e:
         logger.warning(f"[live_price] parse failed (fail-open): {e}")
         return {}
