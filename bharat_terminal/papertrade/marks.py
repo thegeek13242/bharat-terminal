@@ -43,6 +43,7 @@ SCRIP_MASTER_TIMEOUT_TOTAL_S = float(os.getenv("SCRIP_MASTER_TIMEOUT_S", "600"))
 SCRIP_MASTER_TIMEOUT_READ_S = 60
 
 FNO_REDIS_KEY = "papertrade:fno_universe"
+FNO_LOTS_REDIS_KEY = "papertrade:fno_lots"
 FNO_REDIS_TTL_S = 24 * 3600
 # In-process memo so per-event evaluations don't hit Redis every time.
 _FNO_MEMO_TTL_S = 6 * 3600
@@ -50,6 +51,7 @@ _FNO_MEMO_TTL_S = 6 * 3600
 _client: httpx.AsyncClient | None = None
 _redis = None
 _fno_memo: tuple[float, set[str]] | None = None
+_lots_memo: tuple[float, dict[str, int]] | None = None
 
 
 def _get_client() -> httpx.AsyncClient:
@@ -113,9 +115,11 @@ async def get_ltps(symbols) -> dict[str, float]:
 
 # ── F&O universe ─────────────────────────────────────────────────────────────
 
-async def _fetch_fno_from_scrip_master() -> set[str]:
+async def _fetch_fno_from_scrip_master() -> tuple[set[str], dict[str, int]]:
     """Download the Angel One scrip master and extract NFO single-stock-future
-    underlyings. `name` on an NFO FUTSTK row is the NSE underlying symbol."""
+    underlyings + their LOT SIZES. `name` on an NFO FUTSTK row is the NSE
+    underlying symbol; `lotsize` is the exchange contract lot (futures trade
+    in lot multiples ONLY — founder requirement 2026-07-30)."""
     import aiohttp
     timeout = aiohttp.ClientTimeout(
         total=SCRIP_MASTER_TIMEOUT_TOTAL_S, sock_read=SCRIP_MASTER_TIMEOUT_READ_S)
@@ -126,15 +130,24 @@ async def _fetch_fno_from_scrip_master() -> set[str]:
     rows = json.loads(raw)
     if not isinstance(rows, list):
         raise RuntimeError(f"scrip master returned non-list: {type(rows).__name__}")
-    names = {
-        str(r["name"]).upper() for r in rows
-        if r.get("exch_seg") == "NFO"
-        and r.get("instrumenttype") == "FUTSTK"
-        and r.get("name")
-    }
+    names: set[str] = set()
+    lots: dict[str, int] = {}
+    for r in rows:
+        if (r.get("exch_seg") != "NFO"
+                or r.get("instrumenttype") != "FUTSTK" or not r.get("name")):
+            continue
+        nm = str(r["name"]).upper()
+        names.add(nm)
+        if nm not in lots:
+            try:
+                ls = int(float(r.get("lotsize") or 0))
+            except (TypeError, ValueError):
+                ls = 0
+            if ls > 0:
+                lots[nm] = ls
     if not names:
         raise RuntimeError("scrip master parsed but yielded 0 NFO FUTSTK names")
-    return names
+    return names, lots
 
 
 async def _redis_cached_fno() -> set[str] | None:
@@ -163,11 +176,16 @@ async def get_fno_universe() -> set[str]:
         logger.info(f"[FNO] universe from redis cache: {len(universe)} symbols")
     else:
         try:
-            universe = await _fetch_fno_from_scrip_master()
-            logger.info(f"[FNO] universe from scrip master: {len(universe)} symbols")
+            universe, lots = await _fetch_fno_from_scrip_master()
+            logger.info(f"[FNO] universe from scrip master: {len(universe)} "
+                        f"symbols ({len(lots)} lot sizes)")
+            global _lots_memo
+            _lots_memo = (time.monotonic(), lots)
             try:
                 await _get_redis().setex(
                     FNO_REDIS_KEY, FNO_REDIS_TTL_S, json.dumps(sorted(universe)))
+                await _get_redis().setex(
+                    FNO_LOTS_REDIS_KEY, FNO_REDIS_TTL_S, json.dumps(lots))
             except Exception as e:
                 logger.warning(f"[FNO] redis cache write failed: {e}")
         except Exception as e:
@@ -181,3 +199,37 @@ async def get_fno_universe() -> set[str]:
 
     _fno_memo = (now, universe)
     return universe
+
+
+async def get_fno_lots() -> dict[str, int]:
+    """Underlying symbol -> futures LOT SIZE (exchange contract quantum;
+    trades are valid only in lot multiples). Resolution mirrors
+    get_fno_universe: memo -> redis -> fresh fetch (which also populates the
+    universe caches). Empty dict on total failure — callers must then
+    REJECT the FUT trade rather than invent a quantity."""
+    global _lots_memo
+    now = time.monotonic()
+    if _lots_memo is not None and (now - _lots_memo[0]) < _FNO_MEMO_TTL_S:
+        return _lots_memo[1]
+    try:
+        cached = await _get_redis().get(FNO_LOTS_REDIS_KEY)
+        if cached:
+            lots = {k: int(v) for k, v in json.loads(cached).items()}
+            _lots_memo = (now, lots)
+            return lots
+    except Exception as e:
+        logger.warning(f"[FNO] lots redis read failed: {e}")
+    try:
+        universe, lots = await _fetch_fno_from_scrip_master()
+        _lots_memo = (now, lots)
+        try:
+            await _get_redis().setex(
+                FNO_REDIS_KEY, FNO_REDIS_TTL_S, json.dumps(sorted(universe)))
+            await _get_redis().setex(
+                FNO_LOTS_REDIS_KEY, FNO_REDIS_TTL_S, json.dumps(lots))
+        except Exception as e:
+            logger.warning(f"[FNO] lots cache write failed: {e}")
+        return lots
+    except Exception as e:
+        logger.warning(f"[FNO] lots fetch failed: {e}")
+        return {}

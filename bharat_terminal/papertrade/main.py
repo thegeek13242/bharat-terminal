@@ -70,6 +70,13 @@ PAPER_HEDGE_ENABLED = os.getenv("PAPER_PEAD_HEDGE", "1") == "1"
 PAPER_HEDGE_BAND = float(os.getenv("PAPER_HEDGE_BAND", "100000"))
 HEDGE_SYMBOL = os.getenv("PAPER_HEDGE_SYMBOL", "NIFTYBEES")
 HEDGE_INTERVAL_S = int(os.getenv("PAPER_HEDGE_INTERVAL_S", "300"))
+# Futures lot quantification (founder requirement 2026-07-30): a real NIFTY
+# futures hedge trades in whole lots (~lot 75 x ~25,300 = ~19L contract
+# value). The hedge notional is quantized to multiples of this value —
+# nearest lot; a book below half a lot stays UNHEDGED (logged). Update the
+# env as NIFTY drifts; false precision here would be worse than the
+# documented approximation.
+PAPER_HEDGE_LOT_VALUE = float(os.getenv("PAPER_HEDGE_LOT_VALUE", "1900000"))
 
 _PEAD_SCAN_SQL = """
 SELECT es.id, es.symbol, es.sue_composite, es.announced_at, es.period_end
@@ -344,15 +351,23 @@ async def main():
                 pead = await engine.strategy_notional("pead_long")
                 hedge = await engine.strategy_notional("pead_hedge")
                 delta = pead - hedge
-                if abs(delta) <= PAPER_HEDGE_BAND and not (
-                        pead == 0 and hedge > 0):
+                half_lot = PAPER_HEDGE_LOT_VALUE / 2
+                tol = max(PAPER_HEDGE_BAND, half_lot)
+                if abs(delta) <= tol and not (pead == 0 and hedge > 0):
+                    if delta > PAPER_HEDGE_BAND:
+                        logger.info(
+                            f"[HEDGE] book ₹{delta:.0f} under-hedged but "
+                            f"below half a lot (₹{half_lot:.0f}) — staying")
                     continue
                 ltps = await marks.get_ltps({HEDGE_SYMBOL})
                 ltp = ltps.get(HEDGE_SYMBOL)
                 if not ltp or ltp <= 0:
                     logger.warning(f"[HEDGE] no LTP for {HEDGE_SYMBOL}")
                     continue
-                if delta > PAPER_HEDGE_BAND:
+                if delta > tol:
+                    # Quantize to whole NIFTY-futures lots (nearest).
+                    n_lots = max(1, int(delta / PAPER_HEDGE_LOT_VALUE + 0.5))
+                    lot_notional = n_lots * PAPER_HEDGE_LOT_VALUE
                     intent = SignalIntent(
                         "pead_hedge", HEDGE_SYMBOL, "SHORT", "FUT",
                         f"HEDGE_{int(time.time())}", None,
@@ -360,18 +375,22 @@ async def main():
                             "trigger": "hedge_rebalance",
                             "pead_notional": round(pead),
                             "hedge_notional_before": round(hedge),
-                            "note": "represents a NIFTY futures hedge; "
-                                    "paper-modeled via NIFTYBEES prices",
+                            "hedge_lots": n_lots,
+                            "lot_value": PAPER_HEDGE_LOT_VALUE,
+                            "note": "represents a NIFTY futures hedge in "
+                                    "whole lots; paper-modeled via "
+                                    "NIFTYBEES prices",
                             "gate_flags": {"hedge": True},
                         })
-                    await engine.open_position(intent, ltp, notional=delta)
-                    logger.info(f"[HEDGE] extended short by ₹{delta:.0f} "
-                                f"(pead ₹{pead:.0f})")
+                    await engine.open_position(intent, ltp,
+                                               notional=lot_notional)
+                    logger.info(f"[HEDGE] extended short by {n_lots} lot(s) "
+                                f"≈ ₹{lot_notional:.0f} (pead ₹{pead:.0f})")
                 else:
                     # over-hedged (or book empty): close newest rows first
                     excess = hedge - pead
                     for row in reversed(await engine.open_rows("pead_hedge")):
-                        if excess <= PAPER_HEDGE_BAND and pead > 0:
+                        if excess <= tol and pead > 0:
                             break
                         await engine.close_position(row, ltp, "hedge_rebal")
                         excess -= abs(row["qty"]) * float(row["entry_price"])

@@ -239,7 +239,24 @@ class PaperEngine:
 
         slip = PAPER_SLIPPAGE_BPS / 1e4
         entry = ltp * (1 - slip) if intent.side == "SHORT" else ltp * (1 + slip)
-        qty = math.floor((notional or PAPER_NOTIONAL_PER_TRADE) / entry)
+        want = (notional or PAPER_NOTIONAL_PER_TRADE) / entry
+        # Futures trade in exchange LOT MULTIPLES only (founder requirement
+        # 2026-07-30). Minimum one lot — real contract values (5-15L) exceed
+        # the per-trade notional, exactly as they do for a real small book.
+        # pead_hedge quantizes by lot VALUE in the hedge loop instead.
+        if intent.instrument == "FUT" and intent.strategy != "pead_hedge":
+            lot = await self._fut_lot_size(intent.symbol)
+            if not lot:
+                logger.info(f"[REJECT] {intent.strategy} {intent.side} "
+                            f"{intent.symbol}: no_lot_size")
+                return await self._insert_rejected(intent, "no_lot_size", prov)
+            n_lots = max(1, math.floor(want / lot))
+            qty = n_lots * lot
+            prov["lot_size"] = lot
+            prov["n_lots"] = n_lots
+            prov["contract_value"] = round(qty * entry)
+        else:
+            qty = math.floor(want)
         if qty < 1:
             # Price above the whole per-trade notional (rare: MRF-class stock).
             logger.info(f"[REJECT] {intent.strategy} {intent.side} "
@@ -335,6 +352,20 @@ class PaperEngine:
                 logger.info(f"[REJECT] #{r['id']} {r['symbol']}: gross_cap "
                             f"at pending fill")
                 continue
+            if r["instrument"] == "FUT" and r["strategy"] != "pead_hedge":
+                lot = await self._fut_lot_size(r["symbol"])
+                if not lot:
+                    await self._pool.execute(
+                        _PENDING_REJECT_SQL, r["id"], "no_lot_size",
+                        json.dumps(fill_prov, default=str))
+                    logger.info(f"[REJECT] #{r['id']} {r['symbol']}: "
+                                f"no_lot_size at pending fill")
+                    continue
+                n_lots = max(1, math.floor(qty / lot))
+                qty = n_lots * lot
+                fill_prov["lot_size"] = lot
+                fill_prov["n_lots"] = n_lots
+                fill_prov["contract_value"] = round(qty * entry)
             vol60 = await self._fetch_vol60(r["symbol"])
             await self._pool.execute(
                 _FILL_SQL, r["id"], qty, entry,
@@ -358,6 +389,17 @@ class PaperEngine:
             return None
         gap_pct = 100.0 * (ltp / float(prev) - 1)
         return round(gap_pct, 2) if gap_pct > PAPER_PEAD_MAX_GAP_PCT else None
+
+    async def _fut_lot_size(self, symbol: str) -> int | None:
+        """Exchange lot size for a stock future; None = unknown (caller must
+        reject — inventing a quantity would fabricate an untradeable fill)."""
+        try:
+            from bharat_terminal.papertrade import marks
+            lots = await marks.get_fno_lots()
+            return lots.get(symbol.upper())
+        except Exception as e:
+            logger.warning(f"lot lookup failed for {symbol}: {e}")
+            return None
 
     async def _fetch_vol60(self, symbol: str) -> float | None:
         """Trailing-60-session daily vol for stop scaling; None if thin."""
