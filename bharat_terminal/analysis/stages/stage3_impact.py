@@ -34,6 +34,12 @@ MEMORY_CONTEXT_ENABLED = os.getenv("ANALYSIS_MEMORY_CONTEXT_ENABLED", "1") == "1
 # filing/article (filings carry full attachment text), not a clipped first page.
 # Bounded only by the PDF extraction cap (FILING_PDF_TEXT_MAX_CHARS).
 IMPACT_BODY_CHARS = int(os.getenv("IMPACT_BODY_CHARS", "120000"))
+# C1b — include same-symbol filings from the previous 2h as prompt context
+# (results cluster: table → press release → presentation; 42% of same-cluster
+# impact pairs materially disagree when scored blind to each other). DEFAULT
+# OFF: this changes classifier input and must pass replay validation first
+# (the Tier-B lesson) — flag-off is byte-identical to today's prompt.
+STAGE3_SIBLING_CONTEXT = os.getenv("STAGE3_SIBLING_CONTEXT", "0") == "1"
 
 IMPACT_TOOL = {
     "name": "score_company_impacts",
@@ -111,6 +117,34 @@ async def fetch_company_context(symbol: str) -> Optional[dict]:
     return None
 
 
+async def fetch_sibling_section(news_item: NewsItem, symbol: str) -> str:
+    """C1b sibling-context block ('' when disabled/none/error — identity)."""
+    if not STAGE3_SIBLING_CONTEXT or not news_item.timestamp_utc:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(
+                f"{KNOWLEDGE_BASE_URL}/company/{symbol}/filings/siblings",
+                params={"before_ts": news_item.timestamp_utc.isoformat(),
+                        "exclude_id": news_item.id})
+            if resp.status_code != 200:
+                return ""
+            sibs = resp.json().get("siblings") or []
+    except Exception as e:
+        logger.debug(f"sibling fetch failed for {symbol}: {e}")
+        return ""
+    if not sibs:
+        return ""
+    blocks = "\n".join(
+        f"== {s['headline']} ({s['timestamp_utc']}) ==\n{s['body']}"
+        for s in sibs)
+    return (
+        "EARLIER SAME-DAY FILINGS BY THE COMPANY (same event cluster — a "
+        "results table, press release and presentation describe ONE event; "
+        "read them together with THIS filing, do not double-count):\n"
+        f"{blocks}\n\n")
+
+
 # ── Router-v2 provenance registry ───────────────────────────────────────────
 # score_impacts stashes the per-item router meta here; the report assembler
 # collects it via consume_router_meta(news_id) into ImpactReport.router_meta.
@@ -186,6 +220,7 @@ def build_impact_prompt(
     company_memories: Optional[dict] = None,
     market_sector_backdrop: str = "",
     route_decisions: Optional[Dict[str, "router_v2.RouteDecision"]] = None,
+    sibling_section: str = "",
 ) -> str:
     """Build the impact scoring prompt with market/sector backdrop + company
     context + recent-event memory (+ router-v2 factual context when routed)."""
@@ -257,7 +292,7 @@ Headline: {news_item.headline}
 Body: {(news_item.full_body or news_item.body or '')[:IMPACT_BODY_CHARS]}
 Source: {news_item.source}
 
-{backdrop_section}COMPANY PROFILES:
+{sibling_section}{backdrop_section}COMPANY PROFILES:
 {company_ctx_text}
 
 ASSESSMENT DISCIPLINE:
@@ -423,9 +458,19 @@ async def score_impacts(
             for sym in symbols_to_score
         ], DEFAULT_SCOPE
 
+    # C1b sibling context — single-symbol filings only (exchange adapters stamp
+    # one symbol per filing; multi-symbol items skip to avoid ambiguity).
+    # fetch_sibling_section returns '' unless STAGE3_SIBLING_CONTEXT=1.
+    sibling_section = ""
+    if len(symbols_to_score) == 1 and news_item.source in (
+            "NSE_FILINGS", "BSE_FILINGS"):
+        sibling_section = await fetch_sibling_section(
+            news_item, symbols_to_score[0])
+
     prompt = build_impact_prompt(news_item, symbols_to_score, contexts, memories,
                                  market_sector_backdrop=backdrop,
-                                 route_decisions=route_decisions)
+                                 route_decisions=route_decisions,
+                                 sibling_section=sibling_section)
 
     llm_start = time.time()
     try:
@@ -587,4 +632,12 @@ async def score_impacts(
         )
         llm_logger.log(record)
         logger.error(f"Stage 3 error: {e}")
+        # C1a (2026-07-31): a swallowed stage-3 failure used to persist as a
+        # relevant=true report with EMPTY impacts, indistinguishable from a
+        # genuine no-impact judgment — the item permanently lost its
+        # assessment (DYCL 20-Jul press release; 245 reports/30d ≈ 2.2%).
+        # Mark the failure in router_meta so main.py can requeue one retry
+        # and downstream consumers can tell failure from judgment.
+        stash_router_meta(news_item.id,
+                          {**router_meta, "stage3_error": str(e)[:300]})
         return [], DEFAULT_SCOPE

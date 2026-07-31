@@ -36,6 +36,16 @@ logger = logging.getLogger(__name__)
 # background, and max_poll_interval_ms=900s far exceeds the item timeout).
 RT_CONCURRENCY = int(os.getenv("RT_CONCURRENCY", "3"))
 
+# C1a — one delayed retry for items whose stage-3 LLM call failed (marker:
+# router_meta.stage3_error, set by stage3_impact's exception handler). The
+# failed report still publishes (empty impacts), then the item re-runs once
+# after the delay: Vertex 429 storms clear in minutes and MALFORMED_FUNCTION_
+# CALL flakes rarely repeat. In-process only — a restart during the delay
+# loses the retry, which beats today's 100% permanent loss (2.2% of relevant
+# reports, incl. results-day commentary press releases).
+STAGE3_RETRY = os.getenv("STAGE3_RETRY", "1") == "1"
+STAGE3_RETRY_DELAY_S = float(os.getenv("STAGE3_RETRY_DELAY_S", "240"))
+
 
 async def main():
     consumer  = NewsKafkaConsumer()
@@ -95,6 +105,15 @@ async def main():
     # ── per-item real-time processing ─────────────────────────────────────────
     _rt_sem = asyncio.Semaphore(RT_CONCURRENCY)
     _rt_tasks: set[asyncio.Task] = set()
+    _stage3_retried: set[str] = set()
+
+    async def _retry_stage3_later(news_item: NewsItem):
+        await asyncio.sleep(STAGE3_RETRY_DELAY_S)
+        logger.info(f"[RT] Stage-3 retry starting: {news_item.id}")
+        await _rt_sem.acquire()
+        task = asyncio.create_task(_spawn_rt(news_item))
+        _rt_tasks.add(task)
+        task.add_done_callback(_rt_tasks.discard)
 
     async def _process_rt(news_item: NewsItem):
         """Full per-item pipeline run. Safe to run concurrently: cost is
@@ -116,6 +135,17 @@ async def main():
                 f"signals={len(report.trade_signals)}, "
                 f"latency={report.processing_latency_ms:.0f}ms"
             )
+            err = (report.router_meta or {}).get("stage3_error")
+            if STAGE3_RETRY and err and news_item.id not in _stage3_retried:
+                if len(_stage3_retried) > 4096:   # bound; re-retry of ancient
+                    _stage3_retried.clear()       # ids is harmless
+                _stage3_retried.add(news_item.id)
+                logger.warning(
+                    f"[RT] stage3_error on {news_item.id} — one retry in "
+                    f"{STAGE3_RETRY_DELAY_S:.0f}s: {err[:120]}")
+                rt = asyncio.create_task(_retry_stage3_later(news_item))
+                _rt_tasks.add(rt)
+                rt.add_done_callback(_rt_tasks.discard)
         except asyncio.TimeoutError:
             get_monitor().record_breach(
                 "ITEM_TIMEOUT",

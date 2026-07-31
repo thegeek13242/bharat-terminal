@@ -214,6 +214,40 @@ async def get_company(symbol: str):
     return data
 
 
+@app.get("/company/{symbol}/filings/siblings")
+async def get_filing_siblings(symbol: str, before_ts: str,
+                              exclude_id: str = "", hours: float = 2.0,
+                              max_chars: int = 20000):
+    """C1b — same-symbol exchange filings in the window before a trigger
+    filing (the results cluster: table → press release → presentation).
+    Consumed by analysis stage-3 for sibling context (STAGE3_SIBLING_CONTEXT)
+    and by research replay. No cache: the window is a point-in-time query."""
+    symbol = symbol.upper().strip()
+    hours = max(0.1, min(hours, 24.0))
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(
+            text("""
+                SELECT id, headline,
+                       left(coalesce(body, ''), :max_chars) AS body,
+                       timestamp_utc
+                FROM news_items
+                WHERE source IN ('NSE_FILINGS', 'BSE_FILINGS')
+                  AND symbols_mentioned ? :symbol
+                  AND timestamp_utc >= CAST(:before_ts AS timestamptz)
+                                       - make_interval(secs => :window_s)
+                  AND timestamp_utc <= CAST(:before_ts AS timestamptz)
+                  AND id <> :exclude_id
+                  AND char_length(coalesce(body, '')) > 500
+                ORDER BY timestamp_utc DESC
+                LIMIT 4
+            """),
+            {"symbol": symbol, "before_ts": before_ts,
+             "window_s": hours * 3600.0, "exclude_id": exclude_id,
+             "max_chars": max(1000, min(max_chars, 60000))},
+        )).mappings().all()
+    return {"symbol": symbol, "siblings": [dict(r) for r in rows]}
+
+
 @app.get("/company/{symbol}/memory")
 async def get_company_memory(symbol: str):
     """Bounded, recency-decayed event memory for a company (derived from

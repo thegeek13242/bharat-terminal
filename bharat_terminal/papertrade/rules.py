@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
+from bharat_terminal.papertrade import commentary as c0
 from bharat_terminal.types import CompanyImpact, ImpactReport
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,15 @@ ENABLE_ORDERWIN_LONG = os.getenv("PAPER_ENABLE_ORDERWIN_LONG", "1") == "1"
 # in aggregate sit AT/BELOW market drift (-1 to -4.5pp per band). The branch
 # exists so flipping the env var is the whole experiment.
 ENABLE_TAILWIND_LONG = os.getenv("PAPER_ENABLE_TAILWIND_LONG", "0") == "1"
+# C0 commentary veto (MANAGEMENT_COMMENTARY_2026-07-31.md). Modes:
+#   off     — never extract
+#   shadow  — extract + record would-veto in provenance; do NOT block trades
+#   enforce — vetoed intents become auditable REJECTED rows
+# DEFAULT OFF: the presence-based rules FAILED the pre-registered replay
+# validation on 2026-07-31 (ratio 0.95 vs bar 3.0 — see the doc §6). Turn on
+# shadow only as deliberate instrumentation for a NEW, pre-registered rule
+# iteration; enforce requires that iteration to pass on fresh data.
+PAPER_C0_MODE = os.getenv("PAPER_C0_MODE", "off").lower()
 
 # SUE-percentile gate for pead_long: threshold = P90 of trailing-90d
 # sue_composite, recomputed at most once an hour (it moves slowly).
@@ -263,7 +273,57 @@ class RulesEngine:
             intents += await self._tailwind_long(
                 report, ci, etype, fresh, base_prov, base_flags)
 
+        await self._c0_commentary(report, etype, intents)
         return intents
+
+    # ── C0 commentary veto ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _results_genre(report: ImpactReport, etype: str) -> bool:
+        """Results-cluster keying: headline taxonomy OR the router's body-aware
+        read (catches results hidden in press-release/presentation wrappers,
+        e.g. the HYUNDAI trigger). router_meta may be absent on skip reports."""
+        if etype == "results":
+            return True
+        rm = report.router_meta or {}
+        return (rm.get("event_bucket") == "results"
+                or "results_content_sniff" in (rm.get("bucket_flags") or [])
+                or rm.get("rubric_scenario") == "financial_results")
+
+    async def _c0_commentary(self, report: ImpactReport, etype: str,
+                             intents: list[SignalIntent]) -> None:
+        """Extract commentary once per report and veto/annotate the results-
+        genre directional intents. Fail-open by construction: extraction
+        failure stamps provenance and touches nothing else."""
+        if PAPER_C0_MODE not in ("shadow", "enforce"):
+            return
+        live = [i for i in intents
+                if i.rejected_reason is None
+                and i.strategy in ("headwind_short", "tailwind_long")]
+        if not live or not self._results_genre(report, etype):
+            return
+
+        ni = report.news_item
+        extraction = None
+        try:
+            siblings = await c0.fetch_siblings(
+                self._pool, live[0].symbol, ni.timestamp_utc, report.news_id)
+            extraction = await c0.extract(
+                live[0].symbol, ni.headline or "", ni.body or "", siblings)
+        except Exception as e:                       # belt over module's braces
+            logger.warning(f"[C0] unexpected failure: {e}")
+
+        for intent in live:
+            veto, rule = c0.veto_decision(extraction, intent.side)
+            intent.provenance["c0"] = c0.provenance_fields(
+                extraction, veto, rule, PAPER_C0_MODE)
+            if veto and PAPER_C0_MODE == "enforce":
+                intent.rejected_reason = "commentary_veto"
+                logger.info(f"[REJECT] {intent.strategy} {intent.symbol}: "
+                            f"commentary_veto ({rule})")
+            elif veto:
+                logger.info(f"[C0-SHADOW] would veto {intent.strategy} "
+                            f"{intent.symbol}: {rule}")
 
     # ── strategies ───────────────────────────────────────────────────────────
 
