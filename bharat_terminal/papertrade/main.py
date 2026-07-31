@@ -46,6 +46,20 @@ CONSUMER_GROUP = "papertrade"
 # unless a fill/close happened.
 MTM_INTERVAL_S = int(os.getenv("PAPER_MTM_INTERVAL_S", "5"))
 SNAPSHOT_INTERVAL_S = 300
+
+# Continuous trading starts 09:15 IST. is_market_hours() opens at 09:00 —
+# but 09:00-09:15 is the pre-open auction: quotes are stale/indicative and
+# the day's `open` doesn't exist yet. Filling/marking there produced the
+# 2026-07-31 phantoms (REFEX filled at yesterday's LTP and "stopped" 60ms
+# later on the real −6.7% open; HYUNDAI/BESTAGRO stopped on indicative
+# prices). NOTHING trades or marks before this floor.
+_SESSION_FLOOR_IST = dtime(9, 15)
+
+
+def _session_live() -> bool:
+    return (is_market_hours()
+            and datetime.now(ZoneInfo("Asia/Kolkata")).time()
+            >= _SESSION_FLOOR_IST)
 # Absorption-curve marks: LTP at decision (t0) then +5/15/30/60 min for
 # every DURING-SESSION hop-0 filing impact, traded or not. Measures how
 # much of the reaction our ~90s latency can actually reach, per cell.
@@ -222,7 +236,7 @@ async def main():
         ltp_dry_cycles = 0
         while not shutdown_event.is_set():
             await asyncio.sleep(MTM_INTERVAL_S)
-            if not is_market_hours():
+            if not _session_live():
                 continue
             try:
                 symbols = await engine.open_symbols()
@@ -282,7 +296,7 @@ async def main():
     async def snapshot_loop():
         while not shutdown_event.is_set():
             await asyncio.sleep(SNAPSHOT_INTERVAL_S)
-            if not is_market_hours():
+            if not _session_live():
                 continue
             try:
                 await engine.snapshot_equity()
@@ -300,7 +314,7 @@ async def main():
             if not due:
                 continue
             _mark_queue[:] = [m for m in _mark_queue if m[0] > now]
-            if not is_market_hours():
+            if not _session_live():
                 continue    # due after the close: no valid live price; the
                             # session close is recoverable from OHLC anyway
             try:
