@@ -123,6 +123,29 @@ async def get_ltps(symbols) -> dict[str, float]:
     return {s: q["ltp"] for s, q in (await get_quotes(symbols)).items()}
 
 
+async def get_full_quotes(symbols) -> dict[str, dict]:
+    """FULL-mode quotes (adds tot_buy_qty / tot_sell_qty / best bid+ask) via
+    kb-service — the pre-open demand probe's data source (Angel One only,
+    per standing price-data policy)."""
+    syms = sorted({s.strip().upper() for s in symbols if s and s.strip()})
+    out: dict[str, dict] = {}
+    if not syms:
+        return out
+    client = _get_client()
+    for i in range(0, len(syms), _LTP_BATCH):
+        chunk = syms[i:i + _LTP_BATCH]
+        try:
+            resp = await client.get(
+                f"{KB_SERVICE_URL}/quotes/full",
+                params={"symbols": ",".join(chunk)})
+            resp.raise_for_status()
+            out.update({s.upper(): q for s, q in
+                        (resp.json().get("quotes") or {}).items()})
+        except Exception as e:
+            logger.warning(f"[FULL] batch fetch failed for {chunk}: {e}")
+    return out
+
+
 # ── F&O universe ─────────────────────────────────────────────────────────────
 
 async def _fetch_fno_from_scrip_master() -> tuple[set[str], dict[str, int]]:

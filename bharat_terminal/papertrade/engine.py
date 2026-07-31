@@ -310,6 +310,24 @@ class PaperEngine:
         rows = await self._pool.fetch(_PENDING_ROWS_SQL)
         return {r["symbol"] for r in rows}
 
+    async def pending_rows(self) -> list:
+        return await self._pool.fetch(_PENDING_ROWS_SQL)
+
+    async def annotate_pending(self, row_id: int, data: dict) -> None:
+        """Merge audit data into a PENDING row's provenance (pre-open probe)."""
+        await self._pool.execute(
+            "UPDATE paper_trades SET provenance = provenance || $2::jsonb "
+            "WHERE id = $1 AND status = 'PENDING'",
+            row_id, json.dumps(data, default=str))
+
+    async def veto_pending(self, row_id: int, reason: str,
+                           data: dict) -> None:
+        """Reject a queued signal on pre-open evidence — auditable, with the
+        probe snapshot preserved for counterfactual evaluation."""
+        await self._pool.execute(
+            _PENDING_REJECT_SQL, row_id, reason, json.dumps(data, default=str))
+        logger.info(f"[REJECT] #{row_id}: {reason}")
+
     async def fill_pending(self, ltps: dict[str, float],
                            price_sources: dict[str, str] | None = None) -> int:
         """Fill PENDING rows at the supplied fill prices (morning cycles pass

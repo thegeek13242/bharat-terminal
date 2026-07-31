@@ -144,6 +144,18 @@ pead_long + pead_hedge combined net expectancy; the unhedged leg remains
 separately observable. Events before this amendment (16 entries, incl.
 the 9 gap-wounded batch-1 fills) are reported both included and excluded.
 
+### Pre-registration amendment — pre-open demand confirmation (founder-directed 2026-07-31)
+From 2026-08-01: overnight signals are probed at ~09:06 IST against the
+forming pre-open book (Angel One FULL quotes: tot buy/sell qty + depth).
+LONG requires demand ≥ supply × PAPER_PREOPEN_MIN_RATIO (1.0); SHORT the
+inverse; missing data → proceed. Vetoed signals become preopen_veto
+REJECTED rows carrying the full book snapshot, so their counterfactual
+outcomes remain measurable — the confirmation gate itself is therefore
+evaluable (vetoed-vs-confirmed forward returns) and will be scored once
+n ≥ 50 vetoes. CAVEAT recorded: Angel One FULL-quote semantics during
+09:00-09:07 are unverified until the first live probe; the gate fails
+open to pre-existing behavior.
+
 ### Iterations
 
 - **2026-07-30 #6 (RB — Tier-B replay verdict: FAIL, rubrics stay OFF):**

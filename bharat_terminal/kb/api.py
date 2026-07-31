@@ -69,6 +69,21 @@ async def health():
     return {"status": "ok", "service": "kb-api", "timestamp": datetime.utcnow().isoformat()}
 
 
+@app.get("/quotes/full")
+async def get_full_quotes_batch(symbols: str):
+    """Batch FULL-mode quotes (ltp, open, prev_close, total buy/sell
+    quantities, best bid/ask) via the shared Angel One session. Built for
+    the papertrade pre-open demand probe; same licensing posture as /ltp
+    (internal-only consumers, never broadcast/stored beyond provenance)."""
+    from bharat_terminal.kb.live_price import get_full_quotes
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()][:16]
+    if not syms:
+        return {"quotes": {}}
+    quotes = await get_full_quotes(syms, redis_client)
+    return {"quotes": quotes, "source": "angelone_full",
+            "asof": datetime.utcnow().isoformat()}
+
+
 @app.get("/ltp")
 async def get_ltp_batch(symbols: str):
     """Batch live equity LTPs via the shared Angel One session — one upstream

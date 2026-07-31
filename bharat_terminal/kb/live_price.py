@@ -161,3 +161,74 @@ async def get_current_ltps(symbols: List[str], redis_client) -> Dict[str, Dict[s
         logger.warning(f"[live_price] parse failed (fail-open): {e}")
         return {}
     return out
+
+
+async def get_full_quotes(symbols: List[str], redis_client) -> Dict[str, Dict]:
+    """FULL-mode quotes: ltp + total buy/sell quantities + best-5 depth.
+
+    Built for the pre-open demand probe (papertrade, 09:05-09:07 IST): during
+    the auction collection window the exchange disseminates the forming order
+    book, and Angel One's FULL quote carries the aggregate totBuyQuan /
+    totSellQuan and depth for it. Also valid during continuous trading (then
+    it is simply the live book). Fail-open → {}.
+    """
+    if not symbols or redis_client is None:
+        return {}
+    try:
+        session_json = await redis_client.get(REDIS_SESSION_KEY)
+    except Exception:
+        session_json = None
+    if not session_json:
+        return {}
+
+    await _ensure_equity_tokens()
+    token_to_symbol: Dict[tuple, str] = {}
+    exchange_tokens: Dict[str, List[str]] = {}
+    for s in symbols:
+        sym = (s or "").upper()
+        tok = _equity_tokens.get(sym)
+        exch = "NSE"
+        if not tok:
+            tok = _bse_equity_tokens.get(sym)
+            exch = "BSE"
+        if tok:
+            exchange_tokens.setdefault(exch, []).append(tok)
+            token_to_symbol[(exch, tok)] = sym
+    if not exchange_tokens:
+        return {}
+    sc = _smartconnect_from_redis(session_json)
+    if sc is None:
+        return {}
+    try:
+        import asyncio
+        result = await asyncio.to_thread(sc.getMarketData, "FULL", exchange_tokens)
+    except Exception as e:
+        logger.warning(f"[live_price] FULL getMarketData failed (fail-open): {e}")
+        return {}
+
+    out: Dict[str, Dict] = {}
+    try:
+        fetched = ((result or {}).get("data") or {}).get("fetched") or []
+        for row in fetched:
+            sym = token_to_symbol.get(
+                (str(row.get("exchange") or "NSE"),
+                 str(row.get("symbolToken") or "")))
+            if not sym:
+                continue
+            depth = row.get("depth") or {}
+            out[sym] = {
+                "ltp": float(row["ltp"]) if row.get("ltp") else None,
+                "open": float(row["open"]) if row.get("open") else None,
+                "prev_close": (float(row["close"])
+                               if row.get("close") else None),
+                "tot_buy_qty": (float(row["totBuyQuan"])
+                                if row.get("totBuyQuan") is not None else None),
+                "tot_sell_qty": (float(row["totSellQuan"])
+                                 if row.get("totSellQuan") is not None else None),
+                "best_buy": (depth.get("buy") or [{}])[0],
+                "best_sell": (depth.get("sell") or [{}])[0],
+            }
+    except Exception as e:
+        logger.warning(f"[live_price] FULL parse failed (fail-open): {e}")
+        return {}
+    return out

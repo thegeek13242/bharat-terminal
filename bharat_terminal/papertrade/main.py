@@ -94,6 +94,19 @@ HEDGE_INTERVAL_S = int(os.getenv("PAPER_HEDGE_INTERVAL_S", "300"))
 # documented approximation.
 PAPER_HEDGE_LOT_VALUE = float(os.getenv("PAPER_HEDGE_LOT_VALUE", "1900000"))
 
+# Pre-open demand confirmation (founder 2026-07-31): the NSE pre-open
+# collects orders 09:00-~09:07; by ~09:06 the forming book shows real
+# demand/supply per symbol. Overnight signals get CONFIRMED (LONG: demand
+# >= supply x ratio; SHORT: inverse) or VETOED before the auction locks —
+# an auditable preopen_veto with the full book snapshot preserved so the
+# skipped signals' counterfactual outcomes stay measurable. Missing probe
+# data (SME/no-preopen names, feed failure) -> proceed (the pre-existing
+# validated behavior). Angel One FULL quotes only, per price-data policy.
+PAPER_PREOPEN_CONFIRM = os.getenv("PAPER_PREOPEN_CONFIRM", "1") == "1"
+PAPER_PREOPEN_MIN_RATIO = float(os.getenv("PAPER_PREOPEN_MIN_RATIO", "1.0"))
+_PREOPEN_PROBE_START = dtime(9, 5, 30)
+_PREOPEN_PROBE_END = dtime(9, 7, 0)
+
 _PEAD_SCAN_SQL = """
 SELECT es.id, es.symbol, es.sue_composite, es.announced_at, es.period_end
 FROM earnings_surprises es
@@ -431,17 +444,79 @@ async def main():
             except Exception as e:
                 logger.error(f"[HEDGE] cycle failed: {e}", exc_info=True)
 
+    async def preopen_confirm_loop():
+        """One shot per trading day inside 09:05:30-09:07:00 IST: probe the
+        pre-open book for every queued symbol and confirm or veto."""
+        last_run_day = None
+        while not shutdown_event.is_set():
+            await asyncio.sleep(10)
+            now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+            if (not PAPER_PREOPEN_CONFIRM or now_ist.weekday() >= 5
+                    or not (_PREOPEN_PROBE_START <= now_ist.time()
+                            <= _PREOPEN_PROBE_END)
+                    or last_run_day == now_ist.date()):
+                continue
+            last_run_day = now_ist.date()
+            try:
+                rows = await engine.pending_rows()
+                if not rows:
+                    continue
+                quotes = await marks.get_full_quotes(
+                    {r["symbol"] for r in rows})
+                for r in rows:
+                    q = quotes.get(r["symbol"])
+                    if (not q or q.get("tot_buy_qty") is None
+                            or q.get("tot_sell_qty") is None):
+                        await engine.annotate_pending(
+                            r["id"], {"preopen_probe": "missing"})
+                        logger.info(f"[PREOPEN] #{r['id']} {r['symbol']}: "
+                                    f"no book data — proceeding")
+                        continue
+                    buy, sell = q["tot_buy_qty"], q["tot_sell_qty"]
+                    ratio = (min(buy / sell, 999.0) if sell and sell > 0
+                             else (999.0 if buy else None))
+                    snap = {"preopen_probe": {
+                        "at": now_ist.isoformat(),
+                        "tot_buy_qty": buy, "tot_sell_qty": sell,
+                        "ratio": None if ratio is None else round(ratio, 3),
+                        "indicative": q.get("ltp"),
+                        "prev_close": q.get("prev_close"),
+                        "best_buy": q.get("best_buy"),
+                        "best_sell": q.get("best_sell"),
+                        "min_ratio": PAPER_PREOPEN_MIN_RATIO,
+                    }}
+                    confirmed = None
+                    if ratio is not None:
+                        confirmed = (ratio >= PAPER_PREOPEN_MIN_RATIO
+                                     if r["side"] == "LONG"
+                                     else ratio <= 1.0 / PAPER_PREOPEN_MIN_RATIO)
+                    if confirmed is False:
+                        await engine.veto_pending(r["id"], "preopen_veto", snap)
+                        logger.info(f"[PREOPEN] VETO #{r['id']} {r['side']} "
+                                    f"{r['symbol']} ratio={ratio:.2f}")
+                    else:
+                        snap["preopen_probe"]["confirmed"] = (
+                            bool(confirmed) if confirmed is not None
+                            else "indeterminate")
+                        await engine.annotate_pending(r["id"], snap)
+                        logger.info(f"[PREOPEN] CONFIRM #{r['id']} {r['side']} "
+                                    f"{r['symbol']} ratio="
+                                    f"{'n/a' if ratio is None else f'{ratio:.2f}'}")
+            except Exception as e:
+                logger.error(f"[PREOPEN] probe failed: {e}", exc_info=True)
+
     consumer_task = asyncio.create_task(consume_loop())
     mtm_task = asyncio.create_task(mtm_loop())
     snapshot_task = asyncio.create_task(snapshot_loop())
     marks_task = asyncio.create_task(marks_loop())
     pead_task = asyncio.create_task(pead_scan_loop())
     hedge_task = asyncio.create_task(hedge_loop())
+    preopen_task = asyncio.create_task(preopen_confirm_loop())
     shutdown_task = asyncio.create_task(shutdown_event.wait())
 
     done, pending = await asyncio.wait(
         [consumer_task, mtm_task, snapshot_task, marks_task, pead_task,
-         hedge_task, shutdown_task],
+         hedge_task, preopen_task, shutdown_task],
         return_when=asyncio.FIRST_COMPLETED,
     )
     for task in pending:
