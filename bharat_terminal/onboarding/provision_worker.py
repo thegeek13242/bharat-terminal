@@ -242,8 +242,11 @@ async def drain_once(dry_run: bool = False) -> int:
 
 
 async def run_loop(dry_run: bool = False) -> None:
+    from bharat_terminal.heartbeat import abeat
     logger.info("provision worker loop starting (interval=%.0fs)", POLL_INTERVAL_S)
     while True:
+        # Liveness beat for /admin/health; TTL scaled to the poll interval.
+        await abeat("onboarding", ttl=max(180, int(POLL_INTERVAL_S) * 2 + 60))
         try:
             await drain_once(dry_run=dry_run)
         except Exception as e:

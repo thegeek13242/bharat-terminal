@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 from aiokafka import AIOKafkaConsumer
 
 from bharat_terminal.analysis.market_hours import is_market_hours
+from bharat_terminal.heartbeat import abeat
 from bharat_terminal.papertrade import marks
 from bharat_terminal.papertrade.engine import PaperEngine
 from bharat_terminal.papertrade.rules import (ENABLE_PEAD_LONG, RulesEngine,
@@ -249,6 +250,9 @@ async def main():
         ltp_dry_cycles = 0
         while not shutdown_event.is_set():
             await asyncio.sleep(MTM_INTERVAL_S)
+            # Liveness beat for /admin/health — before the session gate, so
+            # the loop reads alive off-hours too.
+            await abeat("papertrade")
             if not _session_live():
                 continue
             try:

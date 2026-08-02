@@ -10,6 +10,7 @@ from bharat_terminal.analysis.pipeline import process_news_item
 from bharat_terminal.analysis.batch_processor import process_batch, BATCH_MAX_SIZE, BATCH_WINDOW_S
 from bharat_terminal.analysis.market_hours import is_market_hours
 from bharat_terminal.analysis.llm_logger import begin_task_cost, current_task_cost
+from bharat_terminal.heartbeat import abeat
 from bharat_terminal.analysis.guardrails import (
     get_monitor,
     ITEM_PROCESSING_TIMEOUT_S,
@@ -237,6 +238,9 @@ async def main():
         failure class that previously froze the feed unnoticed for hours."""
         while not shutdown_event.is_set():
             await asyncio.sleep(WATCHDOG_INTERVAL_S)
+            # Liveness beat for /admin/health (piggybacks the 60s watchdog
+            # tick — proves this process's event loop is alive).
+            await abeat("analysis")
             try:
                 lag = await consumer.lag()
                 idle_s = time.monotonic() - _state["last_publish"]

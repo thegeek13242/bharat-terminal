@@ -92,7 +92,8 @@ async def filing_summary_node(state: PipelineState) -> PipelineState:
     if ni.source not in FILING_SOURCES or ni.summary:
         return state
     task = asyncio.create_task(
-        summarize_filing(ni.headline, ni.full_body or ni.body, ni.source)
+        summarize_filing(ni.headline, ni.full_body or ni.body, ni.source,
+                         news_id=str(ni.id))
     )
     return {**state, "summary_task": task}
 

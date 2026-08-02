@@ -933,7 +933,11 @@ async def watch(interval_s: int) -> None:
     exchange filing; this loop makes the transcript + structure available
     end-to-end without manual runs."""
     logger.info(f"[transcripts] watch mode, every {interval_s}s")
+    from bharat_terminal.heartbeat import abeat
     while True:
+        # Liveness beat for /admin/health; TTL scaled to the poll interval so
+        # slow-poll configs don't read as stalled between healthy cycles.
+        await abeat("transcript-watcher", ttl=max(180, interval_s * 2 + 60))
         try:
             stats = await sync_transcripts()
             if stats.get("pending"):

@@ -495,6 +495,21 @@ services:
 
   # ── Observability ──────────────────────────────────────────────────────────
 
+  docker-proxy:
+    # Read-only Docker API for /admin/health (container status/uptime/restarts).
+    # CONTAINERS=1 permits GET /containers/* ONLY — every other endpoint
+    # (exec, images, POST anything) is default-deny in this proxy. Internal
+    # network only, NO published ports; the socket is never mounted into
+    # api-gateway itself.
+    image: tecnativa/docker-socket-proxy:0.2.0
+    container_name: bharat-docker-proxy
+    environment:
+      CONTAINERS: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+    logging: *default-logging
+
   prometheus:
     image: prom/prometheus:v2.51.2
     container_name: bharat-prometheus

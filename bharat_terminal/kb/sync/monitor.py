@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from bharat_terminal.heartbeat import heartbeat_loop as _hb_loop
 from bharat_terminal.kb.models import ResultEvent
 from bharat_terminal.kb.sync.event_calendar import (
     fetch_result_calendar,
@@ -571,6 +572,107 @@ class Monitor:
             if not await self._sleep_seconds(interval):
                 break
 
+    # ── Dossier auto-refresh ───────────────────────────────────────────────
+
+    async def refresh_stale_dossiers(self) -> dict:
+        """Regenerate dossiers whose financials have advanced past their vintage.
+
+        A dossier's `source_quarter` is the newest financial_results period it
+        was built on. When a company reports a new quarter (synced by
+        _sync_due_events above), its dossier silently goes stale — the project's
+        characteristic failure mode. This finds exactly those and refreshes them
+        incrementally. Idempotent: only genuinely-stale rows are selected, so a
+        quiet night is a no-op at zero cost. Capped per run (env
+        DOSSIER_REFRESH_MAX_PER_RUN, default 100) so a heavy results day cannot
+        drain LLM credits unattended; the remainder is picked up the next night.
+        """
+        from sqlalchemy import text
+
+        max_per_run = int(os.getenv("DOSSIER_REFRESH_MAX_PER_RUN", "100"))
+        concurrency = int(os.getenv("DOSSIER_REFRESH_CONCURRENCY", "4"))
+
+        SessionFactory = create_async_session()
+        async with SessionFactory() as session:
+            symbols = (await session.execute(text("""
+                SELECT d.symbol
+                FROM company_dossiers d
+                JOIN (SELECT symbol, max(period_end) AS mx
+                      FROM financial_results GROUP BY symbol) lf
+                  ON lf.symbol = d.symbol
+                WHERE lf.mx > d.source_quarter
+                ORDER BY lf.mx DESC
+                LIMIT :lim
+            """), {"lim": max_per_run})).scalars().all()
+
+        stats = {"stale": len(symbols), "refreshed": 0, "failed": 0}
+        if not symbols:
+            logger.info("[dossier_refresh] No dossiers stale vs financials")
+            return stats
+
+        logger.info(
+            f"[dossier_refresh] {len(symbols)} dossiers stale vs financials "
+            f"(cap {max_per_run}, concurrency {concurrency}) — refreshing"
+        )
+        from bharat_terminal.research import dossier_agent
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _one(sym: str) -> None:
+            async with sem:
+                try:
+                    res = await dossier_agent.research_company(
+                        sym, refresh_kind="incremental_quarter")
+                    stats["refreshed" if res else "failed"] += 1
+                except Exception as e:
+                    stats["failed"] += 1
+                    logger.error(f"[dossier_refresh] {sym} failed: {e}")
+
+        await asyncio.gather(*(_one(s) for s in symbols))
+        logger.info(f"[dossier_refresh] Done: {stats}")
+        return stats
+
+    # ── Admin-panel table retention ────────────────────────────────────────
+
+    async def retention_prune_loop(self):
+        """Daily 03:30 IST: bound the admin-panel activity/alert tables.
+        user_activity_events > 90d and alert_events > 365d are deleted
+        (migration 035; sampling already bounds ingest rate — this bounds
+        total size). Fail-open pre-migration: missing tables log and skip."""
+        from sqlalchemy import text as _text
+
+        while not self._shutdown.is_set():
+            target = self._next_occurrence(hour=3, minute=30)
+            logger.info(f"[retention_prune] Next run at {target.isoformat()}")
+            if not await self._sleep_until(target):
+                break
+            SessionFactory = create_async_session()
+            for table, keep_days in (("user_activity_events", 90),
+                                     ("alert_events", 365)):
+                try:
+                    async with SessionFactory() as session:
+                        res = await session.execute(_text(
+                            f"DELETE FROM {table} "
+                            f"WHERE ts < now() - interval '{keep_days} days'"))
+                        await session.commit()
+                    logger.info(f"[retention_prune] {table}: "
+                                f"{res.rowcount} rows pruned (> {keep_days}d)")
+                except Exception as e:
+                    logger.warning(f"[retention_prune] {table} skipped: {e}")
+
+    async def dossier_refresh_loop(self):
+        """Daily at 23:30 IST — after event_sync's 23:00 late-filing retry, so
+        the day's freshly-reported financials are already in the DB before we
+        check dossier staleness. Does NOT run on startup (avoids a mass refresh
+        on every container restart); the first pass fires at the next 23:30."""
+        while not self._shutdown.is_set():
+            target = self._next_occurrence(hour=23, minute=30)
+            logger.info(f"[dossier_refresh] Next run at {target.isoformat()}")
+            if not await self._sleep_until(target):
+                break
+            try:
+                await self.refresh_stale_dossiers()
+            except Exception as e:
+                logger.error(f"[dossier_refresh] loop error: {e}", exc_info=True)
+
     async def run(self):
         """Run all monitor tasks concurrently."""
         loop = asyncio.get_running_loop()
@@ -609,6 +711,12 @@ class Monitor:
             asyncio.create_task(self.weekly_bse_sweep(),       name="bse_weekly_sweep"),
             asyncio.create_task(self.daily_market_deals(),     name="market_deals"),
             asyncio.create_task(self.daily_results_sentiment_eval(), name="results_eval"),
+            asyncio.create_task(self.dossier_refresh_loop(),   name="dossier_refresh"),
+            asyncio.create_task(self.retention_prune_loop(),   name="retention_prune"),
+            # Liveness beat for /admin/health: every sync loop above sleeps
+            # for hours between scheduled runs, so a dedicated 60s beat is the
+            # only honest "this process is alive" signal.
+            asyncio.create_task(_hb_loop("kb-monitor"),        name="heartbeat"),
         ]
 
         await self._shutdown.wait()

@@ -2,7 +2,11 @@
 import uuid
 import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
-from bharat_terminal.api.auth import user_from_session_cookie, INTERNAL_RESEARCH_EMAILS
+from bharat_terminal.api.auth import (
+    user_from_session_cookie,
+    load_authz,
+    INTERNAL_RESEARCH_EMAILS,
+)
 from bharat_terminal.api import ltp_relay
 from bharat_terminal.api.ws_manager import manager
 
@@ -26,9 +30,19 @@ async def websocket_feed(websocket: WebSocket):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
+    # DB-backed role check (60s cache): revoked users are refused at connect;
+    # env allowlist kept as the pre-migration/bootstrap fallback.
+    authz = await load_authz(str(user.get("id")))
+    if authz.get("revoked"):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
     # Internal accounts may additionally stream live LTP (Angel One data is
     # personal-use licensed — never available to customer accounts).
-    is_internal = (user.get("email") or "").lower() in INTERNAL_RESEARCH_EMAILS
+    is_internal = (
+        authz.get("role") in ("admin", "internal")
+        or (user.get("email") or "").lower() in INTERNAL_RESEARCH_EMAILS
+    )
 
     client_id = str(uuid.uuid4())
     await manager.connect(websocket, client_id)

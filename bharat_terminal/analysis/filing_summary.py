@@ -132,9 +132,11 @@ ATTACHMENT TEXT:
 {body}"""
 
 
-async def summarize_filing(headline: str, body: Optional[str], source: str) -> Optional[str]:
+async def summarize_filing(headline: str, body: Optional[str], source: str,
+                           news_id: str = "") -> Optional[str]:
     """Summarize a filing attachment. Returns None on any doubt — callers must
-    treat None as 'no summary', never as an error."""
+    treat None as 'no summary', never as an error. news_id is cost-attribution
+    only (llm_call_log.context_id)."""
     if source not in FILING_SOURCES:
         return None
     text_body = (body or "").strip()[:SUMMARY_BODY_CHARS]
@@ -163,6 +165,7 @@ async def summarize_filing(headline: str, body: Optional[str], source: str) -> O
             latency_ms=(time.time() - t0) * 1000,
             cost_usd=compute_cost(SUMMARY_MODEL, response.usage.input_tokens, response.usage.output_tokens),
             success=True,
+            context_id=news_id,
         ))
 
         tool_result = None
@@ -209,6 +212,7 @@ async def summarize_filing(headline: str, body: Optional[str], source: str) -> O
             prompt_tokens=0, completion_tokens=0,
             latency_ms=(time.time() - t0) * 1000, cost_usd=0.0,
             success=False, error=str(e),
+            context_id=news_id,
         ))
         logger.error(f"[filing_summary] error (no summary emitted): {e}")
         return None

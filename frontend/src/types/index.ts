@@ -102,6 +102,10 @@ export interface AuthUser {
   picture?: string | null;
   /** Internal-research allowlist member — gates internal-only UI (research chat). */
   internal?: boolean;
+  /** DB-backed role (app_users.role). Server enforces; UI only shapes nav. */
+  role?: 'admin' | 'internal' | 'external';
+  /** Feature keys the admin disabled for this user (wire format, snake_case). */
+  disabled_features?: string[];
 }
 
 export interface DossierSensitivity {

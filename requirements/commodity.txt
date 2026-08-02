@@ -3,3 +3,6 @@ aiokafka==0.10.0
 sqlalchemy>=2.0,<3
 asyncpg>=0.29,<1
 pgvector>=0.2,<1
+# Liveness heartbeat (bharat_terminal/heartbeat.py) — hb:commodity in /admin/health.
+# Same pin as analysis/ingestion/sentiment.
+redis==5.0.8

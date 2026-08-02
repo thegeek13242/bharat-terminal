@@ -28,19 +28,22 @@ def _norm(email: str) -> str:
     return email.strip().lower()
 
 
-async def _upsert(emails: list[str]) -> None:
+async def _upsert(emails: list[str], role: str = "external") -> None:
     factory = get_session_factory()
     async with factory() as s:
         for email in emails:
             await s.execute(
                 text(
-                    "INSERT INTO app_users (email, is_active) VALUES (:e, true) "
-                    "ON CONFLICT (email) DO UPDATE SET is_active = true"
+                    "INSERT INTO app_users (email, is_active, role) "
+                    "VALUES (:e, true, :role) "
+                    "ON CONFLICT (email) DO UPDATE SET is_active = true, role = :role"
                 ),
-                {"e": email},
+                {"e": email, "role": role},
             )
         await s.commit()
-    print(f"Seeded/activated {len(emails)} user(s): {', '.join(emails)}")
+    print(f"Seeded/activated {len(emails)} user(s) as {role}: {', '.join(emails)}")
+    print("NOTE: if the API is running, role changes bite after the 60s authz "
+          "cache expires (or: redis-cli DEL authz:user:{id}).")
 
 
 async def _deactivate(emails: list[str]) -> None:
@@ -60,16 +63,17 @@ async def _list() -> None:
     async with factory() as s:
         rows = (await s.execute(
             text(
-                "SELECT email, is_active, invited_at, last_login_at "
+                "SELECT email, is_active, role, invited_at, last_login_at "
                 "FROM app_users ORDER BY invited_at"
             )
         )).mappings().all()
     if not rows:
         print("app_users is empty — no one is invited yet.")
         return
-    print(f"{'EMAIL':<40} {'ACTIVE':<7} LAST LOGIN")
+    print(f"{'EMAIL':<40} {'ACTIVE':<7} {'ROLE':<9} LAST LOGIN")
     for r in rows:
-        print(f"{r['email']:<40} {str(r['is_active']):<7} {r['last_login_at'] or '-'}")
+        print(f"{r['email']:<40} {str(r['is_active']):<7} "
+              f"{r['role']:<9} {r['last_login_at'] or '-'}")
 
 
 async def main() -> int:
@@ -78,6 +82,9 @@ async def main() -> int:
     ap.add_argument("--file", help="file with one email per line")
     ap.add_argument("--deactivate", action="store_true", help="deactivate the given emails")
     ap.add_argument("--list", action="store_true", help="print the current allowlist")
+    ap.add_argument("--role", default="external",
+                    choices=("admin", "internal", "external"),
+                    help="role to assign on insert/reactivate (default external)")
     args = ap.parse_args()
 
     try:
@@ -98,7 +105,7 @@ async def main() -> int:
         if args.deactivate:
             await _deactivate(emails)
         else:
-            await _upsert(emails)
+            await _upsert(emails, role=args.role)
         return 0
     finally:
         await close_engine()

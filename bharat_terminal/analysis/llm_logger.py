@@ -44,6 +44,19 @@ class LLMCallRecord:
     success: bool
     error: Optional[str] = None
     timestamp: str = ""
+    # Optional instrumentation (default 0 → existing callers unaffected via asdict).
+    # thinking_tokens: Gemini thoughts billed as output but reported separately.
+    # cached_tokens: input tokens served from cache (billed at a discount).
+    # web_search_calls: grounding requests, billed PER CALL, not per token.
+    # turns: agent tool-loop iterations for this run.
+    thinking_tokens: int = 0
+    cached_tokens: int = 0
+    web_search_calls: int = 0
+    turns: int = 0
+    # What this call was FOR: news_id for analysis-stage calls, symbol for
+    # dossier/grounding calls. Powers per-filing cost rollups in /admin/costs
+    # (SUM(cost_usd) GROUP BY context_id). Empty = unattributed.
+    context_id: str = ""
 
     def __post_init__(self):
         if not self.timestamp:
@@ -69,12 +82,53 @@ def compute_cost(model: str, prompt_tokens: int, completion_tokens: int) -> floa
 
 
 class LLMCallLogger:
-    """Logs every LLM call with tokens, latency, cost."""
+    """Logs every LLM call with tokens, latency, cost.
+
+    Sinks, all fail-open:
+    1. JSONL file (LLM_LOG_FILE) — legacy/local debugging; EPHEMERAL in
+       containers (no volume mount) and wiped on restart.
+    2. Redis LPUSH llm:calls — drained by the api-gateway flusher into the
+       durable llm_call_log table (migration 035). This is the sink
+       /admin/costs reads. Capped by LTRIM so a dead flusher can't grow
+       Redis unboundedly.
+    """
+
+    REDIS_QUEUE = "llm:calls"
+    REDIS_QUEUE_CAP = 50_000
 
     def __init__(self, log_file: Optional[str] = None):
         self.log_file = log_file or os.getenv("LLM_LOG_FILE", "/tmp/llm_calls.jsonl")
         self._total_cost_usd = 0.0
         self._call_count = 0
+        self._redis = None
+        self._redis_dead = False
+        self._service = os.getenv("SERVICE_NAME") or os.getenv("HOSTNAME", "")
+
+    def _push_redis(self, record: LLMCallRecord) -> None:
+        """Queue the record for the durable llm_call_log table. Sync client
+        with short timeouts (call sites are latency-tolerant — they just spent
+        seconds on an LLM); one hard failure disables further attempts for
+        this process so a Redis outage costs at most one timeout."""
+        if self._redis_dead:
+            return
+        try:
+            if self._redis is None:
+                import redis
+                self._redis = redis.Redis.from_url(
+                    os.getenv("REDIS_URL", "redis://redis:6379/0"),
+                    decode_responses=True,
+                    socket_connect_timeout=2, socket_timeout=2,
+                )
+            payload = asdict(record)
+            payload["service"] = self._service
+            pipe = self._redis.pipeline()
+            pipe.lpush(self.REDIS_QUEUE, json.dumps(payload))
+            pipe.ltrim(self.REDIS_QUEUE, 0, self.REDIS_QUEUE_CAP - 1)
+            pipe.execute()
+        except Exception as e:
+            logger.warning("LLM cost redis push failed (disabling for this "
+                           "process): %s", str(e)[:200])
+            self._redis_dead = True
 
     def log(self, record: LLMCallRecord):
         self._total_cost_usd += record.cost_usd
@@ -104,6 +158,8 @@ class LLMCallLogger:
                 f.write(json.dumps(asdict(record)) + "\n")
         except Exception as e:
             logger.warning(f"Failed to write LLM log: {e}")
+
+        self._push_redis(record)
 
     @property
     def total_cost_usd(self) -> float:

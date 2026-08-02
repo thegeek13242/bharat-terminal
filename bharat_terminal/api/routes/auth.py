@@ -75,6 +75,9 @@ async def me(current=Depends(get_current_user)):
         # Session valid but the user was since removed/deactivated.
         raise HTTPException(status_code=401, detail="not_authenticated")
     from bharat_terminal.api.auth import INTERNAL_RESEARCH_EMAILS
+    # role/disabled_features come from get_current_user's load_authz (DB-backed,
+    # 60s cache; fail-opens to 'external' pre-migration-035).
+    role = current.get("role", "external")
     return {
         "user": {
             "id": user["id"],
@@ -83,7 +86,11 @@ async def me(current=Depends(get_current_user)):
             "picture": user.get("picture"),
             # Gates internal-only surfaces in the UI (research chat). The
             # backend enforces independently via require_internal_user.
-            "internal": (user["email"] or "").lower() in INTERNAL_RESEARCH_EMAILS,
+            # Kept for compat; superseded by `role`.
+            "internal": role in ("admin", "internal")
+            or (user["email"] or "").lower() in INTERNAL_RESEARCH_EMAILS,
+            "role": role,
+            "disabled_features": current.get("disabled_features", []),
         }
     }
 

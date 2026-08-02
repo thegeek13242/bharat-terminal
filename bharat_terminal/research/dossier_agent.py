@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from bharat_terminal import grounding, llm
@@ -714,8 +715,41 @@ async def research_company(
     ]
 
     submitted: Optional[Dict[str, Any]] = None
-    tokens_in = tokens_out = 0
+    tokens_in = tokens_out = tokens_think = tokens_cached = 0
+    web_search_calls = 0
+    turns_used = 0
     nudges = 0
+    _t0 = time.monotonic()
+
+    def _emit_cost(success: bool, error: Optional[str] = None) -> None:
+        """Emit ONE cost record per dossier run — success or failure — so token
+        spend lands in the LLM cost log and the rolling-hour guardrail. Captures
+        what tokens_used historically missed: Gemini thinking tokens (billed as
+        output), cache reads, per-call web_search grounding, and runs that burned
+        tokens but never wrote a dossier row (model error / no submit)."""
+        try:
+            from bharat_terminal.analysis.llm_logger import (
+                get_llm_logger, LLMCallRecord, compute_cost,
+            )
+            billed_out = tokens_out + tokens_think
+            get_llm_logger().log(LLMCallRecord(
+                call_id=f"dossier_{symbol}_{time.time_ns()}",
+                model=DOSSIER_MODEL,
+                stage="dossier",
+                prompt_tokens=tokens_in,
+                completion_tokens=billed_out,
+                latency_ms=(time.monotonic() - _t0) * 1000,
+                cost_usd=compute_cost(DOSSIER_MODEL, tokens_in, billed_out),
+                success=success,
+                error=error,
+                thinking_tokens=tokens_think,
+                cached_tokens=tokens_cached,
+                web_search_calls=web_search_calls,
+                turns=turns_used,
+                context_id=symbol,
+            ))
+        except Exception as e:  # cost logging must never break generation
+            logger.warning(f"[DOSSIER] {symbol} cost-log emit failed: {e}")
 
     for turn in range(DOSSIER_MAX_TURNS):
         try:
@@ -728,10 +762,14 @@ async def research_company(
             )
         except Exception as e:
             logger.error(f"[DOSSIER] {symbol} model error turn={turn}: {e}")
+            _emit_cost(success=False, error=f"model_error: {e}")
             return None
 
+        turns_used = turn + 1
         tokens_in += resp.usage.input_tokens or 0
         tokens_out += resp.usage.output_tokens or 0
+        tokens_think += resp.usage.thinking_tokens or 0
+        tokens_cached += resp.usage.cached_tokens or 0
 
         tool_uses = [b for b in resp.content if b.type == "tool_use"]
 
@@ -774,6 +812,8 @@ async def research_company(
         # Execute tools and feed back
         tool_results = []
         for tu in tool_uses:
+            if tu.name == "web_search":
+                web_search_calls += 1  # billed per request, not per token
             try:
                 result = await _execute_tool(tu.name, dict(tu.input))
             except Exception as e:
@@ -792,16 +832,21 @@ async def research_company(
 
     if not submitted:
         logger.error(f"[DOSSIER] {symbol} agent did not submit after {DOSSIER_MAX_TURNS} turns")
+        _emit_cost(success=False, error="no_submit")
         return None
 
     try:
         await _save_dossier(
             submitted,
-            tokens_used=tokens_in + tokens_out,
+            # True billed total: input + output + thinking (Gemini bills thoughts
+            # as output). Previously tokens_in + tokens_out silently dropped them.
+            tokens_used=tokens_in + tokens_out + tokens_think,
             refresh_kind=refresh_kind,
         )
     except Exception as e:
         logger.error(f"[DOSSIER] {symbol} persistence failed: {e}", exc_info=True)
+        _emit_cost(success=False, error=f"persist_error: {e}")
         return None
 
+    _emit_cost(success=True)
     return submitted

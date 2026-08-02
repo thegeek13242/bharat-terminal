@@ -15,6 +15,7 @@ Design goals:
 """
 import os
 import re
+import time
 import asyncio
 import logging
 import itertools
@@ -146,6 +147,22 @@ class ContentBlock:
 class LLMUsage:
     input_tokens: int = 0
     output_tokens: int = 0
+    # Gemini thinking models bill thoughts as output but report them OUTSIDE
+    # candidates_token_count. Left uncounted they are invisible spend — the
+    # dossier agent's 20-turn loop reasons before every tool call. Claude folds
+    # thinking into output_tokens, so this stays 0 on the Anthropic path.
+    thinking_tokens: int = 0
+    # Input tokens served from cache (billed at a discount). 0 when caching off.
+    cached_tokens: int = 0
+
+    @property
+    def billed_output_tokens(self) -> int:
+        """Output tokens actually billed (Gemini: candidates + thoughts)."""
+        return self.output_tokens + self.thinking_tokens
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.billed_output_tokens
 
 
 @dataclass
@@ -215,6 +232,7 @@ def _wrap_anthropic_response(resp, model: str, provider: str) -> LLMResponse:
     usage = LLMUsage(
         input_tokens=getattr(resp.usage, "input_tokens", 0),
         output_tokens=getattr(resp.usage, "output_tokens", 0),
+        cached_tokens=getattr(resp.usage, "cache_read_input_tokens", 0) or 0,
     )
     return LLMResponse(
         content=blocks, usage=usage,
@@ -359,6 +377,8 @@ def _wrap_gemini_response(resp, model: str) -> LLMResponse:
     usage = LLMUsage(
         input_tokens=getattr(um, "prompt_token_count", 0) or 0,
         output_tokens=getattr(um, "candidates_token_count", 0) or 0,
+        thinking_tokens=getattr(um, "thoughts_token_count", 0) or 0,
+        cached_tokens=getattr(um, "cached_content_token_count", 0) or 0,
     )
     return LLMResponse(
         content=blocks, usage=usage, model=model,
@@ -503,6 +523,40 @@ def _is_rate_limited(e: Exception) -> bool:
 GROUNDING_MAX_RETRIES = int(os.getenv("GROUNDING_MAX_RETRIES", "4"))
 
 
+def _log_grounding_cost(model: str, usage: "LLMUsage", latency_ms: float) -> None:
+    """Record ONE web_search grounding call in the shared LLM cost log.
+
+    grounded_search is a SEPARATE Gemini call (default gemini-3.5-flash) whose
+    tokens never flow back into the caller's loop accounting — so without this
+    they are invisible spend, on top of Google Search's per-query grounding fee
+    (billed per call, not per token; compute_cost does not yet price it — the
+    web_search_calls=1 tag makes the calls countable so the fee can be applied
+    once its rate is confirmed). Stage 'dossier_grounding' keeps these separate
+    from the main 'dossier' pro-loop records so neither double-counts the other.
+    """
+    try:
+        from bharat_terminal.analysis.llm_logger import (
+            get_llm_logger, LLMCallRecord, compute_cost,
+        )
+        billed_out = (usage.output_tokens or 0) + (usage.thinking_tokens or 0)
+        get_llm_logger().log(LLMCallRecord(
+            call_id=f"grounding_{time.time_ns()}",
+            model=model,
+            stage="dossier_grounding",
+            prompt_tokens=usage.input_tokens or 0,
+            completion_tokens=billed_out,
+            latency_ms=latency_ms,
+            cost_usd=compute_cost(model, usage.input_tokens or 0, billed_out),
+            success=True,
+            thinking_tokens=usage.thinking_tokens or 0,
+            cached_tokens=usage.cached_tokens or 0,
+            web_search_calls=1,
+            turns=1,
+        ))
+    except Exception as e:  # cost logging must never break grounding
+        logger.warning("grounding cost-log emit failed: %s", str(e)[:200])
+
+
 async def grounded_search(
     query: str, *, model: Optional[str] = None, max_tokens: int = 2048,
 ) -> Dict[str, Any]:
@@ -527,11 +581,13 @@ async def grounded_search(
     for attempt in range(GROUNDING_MAX_RETRIES):
         client = _gemini_client()  # retained local; see complete() note
         try:
+            _g0 = time.monotonic()
             resp = await _await_budget(
                 client.aio.models.generate_content(model=model, contents=contents, config=cfg),
                 model=model, what="grounded_search")
-            return {"text": _wrap_gemini_response(resp, model).text,
-                    "sources": _extract_sources(resp)}
+            wrapped = _wrap_gemini_response(resp, model)
+            _log_grounding_cost(model, wrapped.usage, (time.monotonic() - _g0) * 1000)
+            return {"text": wrapped.text, "sources": _extract_sources(resp)}
         except TimeoutError as e:
             # A stuck grounding call must not hang the agent or burn credits on a
             # retry — degrade gracefully so the dossier proceeds on DB-grounded data.

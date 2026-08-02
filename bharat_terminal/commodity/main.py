@@ -120,12 +120,15 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, shutdown.set)
 
+    from bharat_terminal.heartbeat import heartbeat_loop
     consumer_task = asyncio.create_task(consumer.consume(handle), name="commodity-consume")
     shutdown_task = asyncio.create_task(shutdown.wait(), name="commodity-shutdown")
+    # Liveness beat for /admin/health (event-driven service, no periodic tick).
+    hb_task = asyncio.create_task(heartbeat_loop("commodity"), name="commodity-heartbeat")
 
     logger.info("[COMMODITY-ENGINE] running")
     done, pending = await asyncio.wait(
-        [consumer_task, shutdown_task],
+        [consumer_task, shutdown_task, hb_task],
         return_when=asyncio.FIRST_COMPLETED,
     )
     for t in pending:

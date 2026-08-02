@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 import redis.asyncio as aioredis
 
+from bharat_terminal.heartbeat import abeat
 from bharat_terminal.ingestion.kafka_producer import NewsKafkaProducer
 from bharat_terminal.ingestion.dedup import DedupFilter, url_fingerprint
 from bharat_terminal.ingestion.article_fetcher import ArticleFetcher
@@ -314,6 +315,9 @@ async def main():
         last_hb = 0.0
         while True:
             await asyncio.sleep(60)
+            # Liveness beat for /admin/health (per-adapter stalls are alerted
+            # separately below; this proves the process loop itself).
+            await abeat("ingestion")
             now = _time.time()
             for name, idle in check_adapter_liveness(adapters, now, stall_after):
                 logger.error(f"[liveness] {name} loop stalled — no cycle "

@@ -11,7 +11,12 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
-from bharat_terminal.api.auth import get_current_user, require_internal_user
+from bharat_terminal.api.auth import (
+    get_current_user,
+    require_admin,
+    require_feature,
+    require_internal_user,
+)
 from bharat_terminal.api.kafka_relay import start_kafka_relay, stop_kafka_relay
 from bharat_terminal.api.ltp_relay import start_ltp_relay, stop_ltp_relay
 from bharat_terminal.api.sentiment_relay import (
@@ -19,8 +24,12 @@ from bharat_terminal.api.sentiment_relay import (
     stop_sentiment_relay,
 )
 from bharat_terminal.api.db import close_engine
+from bharat_terminal.api.flushers import start_flushers, stop_flushers
+from bharat_terminal.api.request_log import RequestLogMiddleware, recorder
 from bharat_terminal.api.routes import (
+    admin,
     auth,
+    events,
     news,
     impact,
     company,
@@ -57,8 +66,12 @@ async def lifespan(app: FastAPI):
     await start_kafka_relay()
     await start_sentiment_relay()
     await start_ltp_relay()
+    await start_flushers()
+    await recorder.start()
     yield
     # Shutdown
+    await recorder.stop()
+    await stop_flushers()
     await stop_kafka_relay()
     await stop_sentiment_relay()
     await stop_ltp_relay()
@@ -74,6 +87,9 @@ app = FastAPI(
 )
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+# Per-user activity log (admin analytics). Enqueue-only on the hot path;
+# batch-flushed by `recorder` (see request_log.py for skip/sampling rules).
+app.add_middleware(RequestLogMiddleware)
 
 # CORS: cookie-based auth requires explicit origins + allow_credentials (no "*").
 # Set CORS_ORIGINS (comma-separated) to the real dev + prod origins in production.
@@ -96,37 +112,61 @@ app.include_router(auth.router)
 # Every data router requires an authenticated session (the WebSocket route
 # authenticates from the session cookie on connect inside the handler).
 _auth = [Depends(get_current_user)]
+
+
+def _gated(feature: str) -> list:
+    """Auth + per-user feature gate (admin-panel toggles, no-row = enabled).
+    Core routers (news/impact/company/…) stay ungated — the terminal shell
+    must always work for any active user."""
+    return [*_auth, Depends(require_feature(feature))]
+
+
 app.include_router(news.router, dependencies=_auth)
 app.include_router(impact.router, dependencies=_auth)
 app.include_router(company.router, dependencies=_auth)
 app.include_router(companies.router, dependencies=_auth)
-app.include_router(dossier.router, dependencies=_auth)
-app.include_router(db_explorer.router, dependencies=_auth)
+app.include_router(dossier.router, dependencies=_gated("dossiers"))
+app.include_router(db_explorer.router, dependencies=_gated("db_explorer"))
 app.include_router(graph.router, dependencies=_auth)
-app.include_router(watchlist.router, dependencies=_auth)
+app.include_router(watchlist.router, dependencies=_gated("watchlist"))
 app.include_router(starred.router, dependencies=_auth)
-app.include_router(sentiment.router, dependencies=_auth)
+app.include_router(sentiment.router, dependencies=_gated("sentiment"))
 # Earnings-surprise statistics (PEAD): deterministic, factual-statistical
 # payloads with disclaimer — customer-visible per founder decision 2026-07-04
 # (flagged for RA counsel review; see routes/earnings_surprises.py docstring).
-app.include_router(earnings_surprises.router, dependencies=_auth)
-app.include_router(investor_holdings.router, dependencies=_auth)
-app.include_router(investor_holdings.deals_router, dependencies=_auth)
+app.include_router(earnings_surprises.router, dependencies=_gated("surprises"))
+app.include_router(investor_holdings.router, dependencies=_gated("investors"))
+app.include_router(investor_holdings.deals_router, dependencies=_gated("investors"))
 # Concall transcripts: complete public filings, served unclipped.
-app.include_router(transcripts.router, dependencies=_auth)
+app.include_router(transcripts.router, dependencies=_gated("transcripts"))
+# Activity beacon: _auth only, deliberately feature-gate-exempt (analytics
+# must keep flowing for restricted users).
+app.include_router(events.router, dependencies=_auth)
 app.include_router(websocket.router)
 
 # Internal research surfaces (signal reports + hit-rate metrics). These carry
 # recommendation content and performance claims that must never reach customer
 # accounts; gated by the INTERNAL_RESEARCH_EMAILS allowlist (empty = 403 all).
 _internal = [Depends(require_internal_user)]
-app.include_router(signal_accuracy.router, dependencies=_internal)
-app.include_router(signals_report.router, dependencies=_internal)
+
+
+def _internal_gated(feature: str) -> list:
+    return [*_internal, Depends(require_feature(feature))]
+
+
+app.include_router(signal_accuracy.router, dependencies=_internal_gated("signals"))
+app.include_router(signals_report.router, dependencies=_internal_gated("signals"))
 # Angel One LTP: personal-use data — internal accounts only (licensing).
-app.include_router(internal_ltp.router, dependencies=_internal)
+app.include_router(internal_ltp.router, dependencies=_internal_gated("ltp"))
 # F12 research chat — dogfood phase, internal-only (see routes/research_chat.py).
-app.include_router(research_chat.router, dependencies=_internal)
-app.include_router(papertrading.router, dependencies=_internal)
+app.include_router(research_chat.router, dependencies=_internal_gated("research_chat"))
+app.include_router(papertrading.router, dependencies=_internal_gated("papertrading"))
+
+# Admin panel (founder control surface): fourth tier above _internal. Roles
+# are DB-backed (app_users.role, migration 035); ADMIN_EMAILS env is the
+# bootstrap/lockout fallback only.
+_admin = [Depends(require_admin)]
+app.include_router(admin.router, dependencies=_admin)
 
 
 @app.get("/health")

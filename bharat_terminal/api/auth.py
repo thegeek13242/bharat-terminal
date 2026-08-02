@@ -20,12 +20,14 @@ Secrets (never committed; see .env.example):
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import jwt
+import redis.asyncio as aioredis
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import text
@@ -132,6 +134,140 @@ INTERNAL_RESEARCH_EMAILS = {
     if e.strip()
 }
 
+# Bootstrap/lockout fallback for the admin panel. Roles live in app_users.role
+# (migration 035); this env set exists so the founder can never be locked out
+# by a bad DB state and so the panel works before the migration lands.
+ADMIN_EMAILS = {
+    e.strip().lower()
+    for e in os.getenv("ADMIN_EMAILS", "").split(",")
+    if e.strip()
+}
+
+
+# ── Per-user feature flags ──────────────────────────────────────────────────
+# Single source of truth for what the admin panel can toggle per user. Keys map
+# to router prefixes; enforcement is require_feature() on the router (main.py),
+# nav filtering is the frontend reading disabled_features off /auth/me.
+# Absence of a user_features row = enabled. Admin role bypasses all gates.
+FEATURE_REGISTRY: dict[str, list[str]] = {
+    "watchlist": ["/watchlist"],
+    "research_chat": ["/research-chat"],
+    "papertrading": ["/papertrading"],
+    "transcripts": ["/transcripts"],
+    "investors": ["/investors", "/deals"],
+    "surprises": ["/earnings-surprises"],
+    "dossiers": ["/dossier"],
+    "db_explorer": ["/db"],
+    "signals": ["/signals", "/signal-accuracy"],
+    "sentiment": ["/sentiment"],
+    "ltp": ["/internal/ltp"],
+}
+
+
+# ── DB-backed authorization (role + revocation + feature overrides) ─────────
+# The JWT alone was previously the whole session: deactivating a user left a
+# valid 7-day cookie working everywhere. load_authz closes that: every request
+# re-checks app_users through a 60s Redis cache; admin writes delete the cache
+# key so revocation/role changes are effectively instant.
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+AUTHZ_CACHE_TTL_S = int(os.getenv("AUTHZ_CACHE_TTL_S", "60"))
+_redis = None
+
+
+async def _get_redis():
+    global _redis
+    if _redis is None:
+        _redis = await aioredis.from_url(REDIS_URL, decode_responses=True)
+    return _redis
+
+
+def _authz_key(user_id: str) -> str:
+    return f"authz:user:{user_id}"
+
+
+async def invalidate_authz(user_id: int | str) -> None:
+    """Delete the cached authz state; next request re-reads the DB."""
+    try:
+        r = await _get_redis()
+        await r.delete(_authz_key(str(user_id)))
+    except Exception as e:
+        logger.warning("authz cache invalidation failed for %s: %s", user_id, e)
+
+
+async def _load_authz_db(user_id: str) -> Optional[dict]:
+    """One DB round for {role, is_active, disabled_features}. None = no row."""
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    factory = get_session_factory()
+    async with factory() as s:
+        row = (await s.execute(
+            text("SELECT role, is_active FROM app_users WHERE id = :id"),
+            {"id": uid},
+        )).mappings().first()
+        if row is None:
+            return None
+        disabled: list[str] = []
+        try:
+            disabled = list((await s.execute(
+                text(
+                    "SELECT feature FROM user_features "
+                    "WHERE user_id = :id AND enabled = false"
+                ),
+                {"id": uid},
+            )).scalars())
+        except Exception:
+            # user_features missing (pre-migration) — no overrides.
+            await s.rollback()
+        return {
+            "role": row["role"],
+            "is_active": bool(row["is_active"]),
+            "disabled_features": disabled,
+        }
+
+
+async def load_authz(user_id: str) -> dict:
+    """Cached authz state for a user id (JWT sub, string).
+
+    Failure semantics (deliberate, reviewed):
+    - Redis down        -> fall through to the DB.
+    - DB error          -> FAIL-OPEN to JWT-only claims with role='external'
+                           (privileged surfaces CLOSE, data routes keep working;
+                           a DB outage already breaks every data route anyway).
+                           Loud error log.
+    - row missing or
+      is_active = false -> {"revoked": True}; caller raises 401. Cached too, so
+                           a dead cookie doesn't hammer the DB.
+    """
+    key = _authz_key(user_id)
+    r = None
+    try:
+        r = await _get_redis()
+        cached = await r.get(key)
+        if cached:
+            return json.loads(cached)
+    except Exception as e:
+        logger.warning("authz cache read failed (%s); falling back to DB", e)
+        r = None
+
+    try:
+        authz = await _load_authz_db(user_id)
+    except Exception as e:
+        logger.error("authz DB lookup failed for user %s: %s — fail-open "
+                     "as role='external' (pre-migration-035 or DB outage)",
+                     user_id, e)
+        return {"role": "external", "is_active": True, "disabled_features": []}
+
+    if authz is None or not authz["is_active"]:
+        authz = {"revoked": True}
+    if r is not None:
+        try:
+            await r.setex(key, AUTHZ_CACHE_TTL_S, json.dumps(authz))
+        except Exception:
+            pass
+    return authz
+
 
 # ── FastAPI dependency: require an authenticated user ──────────────────────
 async def get_current_user(request: Request) -> dict:
@@ -148,13 +284,56 @@ async def get_current_user(request: Request) -> dict:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_session"
         )
-    return {"id": payload.get("sub"), "email": payload.get("email")}
+    user_id = payload.get("sub")
+    authz = await load_authz(str(user_id))
+    if authz.get("revoked"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="session_revoked"
+        )
+    return {
+        "id": user_id,
+        "email": payload.get("email"),
+        "role": authz.get("role", "external"),
+        "disabled_features": authz.get("disabled_features", []),
+    }
 
 
 async def require_internal_user(user: dict = Depends(get_current_user)) -> dict:
-    if (user.get("email") or "").lower() not in INTERNAL_RESEARCH_EMAILS:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="internal_only")
-    return user
+    if user.get("role") in ("admin", "internal"):
+        return user
+    # Env fallback: keeps internal surfaces working pre-migration-035 and
+    # during the DB fail-open path (where role degrades to 'external').
+    if (user.get("email") or "").lower() in INTERNAL_RESEARCH_EMAILS:
+        return user
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="internal_only")
+
+
+async def require_admin(user: dict = Depends(get_current_user)) -> dict:
+    if user.get("role") == "admin":
+        return user
+    if (user.get("email") or "").lower() in ADMIN_EMAILS:
+        return user
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin_only")
+
+
+def require_feature(feature: str):
+    """Dependency factory: 403 when the admin disabled `feature` for this user.
+
+    No override row = enabled. Admin role bypasses every gate. Composes with
+    the tier dependencies for free — get_current_user already carries
+    disabled_features, so this adds zero extra lookups.
+    """
+    if feature not in FEATURE_REGISTRY:
+        raise ValueError(f"unknown feature key: {feature}")
+
+    async def _dep(user: dict = Depends(get_current_user)) -> dict:
+        if user.get("role") != "admin" and feature in user.get("disabled_features", []):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="feature_disabled"
+            )
+        return user
+
+    return _dep
 
 
 def user_from_session_cookie(cookies: dict) -> Optional[dict]:

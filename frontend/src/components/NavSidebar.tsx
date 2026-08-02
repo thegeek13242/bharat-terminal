@@ -6,13 +6,16 @@ import { useAuth } from '@/auth/AuthContext';
 const SIDEBAR_MIN = 168;
 const SIDEBAR_MAX = 420;
 
-const NAV: { to: string; label: string; key: string }[] = [
+// `feature` = admin-panel feature key (backend FEATURE_REGISTRY); items whose
+// feature the admin disabled for this user are hidden. Server 403 is the
+// real gate — this is cosmetics.
+const NAV: { to: string; label: string; key: string; feature?: string }[] = [
   { to: '/terminal', label: 'Feed', key: 'feed' },
-  { to: '/watchlist', label: 'Watchlist', key: 'watchlist' },
+  { to: '/watchlist', label: 'Watchlist', key: 'watchlist', feature: 'watchlist' },
   { to: '/starred', label: 'Starred', key: 'starred' },
-  { to: '/surprises', label: 'Surprises', key: 'surprises' },
-  { to: '/transcripts', label: 'Transcripts', key: 'transcripts' },
-  { to: '/investors', label: 'Smart Money', key: 'investors' },
+  { to: '/surprises', label: 'Surprises', key: 'surprises', feature: 'surprises' },
+  { to: '/transcripts', label: 'Transcripts', key: 'transcripts', feature: 'transcripts' },
+  { to: '/investors', label: 'Smart Money', key: 'investors', feature: 'investors' },
   { to: '/universe', label: 'Universe', key: 'universe' },
 ];
 
@@ -32,13 +35,18 @@ export function NavSidebar({ children, counts, connected = false, statusLabel = 
 
   const { pathname } = useLocation();
   const { user, logout } = useAuth();
-  const navItems = user?.internal
+  const disabled = new Set(user?.disabled_features ?? []);
+  const isAdmin = user?.role === 'admin';
+  let navItems: typeof NAV = user?.internal
     ? [
         ...NAV,
-        { to: '/research', label: 'Research', key: 'research' },
-        { to: '/papertrading', label: 'Paper Trading', key: 'papertrading' },
+        { to: '/research', label: 'Research', key: 'research', feature: 'research_chat' },
+        { to: '/papertrading', label: 'Paper Trading', key: 'papertrading', feature: 'papertrading' },
       ]
     : NAV;
+  // Admin sees everything regardless of overrides (mirrors the backend gate).
+  if (!isAdmin) navItems = navItems.filter((i) => !i.feature || !disabled.has(i.feature));
+  if (isAdmin) navItems = [...navItems, { to: '/admin', label: 'Admin', key: 'admin' }];
 
   const monogram = (user?.name || user?.email || 'AM')
     .split(/[\s@.]+/)

@@ -496,6 +496,7 @@ async def score_impacts(
             latency_ms=llm_latency,
             cost_usd=compute_cost(LLM_MODEL, response.usage.input_tokens, response.usage.output_tokens),
             success=True,
+            context_id=str(news_item.id),
         )
         llm_logger.log(record)
 
@@ -629,6 +630,7 @@ async def score_impacts(
             prompt_tokens=0, completion_tokens=0,
             latency_ms=llm_latency, cost_usd=0.0,
             success=False, error=str(e),
+            context_id=str(news_item.id),
         )
         llm_logger.log(record)
         logger.error(f"Stage 3 error: {e}")

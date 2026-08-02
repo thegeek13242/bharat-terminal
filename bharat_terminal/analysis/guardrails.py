@@ -28,6 +28,7 @@ import ssl
 import time
 import urllib.request
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from typing import Deque, Dict, Optional, Tuple
 
@@ -165,14 +166,15 @@ class GuardrailMonitor:
         # Never let alert delivery block the pipeline: fire-and-forget on the loop
         # if one is running, else send inline (e.g. when called from a worker thread).
         try:
-            asyncio.get_running_loop().create_task(self._dispatch_async(subject, body))
+            asyncio.get_running_loop().create_task(
+                self._dispatch_async(kind, subject, body))
         except RuntimeError:
-            self._dispatch_alert(subject, body)
+            self._dispatch_alert(kind, subject, body)
 
-    async def _dispatch_async(self, subject: str, body: str) -> None:
-        await asyncio.to_thread(self._dispatch_alert, subject, body)
+    async def _dispatch_async(self, kind: str, subject: str, body: str) -> None:
+        await asyncio.to_thread(self._dispatch_alert, kind, subject, body)
 
-    def _dispatch_alert(self, subject: str, body: str) -> None:
+    def _dispatch_alert(self, kind: str, subject: str, body: str) -> None:
         """Send via every configured channel (webhook preferred — no auth).
         Logs at ERROR if no channel is configured or all fail."""
         sent = False
@@ -184,6 +186,46 @@ class GuardrailMonitor:
             logger.error(
                 "[guardrail] ALERT (no delivery channel configured/working — set "
                 "ALERT_WEBHOOK_URL for Teams/Slack, or SMTP_*): %s", subject)
+        self._push_history(kind, subject, body, sent)
+
+    # Redis queue drained by the api-gateway flusher into alert_events
+    # (migration 035). Before this, alert state was per-process, in-memory,
+    # and lost on every restart — no history existed anywhere.
+    HISTORY_QUEUE = "alerts:history"
+    HISTORY_CAP = 10_000
+
+    def _push_history(self, kind: str, subject: str, body: str,
+                      delivered: bool) -> None:
+        """Queue the alert for the durable alert_events table. Fully fail-open
+        (guardrails must never take the caller down); one hard failure
+        disables further attempts for this process."""
+        if getattr(self, "_history_dead", False):
+            return
+        try:
+            import json as _json
+            if getattr(self, "_history_redis", None) is None:
+                import redis
+                self._history_redis = redis.Redis.from_url(
+                    os.getenv("REDIS_URL", "redis://redis:6379/0"),
+                    decode_responses=True,
+                    socket_connect_timeout=2, socket_timeout=2,
+                )
+            entry = _json.dumps({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "service": os.getenv("SERVICE_NAME") or socket.gethostname(),
+                "kind": kind,
+                "subject": subject,
+                "body": body,
+                "delivered": delivered,
+            })
+            pipe = self._history_redis.pipeline()
+            pipe.lpush(self.HISTORY_QUEUE, entry)
+            pipe.ltrim(self.HISTORY_QUEUE, 0, self.HISTORY_CAP - 1)
+            pipe.execute()
+        except Exception as e:
+            logger.warning("[guardrail] alert-history push failed (disabling "
+                           "for this process): %s", str(e)[:200])
+            self._history_dead = True
 
     def _send_webhook(self, subject: str, body: str) -> bool:
         """POST the alert to a Teams/Slack/Discord incoming webhook. Returns

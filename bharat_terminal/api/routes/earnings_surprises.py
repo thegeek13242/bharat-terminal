@@ -194,7 +194,11 @@ async def recent_surprises(
         """), {"days": days})).all()
     # Live provisional reactions are internal-only (Angel One licensing —
     # see _live_reactions). Customers see basis=null → "pending".
-    is_internal = (user.get("email") or "").lower() in INTERNAL_RESEARCH_EMAILS
+    # Role is DB-backed (get_current_user); env allowlist = bootstrap fallback.
+    is_internal = (
+        user.get("role") in ("admin", "internal")
+        or (user.get("email") or "").lower() in INTERNAL_RESEARCH_EMAILS
+    )
     live = await _live_reactions(rows) if is_internal else {}
     return {
         "items": [_row(r, live) for r in rows],
