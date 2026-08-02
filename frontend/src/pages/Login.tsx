@@ -125,6 +125,13 @@ export function Login() {
                 Sessions are logged for compliance.
               </span>
             </div>
+
+            {/* Legal identity (statutory footer) */}
+            <div className="mono" style={{ marginTop: 14, fontSize: 9.5, letterSpacing: '0.04em', color: 'var(--ink-faint)', lineHeight: 1.6 }}>
+              © 2026 TAPEREAD TERMINAL (OPC) PRIVATE LIMITED
+              <br />
+              CIN: U63119UP2026OPC249859
+            </div>
           </div>
         </div>
       </div>
