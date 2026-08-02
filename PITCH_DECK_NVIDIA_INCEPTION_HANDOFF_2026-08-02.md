@@ -6,9 +6,11 @@ alpha-recruitment deck handoff (`PITCH_DECK_HANDOFF.md`, 2026-07-02) remains
 valid for its own audience and this document inherits its claims policy and
 brand system wholesale.
 
-Prepared 2026-08-02. Every metric in §4 was verified against the production
-database on this date (read-only queries). House rule, non-negotiable:
-**claims must match verified reality**. Round down, never up.
+Prepared 2026-08-02; revised same day after incorporation details landed and
+the observability/admin platform deployed to production. Every metric in §4
+was verified against the production database on this date (read-only
+queries). House rule, non-negotiable: **claims must match verified
+reality**. Round down, never up.
 
 ---
 
@@ -37,7 +39,7 @@ accelerated inference is the next unlock.
 | Stage | Invite-only alpha; single-digit professional users; demo-request → provisioning pipeline live |
 | Target customer | Analysts at boutique Indian PMS/AIF firms (sub-₹2,000 Cr AUM); firm pays, analyst consumes |
 | Legal entity | TAPEREAD TERMINAL (OPC) PRIVATE LIMITED (incorporated 2026, Uttar Pradesh) |
-| CIN | U63119UP2026OPC249859 |
+| CIN | U63119UP2026OPC249859 — displayed in the statutory footer on every page of taperead.trade and the terminal login (live, verifiable during diligence) |
 | Contact | aviralv35@gmail.com |
 
 Do not state team size beyond "solo founder" — it is a strength at this
@@ -112,10 +114,15 @@ present it as an engineering-culture story:
    A statistically validated post-earnings drift event study (51 quarterly
    cohorts) anchors the materiality work. **Frame as "statistical
    validation of event materiality" — see §7 for what may NOT be said.**
-6. **Full-stack observability.** Per-stage LLM cost/latency accounting to
-   the row level (cost per filing analysed is a tracked metric), durable
-   alert history, per-service liveness — one person operates the whole
-   platform because the platform reports on itself.
+6. **Full-stack observability — live in production, not a slide.** An
+   in-product operations panel (deployed Aug 2026) tracks per-stage LLM
+   cost and latency to the individual-call row — mean/median **cost per
+   filing analysed** is a first-class production metric — plus durable
+   alert history, per-loop worker liveness (distinct from container
+   status), Kafka consumer lag, and per-user engagement analytics. One
+   person operates the whole platform because the platform reports on
+   itself. Dossier regeneration is now a scheduled nightly staleness-driven
+   job (shipped Aug 2026) rather than manual batches.
 
 ## 6. GPU / accelerated-computing relevance (honest today + credible roadmap)
 
@@ -138,9 +145,9 @@ admits pre-GPU startups; a credible roadmap is what they want to see.
    high-volume, low-complexity stages (entity extraction, guidance
    extraction, filing summarisation) are exactly the tier where fine-tuned
    open-weight models on GPU (TensorRT-LLM / NIM) beat per-token API
-   pricing — LLM cost per filing is already instrumented, so the
-   API-vs-self-hosted crossover can be computed from production data, not
-   estimated.
+   pricing — LLM cost per filing is instrumented in production as of Aug
+   2026 (durable per-call cost log with per-filing rollups), so the
+   API-vs-self-hosted crossover is computed from live data, not estimated.
 4. **Data residency.** Indian financial-market customers increasingly
    expect in-country processing; self-hosted inference in an Indian region
    is the clean answer.
