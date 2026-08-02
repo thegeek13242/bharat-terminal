@@ -266,6 +266,41 @@ base rate of commentary prose, not wrongness. Per rule:
 4. C1a is unaffected (plumbing, no model claim) and ships regardless.
    C1b remains flag-off pending its own fresh-window replay.
 
+### C2 build (2026-07-31 late evening; founder-approved "start C2")
+
+Recon (3 agents) established: transcript_guidance is row-clean (0/25 junk)
+but join-key-broken (1,351 free-text metrics, unnormalized units, 98% of
+verdicts stuck at 'new'); ~25% of rows have exact actuals formulas but only
+1.3% cover elapsed periods; ZERO companies have >= 2 resolved pairs today —
+credibility becomes meaningful only when FY27 actuals land (Apr-May 2027).
+Also found: grounding.get_guidance_timeline exists but is wired to neither
+the dossier agent nor the MCP server (offered, not done — dossier_agent.py
+is a parallel-session file).
+
+Shipped in working tree (verified: normalize self-tests pass; dry-run
+against prod reproduces recon numbers):
+- migration 034: guidance_ledger (canonical projection + lifecycle) +
+  guidance_outcomes (delivered-vs-guided; credibility scaffold).
+- kb/sync/guidance_normalize.py: metric/unit/period canonicalization
+  (~20 named families incl. the UJJIVANSFB advances→asset rename; unit
+  conversion lakh/mn/bn→cr; refuses USD bases and past-period misparses).
+- kb/sync/guidance_ledger_sync.py (--dry-run default/--execute,
+  sync_log convention): dry-run on 2,589 rows → 48% named-family, 683
+  scoreable, lifecycle 2,286 active/303 superseded, recomputed verdicts
+  118 lowered/76 raised/40 maintained (raw table had 51 links total),
+  outcomes: 1 scored (INDHOTEL rev growth Q1FY27 12% guided → 14.61%
+  above/met), 0 credibility-eligible.
+- kb GET /company/{symbol}/guidance (internal): standing + outcomes +
+  credibility {status: insufficient_history below n=2}; fail-soft
+  pre-migration.
+Caveats recorded: 'superseded' counts include intra-call duplicate
+statements, not only cross-quarter restatements; H1/H2 periods and 22.5%
+NULL-period rows are unscored in v1; guidance basis (CC/consolidated) is
+not captured by the extractor — a GUIDANCE_VERSION=2 schema change is the
+main upstream improvement candidate.
+Deploy pending approval: apply 034 (kb rebuild + kb-migrate), backfill
+--execute, kb-service rebuild (endpoint), nightly cron 20:15 IST.
+
 ## 7. Incidental findings from the sweeps (noted, not fixed)
 - Investor-presentation impact e8f60760 mislabels EBIT (−42.4%) as PAT — minor
   classification defect class (metric confusion inside decks).

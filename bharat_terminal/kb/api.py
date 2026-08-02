@@ -248,6 +248,76 @@ async def get_filing_siblings(symbol: str, before_ts: str,
     return {"symbol": symbol, "siblings": [dict(r) for r in rows]}
 
 
+@app.get("/company/{symbol}/guidance")
+async def get_company_guidance(symbol: str):
+    """C2 — standing guidance state + delivered-vs-guided outcomes +
+    credibility status (INTERNAL, pipeline-facing; the customer surface is
+    the gateway's /transcripts/{symbol}/guidance). Derived from
+    guidance_ledger/guidance_outcomes (migration 034 + guidance_ledger_sync).
+    Credibility is computed here at read time and reports
+    'insufficient_history' below 2 resolved outcomes — by design it will say
+    that for almost every company until FY27 actuals land (Apr-May 2027)."""
+    symbol = symbol.upper().strip()
+    cache_key = f"guidance:{symbol}"
+    if redis_client:
+        try:
+            cached = await redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception as e:
+            logger.warning(f"Redis read failed for {cache_key}: {e}")
+
+    async with AsyncSessionLocal() as session:
+        try:
+            standing = (await session.execute(
+                text("""
+                    SELECT metric_key, metric_raw, period_key, period_end,
+                           value_low, value_high, unit_key, better_direction,
+                           change_verdict, restatements, stated_at, scoreable
+                    FROM guidance_ledger
+                    WHERE symbol = :symbol AND status = 'active'
+                    ORDER BY stated_at DESC, metric_key
+                    LIMIT 60
+                """), {"symbol": symbol})).mappings().all()
+            outcomes = (await session.execute(
+                text("""
+                    SELECT metric_key, period_key, guided_low, guided_high,
+                           delivered, delivered_verdict, met,
+                           basis_consolidated, formula, actual_period_end,
+                           ambiguity_flags
+                    FROM guidance_outcomes
+                    WHERE symbol = :symbol
+                    ORDER BY actual_period_end DESC
+                    LIMIT 40
+                """), {"symbol": symbol})).mappings().all()
+        except Exception as e:
+            # Pre-migration-034 deployments: report absence, don't 500.
+            logger.warning(f"guidance tables unavailable: {e}")
+            return {"symbol": symbol, "standing": [], "outcomes": [],
+                    "credibility": {"status": "unavailable"}}
+
+    resolved = [o for o in outcomes if o["met"] is not None]
+    n_met = sum(1 for o in resolved if o["met"])
+    credibility = {
+        "n_resolved": len(resolved), "n_met": n_met,
+        "hit_rate": (round(n_met / len(resolved), 3) if resolved else None),
+        # Multiplier gate (MANAGEMENT_COMMENTARY_2026-07-31.md §C2): no
+        # score is usable below 2 resolved pairs.
+        "status": ("ok" if len(resolved) >= 2 else "insufficient_history"),
+    }
+    data = {"symbol": symbol,
+            "standing": [dict(r) for r in standing],
+            "outcomes": [dict(r) for r in outcomes],
+            "credibility": credibility}
+    if redis_client:
+        try:
+            await redis_client.setex(cache_key, CACHE_TTL,
+                                     json.dumps(data, default=str))
+        except Exception as e:
+            logger.warning(f"Redis write failed for {cache_key}: {e}")
+    return data
+
+
 @app.get("/company/{symbol}/memory")
 async def get_company_memory(symbol: str):
     """Bounded, recency-decayed event memory for a company (derived from
