@@ -1,0 +1,10 @@
+# Test-only dependencies. Never baked into service images — installed at
+# runtime by scripts/test.sh inside a throwaway papertrade-image container
+# (python 3.12, full papertrade dep surface). See tests/README.md.
+pytest>=8,<9
+pytest-asyncio>=0.23.6,<0.24
+# tests/api/: the papertrade image lacks the api-gateway surface — these are
+# runtime-installed in the throwaway container like everything else here.
+fastapi==0.111.0
+sqlalchemy[asyncio]==2.0.30
+PyJWT==2.8.0
