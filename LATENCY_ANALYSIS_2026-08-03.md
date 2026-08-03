@@ -148,6 +148,46 @@ Honest status: the deployed changes are safe and directionally right, but the
 size of the win is unproven and smaller than first claimed. Verification is a
 market-hours re-run of the §2 queries plus a market-hours BSE listing probe.
 
+## 8. Stage 5 paused during market hours (founder decision 2026-08-03)
+
+**What stage 5 is:** the last LLM stage — turns scored impacts into trade
+signals (direction, instrument, position size, conviction, rationale). Runs on
+the PRO model (`SIGNALS_MODEL=gemini-3.1-pro-preview`): **p50 8.5s, p90 11.9s**,
+~$0.002/call. Fires on 1,423 of 4,673 relevant reports (30%) in 7d — it
+short-circuits for derivative headlines, stale articles, and anything without
+a hop-0 magnitude>=3 impact.
+
+**Why it was pure latency:** it sits between stage 4 and the Kafka publish, so
+it delays the papertrade consumer on every filing it touches — yet nothing on
+the trading path reads it. Papertrade trades `company_impacts` (zero
+references to `trade_signals` in the package); customers never see signals
+(`kafka_relay.py:146` strips them from the WS broadcast as SEBI RA scope,
+`impact.py` lists them in `_INTERNAL_KEYS`, `starred.py` omits them).
+
+**It is NOT consumer-free** (the premise checked before pausing): the nightly
+`daily_signal_eval` (19:00 IST weekdays, gated on the price sync) explodes
+`impact_reports.trade_signals` into `signal_outcomes` via
+`research/score_signals`, scores 1/5/10/20d forward returns, and feeds the
+internal `/signal-accuracy` API plus `research/gate_backtest.py`. Verified
+live: 2,688 outcomes (1,082 complete with full 20d returns, 1,421 partial),
+1,569 in the last 30 days, newest signal stamped 2026-08-03.
+
+**Decision — option 2 of three:** skip stage 5 during market hours only
+(`stage5_node`, flag `ANALYSIS_STAGE5_MARKET_HOURS=1` restores always-on).
+Removes 100% of the trading-path cost; off-hours filings (the majority) keep
+feeding the eval, so the measurement series survives.
+
+**CAVEAT — recorded, not silent:** from 2026-08-03 the signal-accuracy series
+is **off-hours only**. Evening/results filings differ in event mix from
+intraday ones, so post-cutoff accuracy stats are NOT strictly comparable with
+the historical all-hours baseline (incl. the 2026-07-04 coin-flip audit). Any
+future signal-quality claim must either split at this date or restore the flag
+for a clean window. The full-coverage fix without latency cost is §4's
+publish-then-signal design (second Kafka message + relay UPDATE), unbuilt.
+
+Verified: 4/4 gate cases (market-hours skip / off-hours run / override in both
+regimes); suite 90 passed / 1 skipped / 4 xfailed.
+
 ## 6. Not addressed by latency work (but bigger on BLUEJET)
 Our marks: t0 597.05 → t+5m 585.65 → **t+15m 581.20 (-2.7% in our favour)** →
 t+30m 599.00 → now 593.60. There was another 2.7% available AFTER entry that

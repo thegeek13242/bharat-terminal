@@ -4,6 +4,7 @@ News → Relevance → Extraction → Impact → Propagation → Signals → Pub
 End-to-end SLA: ≤5s at P95
 """
 import asyncio
+import os
 import time
 import logging
 import uuid
@@ -22,8 +23,14 @@ from bharat_terminal.analysis.stages.stage4_propagation import propagate_impacts
 from bharat_terminal.analysis.stages.stage5_signals import generate_signals
 from bharat_terminal.analysis.priced_in import apply_priced_in
 from bharat_terminal.analysis.filing_summary import summarize_filing, FILING_SOURCES
+from bharat_terminal.analysis.market_hours import is_market_hours
 
 logger = logging.getLogger(__name__)
+
+# Stage 5 (trade signals) is internal telemetry only and is the last LLM call
+# before publish — see stage5_node. Off during market hours by default so it
+# never sits on the filing→trade path; set to "1" to restore always-on.
+STAGE5_IN_MARKET_HOURS = os.getenv("ANALYSIS_STAGE5_MARKET_HOURS", "0") == "1"
 
 
 class PipelineState(TypedDict):
@@ -160,7 +167,30 @@ async def stage4_node(state: PipelineState) -> PipelineState:
 
 
 async def stage5_node(state: PipelineState) -> PipelineState:
-    """Stage 5: Trade signal generation."""
+    """Stage 5: Trade signal generation.
+
+    SKIPPED DURING MARKET HOURS (founder decision 2026-08-03, latency work).
+    Stage 5 is the last LLM call before the Kafka publish and runs on the PRO
+    model (SIGNALS_MODEL=gemini-3.1-pro-preview, p50 8.5s / p90 11.9s), so on
+    the ~30% of filings that reach it, it delays the papertrade consumer by
+    that much. Nothing on the trading path reads its output: papertrade trades
+    company_impacts, and trade_signals are stripped from every customer
+    surface (kafka_relay.py:146, impact.py _INTERNAL_KEYS) as SEBI RA scope.
+
+    Its ONE real consumer is the nightly signal-accuracy eval
+    (monitor.daily_signal_eval → research/score_signals → signal_outcomes →
+    /signal-accuracy). That eval keeps running on off-hours filings — which
+    are the majority — so the series continues, but see the caveat in
+    LATENCY_ANALYSIS_2026-08-03.md §8: from this date the ongoing series is
+    OFF-HOURS ONLY and is therefore not strictly comparable to the historical
+    all-hours baseline. That is a deliberate, recorded sampling change.
+
+    ANALYSIS_STAGE5_MARKET_HOURS=1 restores the old always-on behaviour.
+    """
+    if not STAGE5_IN_MARKET_HOURS and is_market_hours():
+        logger.info(
+            f"[stage5] skipped during market hours (latency): {state['news_item'].id}")
+        return {**state, "trade_signals": []}
     signals = await generate_signals(
         state["news_item"],
         state["all_impacts"],
