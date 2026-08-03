@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
 from sqlalchemy import text
@@ -36,7 +37,7 @@ FLUSH_BATCH_MAX = int(os.getenv("FLUSH_BATCH_MAX", "500"))
 
 _ALERT_INSERT = text("""
     INSERT INTO alert_events (ts, service, kind, subject, body, delivered)
-    VALUES (CAST(:ts AS timestamptz), :service, :kind, :subject, :body, :delivered)
+    VALUES (:ts, :service, :kind, :subject, :body, :delivered)
 """)
 
 _LLM_INSERT = text("""
@@ -45,16 +46,30 @@ _LLM_INSERT = text("""
          prompt_tokens, completion_tokens, thinking_tokens, cached_tokens,
          web_search_calls, turns, latency_ms, cost_usd, success, error)
     VALUES
-        (:call_id, CAST(:ts AS timestamptz), :service, :model, :stage, :context_id,
+        (:call_id, :ts, :service, :model, :stage, :context_id,
          :prompt_tokens, :completion_tokens, :thinking_tokens, :cached_tokens,
          :web_search_calls, :turns, :latency_ms, :cost_usd, :success, :error)
     ON CONFLICT (call_id) DO NOTHING
 """)
 
 
+def _ts(value) -> datetime:
+    """Producers queue ISO-8601 strings; asyncpg binds timestamptz params as
+    real datetimes and rejects strings outright (a whole batch DataErrors on
+    the first bad element). Parse here, fall back to now() rather than lose
+    the row. Naive timestamps are assumed UTC — every producer emits UTC."""
+    if isinstance(value, datetime):
+        return value
+    try:
+        dt = datetime.fromisoformat(str(value))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return datetime.now(timezone.utc)
+
+
 def _alert_params(entry: dict) -> dict:
     return {
-        "ts": entry.get("ts"),
+        "ts": _ts(entry.get("ts")),
         "service": str(entry.get("service") or "unknown")[:120],
         "kind": str(entry.get("kind") or "UNKNOWN")[:120],
         "subject": str(entry.get("subject") or "")[:500],
@@ -66,7 +81,7 @@ def _alert_params(entry: dict) -> dict:
 def _llm_params(entry: dict) -> dict:
     return {
         "call_id": str(entry.get("call_id") or "")[:200],
-        "ts": entry.get("timestamp"),
+        "ts": _ts(entry.get("timestamp")),
         "service": str(entry.get("service") or "")[:120] or None,
         "model": str(entry.get("model") or "unknown")[:120],
         "stage": str(entry.get("stage") or "unknown")[:120],

@@ -4,8 +4,13 @@ log — silent loss here means the admin panel lies."""
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 from bharat_terminal.api import flushers
+
+
+def _llm_entry_dict(call_id="c1", **over):
+    return json.loads(_llm_entry(call_id, **over))
 
 
 def _llm_entry(call_id="c1", **over):
@@ -66,6 +71,26 @@ async def test_db_failure_pushes_batch_back(monkeypatch, fakes):
     assert n == 0
     assert len(r.lists["alerts:history"]) == 1, "entry must survive for retry"
     assert not s.committed
+
+
+def test_ts_params_are_datetimes_not_strings():
+    """Regression (prod 2026-08-03): ts was passed through as an ISO STRING.
+    asyncpg binds timestamptz positionally and DataErrors the whole
+    executemany batch on a str, so every LLM cost record silently backed up
+    in Redis (2,824 queued, 0 inserted) while the fake-session tests stayed
+    green. Pin the type, not just the value."""
+    llm = flushers._llm_params(_llm_entry_dict())
+    assert isinstance(llm["ts"], datetime)
+    assert llm["ts"].tzinfo is not None
+
+    alert = flushers._alert_params({"ts": "2026-08-01T10:00:00+00:00"})
+    assert isinstance(alert["ts"], datetime)
+
+    # Naive input is assumed UTC; junk falls back to now() rather than
+    # poisoning the batch.
+    assert flushers._ts("2026-08-01T10:00:00").tzinfo is timezone.utc
+    assert isinstance(flushers._ts("not-a-timestamp"), datetime)
+    assert isinstance(flushers._ts(None), datetime)
 
 
 def test_param_mappers_tolerate_missing_fields():
