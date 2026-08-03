@@ -42,12 +42,57 @@ async def gather_pdf_texts(
     return [r if isinstance(r, str) else None for r in results]
 
 
+async def gather_pdf_texts_as_completed(
+    attachments: list[Optional[str]],
+    fetch: Callable[[str], Awaitable[Optional[str]]],
+    limit: int = PDF_FETCH_CONCURRENCY,
+):
+    """Same fetching as gather_pdf_texts, but yields (index, text) AS EACH
+    attachment completes instead of returning one ordered list at the end.
+
+    WHY (2026-08-03 latency analysis): awaiting the whole batch made every
+    filing in a burst wait for the slowest PDF in that batch before any of
+    them reached Kafka — dead time on the tier-1 trading path. Callers now
+    publish each item the moment its own attachment is ready. Order is NOT
+    preserved (the index identifies the slot); failures yield None, never
+    raise, so one bad attachment cannot drop the rest of the batch.
+    """
+    sem = asyncio.Semaphore(max(1, limit))
+
+    async def one(idx: int, url: Optional[str]) -> tuple[int, Optional[str]]:
+        if not url:
+            return idx, None
+        async with sem:
+            try:
+                text = await fetch(url)
+            except Exception:
+                return idx, None
+        return idx, text if isinstance(text, str) else None
+
+    tasks = [asyncio.create_task(one(i, a)) for i, a in enumerate(attachments)]
+    try:
+        for coro in asyncio.as_completed(tasks):
+            yield await coro
+    finally:
+        # Generator closed early (consumer break / adapter shutdown): never
+        # leave attachment fetches running detached.
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+
+
 class NSEFilingsAdapter(BaseAdapter):
     source_name = "NSE_FILINGS"
     poll_interval_seconds = 60.0
-    poll_interval_fast = 15.0   # Tier 1 — near-real-time during market hours
+    # Tier 1 — near-real-time during market hours. 8s (was 15s) per the
+    # 2026-08-03 latency analysis: NSE detection lag was p50 45s / p90 118s.
+    # Steady state is 2 requests/cycle (announcements + board meetings) =
+    # 15 req/min, so rate_limit_per_minute is raised to 20 in step; NSE has
+    # not throttled this endpoint pair at that rate (watch for 401/403 —
+    # the historical NSE failure mode is session expiry, not 429).
+    poll_interval_fast = 8.0
     poll_interval_slow = 120.0
-    rate_limit_per_minute = 10
+    rate_limit_per_minute = 20
 
     # ?index=equities is required — without it the API returns an error string, not JSON
     ANNOUNCEMENTS_URL = "https://www.nseindia.com/api/home-corporate-announcements?index=equities"
@@ -160,13 +205,15 @@ class NSEFilingsAdapter(BaseAdapter):
                     # sequential fetch serialized a burst of filings for
                     # minutes. Fail-soft per item: fall back to the truncated
                     # text / structured fields.
-                    pdf_texts = await gather_pdf_texts(
+                    # Pass 3: publish each filing the moment ITS attachment
+                    # lands. Waiting for the whole batch made the first-ready
+                    # filing pay for the slowest PDF in the burst — dead time
+                    # on the trading path (2026-08-03 latency analysis).
+                    async for _idx, pdf_text in gather_pdf_texts_as_completed(
                         [p["attachment"] for p in pending],
                         lambda url: fetch_pdf_text(url, session),
-                    )
-
-                    # Pass 3: yield in original order.
-                    for p, pdf_text in zip(pending, pdf_texts):
+                    ):
+                        p = pending[_idx]
                         item = p["item"]
                         body = (
                             pdf_text

@@ -16,6 +16,7 @@ from bharat_terminal.types import NewsItem, ImpactReport, CompanyImpact, TradeSi
 from bharat_terminal.analysis.stages.stage1_relevance import classify_relevance
 from bharat_terminal.analysis.stages.stage2_extraction import extract_entities
 from bharat_terminal.analysis.stages.stage3_impact import (consume_router_meta,
+                                                           prefetch_company_contexts,
                                                            score_impacts)
 from bharat_terminal.analysis.stages.stage4_propagation import propagate_impacts
 from bharat_terminal.analysis.stages.stage5_signals import generate_signals
@@ -104,8 +105,17 @@ SUMMARY_JOIN_TIMEOUT_S = 30.0
 
 
 async def stage2_node(state: PipelineState) -> PipelineState:
-    """Stage 2: Entity/sector extraction."""
-    result = await extract_entities(state["news_item"])
+    """Stage 2: Entity/sector extraction.
+
+    Kicks off stage-3's KB company-context fetches first so they overlap this
+    stage's LLM call rather than running serially after it (2026-08-03 latency
+    analysis). Exchange filings already carry the symbol, so the prefetch needs
+    nothing stage-2 produces; stage-3 consumes identical context objects.
+    """
+    ni = state["news_item"]
+    if ni.source in FILING_SOURCES and ni.symbols_mentioned:
+        prefetch_company_contexts(str(ni.id), list(ni.symbols_mentioned))
+    result = await extract_entities(ni)
     return {
         **state,
         "macro_theme": result["macro_theme"],

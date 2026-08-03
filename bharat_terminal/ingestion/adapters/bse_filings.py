@@ -33,7 +33,7 @@ from bharat_terminal.types import NewsItem
 from bharat_terminal.ingestion.pdf_fetch import fetch_pdf_text
 from bharat_terminal.ingestion.dedup import text_fingerprint
 from .base import BaseAdapter
-from .nse_filings import gather_pdf_texts
+from .nse_filings import gather_pdf_texts, gather_pdf_texts_as_completed
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,15 @@ class BSEFilingsAdapter(BaseAdapter):
     # added latency vs the old 60s while staying polite on api.bseindia.com
     # (steady state = 2 requests/cycle: today's first fully-seen page stops
     # pagination, plus yesterday's page 1).
-    poll_interval_fast = 30.0
+    # 2026-08-03 latency analysis: measured detection lag (exchange stamp →
+    # analysis consume) was p50 109s. A live probe showed BSE's own API does
+    # not list an announcement until ~60s after its stated NEWS_DT, so ~60s
+    # is an unfixable BSE-side floor and the remainder is ours. 15s is the
+    # rate-limit floor, not a guess: steady state is 2 requests/cycle (today's
+    # first fully-seen page + yesterday's page 1) = 8 req/min against
+    # rate_limit_per_minute=10. Going to 10s would need 12 req/min and would
+    # start getting throttled.
+    poll_interval_fast = 15.0
     poll_interval_slow = 300.0
     rate_limit_per_minute = 10
 
@@ -180,7 +188,10 @@ class BSEFilingsAdapter(BaseAdapter):
                     data = json.loads(raw)
                     rows = data.get("Table") or []
                 except Exception as e:
-                    logger.error(f"[{self.source_name}] Error fetching {day} p{page}: {e}")
+                    # repr(): asyncio.TimeoutError str()s to '' — the old log
+                    # line read "Error fetching 20260803 p1: " with no cause.
+                    logger.error(f"[{self.source_name}] Error fetching {day} "
+                                 f"p{page}: {type(e).__name__}: {e!r}")
                     self._record_failure()
                     break
 
@@ -224,14 +235,24 @@ class BSEFilingsAdapter(BaseAdapter):
                         "row": row,
                     })
 
-                # Pass 2: fetch PDF attachments concurrently (bounded, fail-soft).
+                # Pass 2: fetch PDF attachments concurrently (bounded,
+                # fail-soft) and publish EACH filing the moment its own
+                # attachment lands.
+                #
+                # LATENCY (2026-08-03 analysis): the previous code awaited the
+                # whole batch before yielding anything, so on a burst page the
+                # first-ready filing waited for the slowest PDF in the batch —
+                # pure dead time on the trading path. as_completed drops that
+                # barrier; ordering within a cycle no longer matters because
+                # downstream dedup/analysis are per-item.
                 if pending:
-                    pdf_texts = await gather_pdf_texts(
+                    async for idx, pdf_text in gather_pdf_texts_as_completed(
                         [p["attachment"] for p in pending],
                         lambda u: fetch_pdf_text(u, session, referer=BSE_REFERER),
-                    )
-                    ingest_latency = (time.time() - ingest_start) * 1000
-                    for p, pdf_text in zip(pending, pdf_texts):
+                    ):
+                        p = pending[idx]
+                        # Per-item latency: measured to ITS publish moment.
+                        ingest_latency = (time.time() - ingest_start) * 1000
                         row = p["row"]
                         # HEADLINE is BSE's one-line gist (often "Please refer
                         # the enclosed file.") — only a fallback when there is

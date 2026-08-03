@@ -167,6 +167,42 @@ def consume_router_meta(news_id: str) -> Optional[dict]:
     return _ROUTER_META.pop(news_id, None)
 
 
+# ── Company-context prefetch (latency) ──────────────────────────────────────
+# Stage-3's KB profile fetches depend ONLY on the symbol, which exchange
+# filings already carry (adapters stamp symbols_mentioned). Kicking them off
+# when stage-2 STARTS overlaps them with stage-2's LLM call instead of paying
+# for them serially afterwards (measured ~1-2s on the tier-1 filing path,
+# 2026-08-03 latency analysis). Purely an I/O reordering: stage-3 consumes the
+# exact same context objects, so the prompt is byte-identical.
+_CTX_PREFETCH: "OrderedDict[str, dict]" = OrderedDict()
+_CTX_PREFETCH_MAX = 256
+
+
+def prefetch_company_contexts(news_id: str, symbols: List[str]) -> None:
+    """Start KB context fetches for `symbols` now; stage-3 awaits them later.
+    Fire-and-forget and fail-soft — fetch_company_context returns None on any
+    error, so a prefetch can never break the pipeline."""
+    if not symbols or not KNOWLEDGE_BASE_URL or news_id in _CTX_PREFETCH:
+        return
+    try:
+        _CTX_PREFETCH[news_id] = {
+            sym: asyncio.create_task(fetch_company_context(sym))
+            for sym in symbols[:5]
+        }
+    except RuntimeError:          # no running loop (sync caller) — skip
+        return
+    _CTX_PREFETCH.move_to_end(news_id)
+    while len(_CTX_PREFETCH) > _CTX_PREFETCH_MAX:
+        _, stale = _CTX_PREFETCH.popitem(last=False)
+        for task in stale.values():
+            if not task.done():
+                task.cancel()
+
+
+def _consume_prefetched(news_id: str) -> dict:
+    return _CTX_PREFETCH.pop(news_id, {}) or {}
+
+
 def _scenario_for(
     news_item: NewsItem,
     symbols: List[str],
@@ -367,7 +403,14 @@ async def score_impacts(
     memories = {}
     backdrop = ""
     if KNOWLEDGE_BASE_URL:
-        context_tasks = [fetch_company_context(sym) for sym in candidate_symbols]
+        # Reuse anything stage-2 already started for us (same coroutine, same
+        # result); only symbols stage-2 newly discovered are fetched now.
+        prefetched = _consume_prefetched(news_item.id)
+        context_tasks = [prefetched.get(sym) or fetch_company_context(sym)
+                         for sym in candidate_symbols]
+        for sym, task in prefetched.items():
+            if sym not in candidate_symbols and not task.done():
+                task.cancel()
         if MEMORY_CONTEXT_ENABLED:
             # One combined, relevance-ranked fetch: company memories (replacing the
             # recency-only per-symbol path) + market/sector backdrop. Fail-soft.
