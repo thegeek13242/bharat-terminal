@@ -982,7 +982,20 @@ async def sync_bse_prices(days: int = 5) -> Dict:
                     .where(PricePoint.date == target_date, Company.exchange == "BSE")
                 )
                 count = existing.scalar() or 0
-                if count > 100:
+                # Skip only when this date is SUBSTANTIALLY loaded for the BSE
+                # universe, scaled to the universe itself.
+                #
+                # WHY (2026-08-03): the old test was `count > 100`, a fixed
+                # threshold that ~193 dual-listed names satisfy every single
+                # day — they carry exchange='BSE' but get their prices from the
+                # NSE bhavcopy, which loads first. So the check read "already
+                # loaded" on every run and the other ~1,438 BSE-only companies
+                # were never fetched: price_points for BSE-only names froze on
+                # 2026-07-03 while the job logged days_loaded=0/days_skipped=2
+                # and reported success. Coverage-relative means a partially
+                # NSE-fed date can no longer masquerade as a complete one.
+                loaded_threshold = max(200, int(0.6 * len(isin_to_symbol)))
+                if count >= loaded_threshold:
                     days_skipped += 1
                     continue
 
