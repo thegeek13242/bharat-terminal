@@ -36,6 +36,11 @@ _SCRIP_REFRESH_S = 12 * 3600
 # BSE scrip_id == Angel One's BSE `symbol` field, so name lookup resolves).
 _equity_tokens: Dict[str, str] = {}
 _bse_equity_tokens: Dict[str, str] = {}
+# NSE cash-equity series we will price, best-market first. EQ = rolling
+# settlement, BE/BZ = trade-for-trade (where ESM/GSM surveillance names live),
+# SM/ST = SME board. Anything else on exch_seg NSE is not a cash equity.
+_NSE_CASH_SERIES = ("EQ", "BE", "BZ", "SM", "ST")
+_NSE_SERIES_RANK = {s: i for i, s in enumerate(_NSE_CASH_SERIES)}
 _scrip_loaded_at: float = 0.0
 
 
@@ -50,13 +55,31 @@ async def _ensure_equity_tokens() -> None:
         rows = resp.json()
         tokens: Dict[str, str] = {}
         bse_tokens: Dict[str, str] = {}
+        nse_series: Dict[str, str] = {}
         for r in rows:
             seg = r.get("exch_seg")
             sym = (r.get("symbol") or "")
             if seg == "NSE":
-                # NSE cash equities are listed as "<NAME>-EQ".
-                if sym.endswith("-EQ"):
-                    tokens[sym[:-3].upper()] = str(r.get("token") or "")
+                # NSE cash equities are "<NAME>-<SERIES>". Indexing ONLY "-EQ"
+                # (the old behaviour) silently lost every surveillance and SME
+                # series — 291 -BE, 414 -SM, 145 -ST names — which then fell
+                # through to the BSE map and got priced off the WRONG exchange.
+                # Measured 2026-07-31: GLFL (GLFL-BE) quoted 6.20 vs NSE's 5.87
+                # open, OILCOUNTUB (OILCOUNTUB-BE) 53.34 vs 56.40 — both were
+                # BSE circuit-band prints, up to 5% wrong, feeding live paper
+                # marks and fills. Non-equity NSE series (SG/GS/N0/N1/MF/TB =
+                # gilts, bonds, MFs, T-bills) stay excluded by the whitelist.
+                if "-" in sym:
+                    base, series = sym.rsplit("-", 1)
+                    rank = _NSE_SERIES_RANK.get(series.upper())
+                    if rank is not None and base:
+                        base_u = base.upper()
+                        held = nse_series.get(base_u)
+                        # EQ outranks BE outranks SME: a name listed in two
+                        # series keeps its primary market.
+                        if held is None or rank < _NSE_SERIES_RANK[held]:
+                            tokens[base_u] = str(r.get("token") or "")
+                            nse_series[base_u] = series.upper()
             elif seg == "BSE":
                 # BSE cash equities have instrumenttype "" (indices are AMXIDX);
                 # token == the 6-digit BSE scrip code.
@@ -156,7 +179,11 @@ async def get_current_ltps(symbols: List[str], redis_client) -> Dict[str, Dict[s
             if sym and ltp is not None:
                 out[sym] = {"ltp": float(ltp),
                             "prev_close": float(prev_close) if prev_close is not None else None,
-                            "open": float(day_open) if day_open else None}
+                            "open": float(day_open) if day_open else None,
+                            # Which exchange this print came from. Stamped so a
+                            # wrong-segment quote is visible downstream instead
+                            # of silently becoming a fill price (2026-07-31).
+                            "exchange": exch}
     except Exception as e:
         logger.warning(f"[live_price] parse failed (fail-open): {e}")
         return {}

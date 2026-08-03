@@ -110,6 +110,9 @@ async def get_quotes(symbols) -> dict[str, dict]:
                     out[sym.upper()] = {
                         "ltp": float(q["ltp"]),
                         "open": float(q["open"]) if q.get("open") else None,
+                        # Source exchange of the print — carried into fill
+                        # provenance so a wrong-segment quote is auditable.
+                        "exchange": q.get("exchange"),
                         "prev_close": (float(q["prev_close"])
                                        if q.get("prev_close") else None),
                     }
