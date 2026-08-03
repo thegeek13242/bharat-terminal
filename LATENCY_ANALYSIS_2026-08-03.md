@@ -98,6 +98,56 @@ terms (44.7s → ~30s) because it has no comparable listing floor measured.
 These are projections from component measurements — the honest check is
 re-running §2's queries a week after deploy.
 
+## 7. POST-DEPLOY VERIFICATION — and a correction to §2/§5
+
+Deployed 2026-08-03 17:07 IST. First 15 post-deploy filings measured BSE
+detect p50 195.8s / NSE 78.1s — *worse* than the §2 baseline. Neither number
+means what it looks like, and chasing it exposed an error in §2.
+
+**Cause of the apparent regression:** the sample was entirely OFF-HOURS
+(`_is_market_hours() = False` after 15:30 IST), so adapters were on the SLOW
+intervals — BSE 300s, NSE 120s — which this commit did not change. Pre-deploy
+off-hours was BSE 181.6s / NSE 58.1s, so post-deploy off-hours (n=10/5) is
+statistically the same. **No regression; the fast path simply cannot be
+measured outside market hours.**
+
+**The error in §2:** those headline figures (BSE 109.4s, NSE 44.7s) blended
+market-hours and off-hours filings. Split properly over the same 7 days:
+
+| Source | market-hours (09:15-15:30) | off-hours |
+|---|---|---|
+| BSE | **61.6s** (n=1413) | 181.6s (n=2146) |
+| NSE | **26.0s** (n=918) | 58.1s (n=1953) |
+
+The trading path only ever sees the market-hours column. Off-hours filings
+queue to the next open anyway (PENDING → auction fill), so their latency is
+nearly irrelevant — and they were inflating the baseline that justified the
+poll-interval change.
+
+**Consequences:**
+1. BSE market-hours detection (61.6s) sits almost exactly on the ~60s BSE
+   listing floor measured in §2. Either our own added latency was already
+   ~nil during market hours, or BSE lists faster intra-session than the
+   16:35 probe showed. Unresolved — the probe must be repeated DURING market
+   hours to split these.
+2. Realistic gain from the poll change is therefore much smaller than §5
+   claimed: BSE avg wait 15s→7.5s and NSE 7.5s→4s, i.e. **BSE ~61.6s→~54s,
+   NSE ~26s→~22s**, not "125s→75-85s". §5's projection is withdrawn — it was
+   computed off the blended number.
+3. The **batch-barrier removal is the part that still clearly earns its
+   keep**, and it is independent of poll interval: it only bites during
+   bursts, which is exactly results-day market hours (verified 0.69s vs
+   4.53s to first item).
+4. **The pipeline is now the bigger share of the market-hours path**
+   (BSE: 61.6s detect + 16.2s pipeline). That RAISES the value of the two
+   deferred pipeline items in §4 — stage-5 (~8s, papertrade ignores its
+   output) and stage-2 decoupling (~7s) — relative to any further detection
+   work.
+
+Honest status: the deployed changes are safe and directionally right, but the
+size of the win is unproven and smaller than first claimed. Verification is a
+market-hours re-run of the §2 queries plus a market-hours BSE listing probe.
+
 ## 6. Not addressed by latency work (but bigger on BLUEJET)
 Our marks: t0 597.05 → t+5m 585.65 → **t+15m 581.20 (-2.7% in our favour)** →
 t+30m 599.00 → now 593.60. There was another 2.7% available AFTER entry that
