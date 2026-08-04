@@ -259,7 +259,57 @@ def _coerce_response_dict(raw: Any) -> Dict[str, Any]:
     return {"result": raw}
 
 
-def _gemini_translate(system, messages, tools, tool_choice, max_tokens, temperature):
+def _sdk_supports_thought_signatures() -> bool:
+    """Does the installed google-genai expose Part.thought_signature?
+
+    google-genai < ~1.21 has NO such field. On those versions every Gemini 3
+    multi-turn tool loop silently breaks: extraction reads None, replay drops
+    the value, and turn 2 dies with 400 "Function call is missing a
+    thought_signature". Cached because it is a pure import-time property.
+
+    Real incident (2026-08-03): requirements/kb.txt pinned pydantic==2.6.3,
+    which forced pip to resolve google-genai 1.2.0 in the kb image only. The
+    nightly dossier refresh — which runs in kb-monitor — failed 100/100 for
+    weeks while the same code worked fine from other images. The version
+    floors in requirements/*.txt are the fix; this check makes a regression
+    LOUD instead of silent.
+    """
+    global _SIG_SUPPORT
+    if _SIG_SUPPORT is None:
+        try:
+            from google.genai import types
+            _SIG_SUPPORT = "thought_signature" in types.Part.model_fields
+        except Exception:
+            _SIG_SUPPORT = False
+    return _SIG_SUPPORT
+
+
+_SIG_SUPPORT: Optional[bool] = None
+_SIG_WARNED = False
+
+
+def _warn_if_signatures_unsupported(model: str, has_tools: bool) -> None:
+    """Warn once per process when a tool loop is issued on an SDK that cannot
+    carry thought signatures — the loop will fail on its SECOND turn."""
+    global _SIG_WARNED
+    if _SIG_WARNED or not has_tools or _sdk_supports_thought_signatures():
+        return
+    _SIG_WARNED = True
+    try:
+        import google.genai as _g
+        ver = getattr(_g, "__version__", "unknown")
+    except Exception:
+        ver = "unknown"
+    logger.error(
+        "google-genai %s has NO Part.thought_signature; multi-turn tool loops "
+        "on %s WILL fail on turn 2 with 400 'missing a thought_signature'. "
+        "Rebuild this image against google-genai>=1.21 (see requirements/).",
+        ver, model,
+    )
+
+
+def _gemini_translate(system, messages, tools, tool_choice, max_tokens, temperature,
+                      _model: str = "gemini"):
     """Translate Anthropic-style args to google-genai contents/config.
 
     Handles multi-turn tool loops: assistant `tool_use` blocks become Gemini
@@ -267,6 +317,7 @@ def _gemini_translate(system, messages, tools, tool_choice, max_tokens, temperat
     parts. Gemini correlates a response to a call by function *name* (not by
     Anthropic's tool_use_id), so we first map id → name from the assistant turns.
     """
+    _warn_if_signatures_unsupported(_model, bool(tools))
     from google.genai import types
 
     id_to_name: Dict[str, str] = {}
@@ -445,7 +496,7 @@ def complete(
         return _wrap_anthropic_response(client.messages.create(**kwargs), model, provider)
     # gemini-vertex
     contents, cfg = _gemini_translate(system, messages, tools, tool_choice,
-                                      max_tokens, temperature)
+                                      max_tokens, temperature, _model=model)
     # Retain the client in a local: an inline `_gemini_client().models...` lets
     # the Client be GC'd mid-call in google-genai 1.x, raising
     # "Cannot send a request, as the client has been closed".
@@ -476,7 +527,7 @@ async def acomplete(
         return _wrap_anthropic_response(resp, model, provider)
     # gemini-vertex
     contents, cfg = _gemini_translate(system, messages, tools, tool_choice,
-                                      max_tokens, temperature)
+                                      max_tokens, temperature, _model=model)
     # Retain the client in a local (see note in complete()): an inline
     # `_gemini_client().aio...` lets the Client be GC'd/closed mid-call.
     client = _gemini_client()

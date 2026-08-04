@@ -16,5 +16,5 @@ aiohttp==3.9.3
 # C0 commentary extraction via the bharat_terminal.llm wrapper (Vertex ADC,
 # same pins as requirements/analysis.txt).
 anthropic[vertex]>=0.40,<1
-google-genai>=0.3,<2
+google-genai>=1.21,<2   # Gemini 3 tool loops REQUIRE Part.thought_signature
 
