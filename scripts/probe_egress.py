@@ -50,7 +50,14 @@ except ImportError:  # pragma: no cover - operator-facing
     print("ERROR: httpx not installed.  python3 -m pip install httpx", file=sys.stderr)
     sys.exit(2)
 
-TIMEOUT = httpx.Timeout(20.0, connect=10.0)
+# 60s read timeout MATCHES PRODUCTION (kb/sync/bse_financial_results.py uses
+# timeout=60.0). BSE degrades badly under live-session load — endpoints that
+# answer in 0.5s after hours take 5-12s at midday. A stricter probe timeout
+# than prod manufactures false NO-GO verdicts; measured 2026-08-04 12:25 IST.
+TIMEOUT = httpx.Timeout(60.0, connect=10.0)
+
+# Seconds between consecutive requests to the SAME host (see run()).
+POLITENESS_DELAY_S = 6.0
 
 # Header sets copied from the live adapters so the probe is a faithful test:
 #   ingestion/adapters/nse_filings.py     (NSE JSON API)
@@ -184,9 +191,19 @@ def classify(resp: httpx.Response, expect_json: bool) -> tuple[str, str]:
 
 def run() -> dict:
     results = []
+    # Per-host pacing mirrors the adapters' rate limits (BSE 10/min, NSE
+    # 20/min). Without it the probe fires 3 BSE calls back-to-back, gets
+    # throttled, and reports a FAIL that production would never hit —
+    # observed 2026-08-04: same endpoint 60s+ in a burst vs 7s when spaced.
+    last_hit: dict[str, float] = {}
     with httpx.Client(follow_redirects=True, timeout=TIMEOUT) as client:
         cookie_status = warm_nse_cookies(client)
         for key, desc, url, headers, critical, expect_json in CHECKS:
+            host = httpx.URL(url).host
+            gap = time.monotonic() - last_hit.get(host, 0.0)
+            if gap < POLITENESS_DELAY_S:
+                time.sleep(POLITENESS_DELAY_S - gap)
+            last_hit[host] = time.monotonic()
             t0 = time.monotonic()
             try:
                 resp = client.get(url, headers=headers)
