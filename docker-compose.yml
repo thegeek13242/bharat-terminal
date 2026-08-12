@@ -307,6 +307,9 @@ services:
       # v2 structuring prompts generate past the 120s default on long calls
       # (thinking models); transcript jobs are batch, not latency-bound.
       LLM_CALL_TIMEOUT_S: "300"
+      # Bedrock pacing (see kb-monitor note): structuring on Haiku uses the
+      # pool's spare 2 RPM (fleet: analysis 5 + kb-monitor 2 + api 1 + here 2).
+      BEDROCK_RPM_LIMIT: ${BEDROCK_RPM_LIMIT_TRANSCRIPTS:-2}
     command: ["python", "-m", "bharat_terminal.kb.sync.transcript_sync", "--watch"]
     restart: unless-stopped
     logging: *default-logging
@@ -356,6 +359,9 @@ services:
       # clean at ~8 RPM unpaced, so it gets the larger slice.
       BEDROCK_RPM_LIMIT: ${BEDROCK_RPM_LIMIT_ANALYSIS:-5}
       BEDROCK_RPM_LIMIT_CLAUDE_SONNET_4_6: ${BEDROCK_RPM_SONNET_ANALYSIS:-7}
+      # filing_summary rides the otherwise-idle Sonnet 4.5 pool (10 RPM),
+      # taking Haiku's biggest co-tenant off the rejected-quota 10 RPM pool.
+      BEDROCK_RPM_LIMIT_CLAUDE_SONNET_4_5_20250929: ${BEDROCK_RPM_SONNET45_ANALYSIS:-8}
     restart: unless-stopped
     logging: *default-logging
 
