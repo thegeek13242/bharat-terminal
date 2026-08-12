@@ -12,7 +12,7 @@ pandas>=2.0,<3
 aiokafka==0.10.0
 redis==5.0.8
 # Scrip-master download (35MB, slow CDN — long-timeout pattern).
-aiohttp==3.9.3
+aiohttp==3.14.3
 # C0 commentary extraction via the bharat_terminal.llm wrapper (Vertex ADC,
 # same pins as requirements/analysis.txt).
 anthropic[vertex,bedrock]>=0.121,<1  # bedrock extra: boto3 for AWS IAM auth; >=0.121 for AnthropicBedrockMantle
