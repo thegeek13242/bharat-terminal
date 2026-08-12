@@ -34,4 +34,4 @@ google-genai>=1.21,<2   # Gemini 3 tool loops REQUIRE Part.thought_signature
 # imports the anthropic SDK lazily — the dependency MUST be in this image or
 # the first claude-* call fails at runtime (2026-08-03 incident class).
 anthropic[bedrock]>=0.121,<1
-pypdf==6.11.0            # concall transcript extraction (transcript_sync — full text, no clipping)
+pypdf==6.15.0            # concall transcript extraction (transcript_sync — full text, no clipping)
