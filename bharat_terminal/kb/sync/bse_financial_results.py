@@ -77,6 +77,40 @@ def flagdurs_for_days(since_days: int) -> List[str]:
     return ["6", "7"]
 
 
+# FlagDur buckets 1..6 are cumulative windows (each a superset of the last);
+# "7" alone is the beyond-a-year remainder.
+_FLAGDUR_WIDER = {"1": "2", "2": "3", "3": "4", "4": "5", "5": "6"}
+
+# A MARKET-WIDE index request over a multi-day window with this few rows is a
+# flap, not reality — Indian exchanges never have <=5 filers market-wide in a
+# 2+ day window, any season. Observed 2026-08-12: the endpoint intermittently
+# returns a near-empty 200 body (1 row) per REQUEST, not per bucket — minutes
+# apart the same bucket flipped 542→1 and 1→1,817 rows — so the check must be
+# an absolute floor with retries, not a comparison against a reference fetch
+# (the reference can be the flapped one). The nightly since_days=2 scan
+# silently ingested nothing for four days on exactly this.
+_SUSPECT_MIN_ROWS = 5
+
+
+def _rows_suspect(rows: Optional[List[dict]]) -> bool:
+    return rows is None or len(rows) <= _SUSPECT_MIN_ROWS
+
+
+async def _fetch_index_best(
+    scrip_code: str, client: httpx.AsyncClient, limiter: RateLimiter, flagdur: str,
+    attempts: int = 3,
+) -> Optional[List[dict]]:
+    """Best-of-N fetch: keep the largest row set, stop early once plausible."""
+    best: Optional[List[dict]] = None
+    for _ in range(attempts):
+        part = await _fetch_index(scrip_code, client, limiter, flagdur)
+        if part is not None and (best is None or len(part) > len(best)):
+            best = part
+        if not _rows_suspect(best):
+            break
+    return best
+
+
 def _xml_url(xml_name: str) -> str:
     name = re.sub(r"\.html$", ".xml", xml_name.strip(), flags=re.I)
     return XBRL_FILE_URL.format(name=name)
@@ -199,6 +233,50 @@ async def _fetch_index(
     return None
 
 
+async def _fetch_index_window(
+    scrip_code: str, client: httpx.AsyncClient, limiter: RateLimiter, since_days: int,
+) -> Optional[List[dict]]:
+    """MARKET-WIDE index fetch for `since_days`, tolerant of flapping buckets.
+
+    Fetches the bucket(s) covering the window best-of-3 (see _fetch_index_best);
+    if the result is still implausibly small for a multi-day market-wide window
+    (_SUSPECT_MIN_ROWS), escalates to wider buckets as rescue, keeping whatever
+    was largest overall. Wider-than-asked buckets over-cover harmlessly — every
+    downstream upsert is idempotent behind uq_financial_result. The plausibility
+    floor assumes scrip_code == "" (market-wide); per-scrip callers must not use
+    this (a quiet scrip legitimately has 0 rows). A single-day window (["1"])
+    passes through unchecked — 0 rows is legitimate on holidays. Returns None
+    only when nothing could be fetched at all.
+    """
+    flags = flagdurs_for_days(since_days)
+    if flags == ["1"]:
+        return await _fetch_index(scrip_code, client, limiter, "1")
+
+    entries: Optional[List[dict]] = None
+    for flag in flags:  # two-element only on the >1y ["6","7"] path
+        part = await _fetch_index_best(scrip_code, client, limiter, flag)
+        if part is not None:
+            entries = (entries or []) + part
+    if not _rows_suspect(entries) or flags[-1] == "7":
+        return entries
+
+    flag = flags[-1]
+    while (flag := _FLAGDUR_WIDER.get(flag)) is not None:
+        logger.warning(
+            f"[BSE-FIN] market-wide index window (FlagDur={flags[-1]}) still suspect "
+            f"after retries ({0 if entries is None else len(entries)} rows) — "
+            f"escalating to FlagDur={flag}")
+        wider = await _fetch_index_best(scrip_code, client, limiter, flag)
+        if wider is not None and (entries is None or len(wider) > len(entries)):
+            entries = wider
+        if not _rows_suspect(entries):
+            return entries
+    logger.warning(
+        f"[BSE-FIN] all index buckets suspect — proceeding with "
+        f"{0 if entries is None else len(entries)} rows")
+    return entries
+
+
 _COUNT_KEYS = ("upserted", "xml_missing", "parse_failed", "skipped_annual",
                "skipped_halfyear_covered", "scale_suspect")
 
@@ -314,7 +392,7 @@ async def run_market_scan(since_days: int = 1) -> Dict[str, int]:
         await session.commit()
 
     async with httpx.AsyncClient(timeout=60, headers=BSE_HEADERS) as client:
-        entries = await _fetch_index("", client, limiter, flagdurs_for_days(since_days)[0])
+        entries = await _fetch_index_window("", client, limiter, since_days)
         if entries is None:
             entries = []
             stats["parse_failed"] += 1
