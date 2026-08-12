@@ -693,7 +693,7 @@ async def search_transcript_chunks(
     /transcripts/search API and, later, the research-chat tool loop.
     """
     from sqlalchemy import text as sql_text
-    from bharat_terminal.llm.embeddings import embed_query
+    from bharat_terminal.llm.embeddings import embed_query, EMBEDDING_COLUMN
 
     qvec = await embed_query(query)
     if qvec is None:
@@ -710,7 +710,7 @@ async def search_transcript_chunks(
         rows = (await s.execute(sql_text(f"""
             SELECT tc.transcript_id, tc.symbol, tc.announced_at,
                    tc.char_start, tc.char_end, tc.section,
-                   (1 - (tc.embedding <=> (:q)::vector)) AS relevance,
+                   (1 - (tc.{EMBEDDING_COLUMN} <=> (:q)::vector)) AS relevance,
                    substring(ct.full_text FROM tc.char_start + 1
                              FOR tc.char_end - tc.char_start) AS excerpt,
                    c.company_name
@@ -718,7 +718,8 @@ async def search_transcript_chunks(
             JOIN concall_transcripts ct ON ct.id = tc.transcript_id
             LEFT JOIN companies c ON c.symbol = tc.symbol
             WHERE ct.parse_status = 'ok' {sym_clause}
-            ORDER BY tc.embedding <=> (:q)::vector
+                  AND tc.{EMBEDDING_COLUMN} IS NOT NULL
+            ORDER BY tc.{EMBEDDING_COLUMN} <=> (:q)::vector
             LIMIT :k
         """), params)).all()
     return {

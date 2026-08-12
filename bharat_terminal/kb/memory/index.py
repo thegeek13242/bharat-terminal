@@ -26,7 +26,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from bharat_terminal.research.db import session_scope
 from bharat_terminal.kb.models import MemoryItem
 from bharat_terminal.kb.memory import core
-from bharat_terminal.llm.embeddings import embed_texts
+from bharat_terminal.llm.embeddings import embed_texts, EMBEDDING_COLUMN
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("memory_index")
@@ -52,8 +52,8 @@ async def _existing_signatures(event_keys: List[str]) -> Dict[str, Any]:
     if not event_keys:
         return {}
     async with session_scope() as s:
-        rows = (await s.execute(text("""
-            SELECT event_key, summary, magnitude, (embedding IS NOT NULL) AS has_emb
+        rows = (await s.execute(text(f"""
+            SELECT event_key, summary, magnitude, ({EMBEDDING_COLUMN} IS NOT NULL) AS has_emb
             FROM memory_items WHERE event_key = ANY(:keys)
         """), {"keys": event_keys})).all()
     return {r.event_key: (r.summary, r.magnitude, r.has_emb) for r in rows}
@@ -77,7 +77,9 @@ async def _upsert(events: List[Dict[str, Any]], embeddings: Dict[str, List[float
             "importance": ev["importance"],
             "source_news_ids": ev["source_news_ids"],
             "source_count": ev["source_count"],
-            "embedding": embeddings.get(ev["event_key"]),  # None → keep existing on conflict
+            # None → keep existing on conflict. Written to the ACTIVE column
+            # (embedding vs embedding_1024) for the configured provider.
+            EMBEDDING_COLUMN: embeddings.get(ev["event_key"]),
         })
     async with session_scope() as s:
         # Chunk to keep statements a sane size.
@@ -99,8 +101,9 @@ async def _upsert(events: List[Dict[str, Any]], embeddings: Dict[str, List[float
                     "source_news_ids": stmt.excluded.source_news_ids,
                     "source_count": stmt.excluded.source_count,
                     # Only overwrite the embedding when we computed a fresh one.
-                    "embedding": func.coalesce(
-                        stmt.excluded.embedding, MemoryItem.__table__.c.embedding
+                    EMBEDDING_COLUMN: func.coalesce(
+                        getattr(stmt.excluded, EMBEDDING_COLUMN),
+                        MemoryItem.__table__.c[EMBEDDING_COLUMN],
                     ),
                     "updated_at": datetime.now(timezone.utc),
                 },

@@ -1,18 +1,26 @@
-"""Vertex text embeddings (768-dim) for the event-memory index.
+"""Text embeddings for the event-memory index + transcript retrieval.
 
-Reuses the same Vertex / google-genai setup as the LLM wrapper. The dimension is
-pinned to EMBEDDING_DIM (768) to match the `memory_items.embedding` column and its
-HNSW cosine index — a mismatch raises loudly rather than silently corrupting the
-index. `text-embedding-004` and `gemini-embedding-001` both emit 768 dims at the
-`global` Vertex region (verified live).
+Two providers, selected by EMBEDDING_PROVIDER:
 
-Task types follow Vertex conventions: index the memory items as
-RETRIEVAL_DOCUMENT, embed the incoming news as RETRIEVAL_QUERY, so the query and
-document spaces line up for cosine retrieval.
+  vertex  : text-embedding-004 (768-dim) via google-genai — the original setup.
+            Requires GCP ADC, which does NOT exist on the AWS host.
+  bedrock : Cohere Embed v4 (1024-dim) via the `global.` cross-region profile —
+            AWS IAM auth (instance role). The Vertex task types map 1:1 onto
+            Cohere input types (RETRIEVAL_DOCUMENT→search_document,
+            RETRIEVAL_QUERY→search_query), preserving the asymmetric
+            query/document space the retrieval code was built on.
+
+The dimension is pinned to EMBEDDING_DIM to match the pgvector column and its
+HNSW cosine index — a mismatch raises loudly rather than silently corrupting
+the index. Because the two providers emit different dimensions, each dimension
+gets its OWN column: EMBEDDING_COLUMN names it, and every reader/writer must go
+through it (memory index/retrieve, transcript embed/search). 768 ↔ `embedding`,
+anything else ↔ `embedding_<dim>` (migration 036 added embedding_1024).
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from typing import List, Optional, Sequence
@@ -21,17 +29,40 @@ from bharat_terminal.llm.wrapper import (
     VERTEX_PROJECT,
     VERTEX_GEMINI_REGION,
     LLM_CALL_TIMEOUT_S,
+    BEDROCK_REGION,
+    _bedrock_pace_sync,
 )
 
 logger = logging.getLogger(__name__)
 
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "vertex").lower()
+
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-004")
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "768"))
-# Vertex text-embedding endpoints cap instances/request; keep batches modest.
-_BATCH = int(os.getenv("EMBEDDING_BATCH", "100"))
+# Cohere Embed v4 is served from ap-south-1 ONLY via the global cross-region
+# profile (verified live 2026-08-12); quotas are the "Global cross-region ...
+# Cohere Embed V4" family (20 req/min, 300k tokens/min).
+BEDROCK_EMBEDDING_MODEL = os.getenv("BEDROCK_EMBEDDING_MODEL", "global.cohere.embed-v4:0")
+
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM",
+                              "1024" if EMBEDDING_PROVIDER == "bedrock" else "768"))
+# The pgvector column this dimension lives in. Readers and writers MUST use
+# this name — mixing columns across dimensions is exactly the silent-corruption
+# failure the dim check below exists to prevent.
+EMBEDDING_COLUMN = os.getenv(
+    "EMBEDDING_COLUMN", "embedding" if EMBEDDING_DIM == 768 else f"embedding_{EMBEDDING_DIM}")
+
+# Vertex caps instances/request at ~250; Cohere Embed v4 caps texts at 96.
+_BATCH = int(os.getenv("EMBEDDING_BATCH",
+                       "96" if EMBEDDING_PROVIDER == "bedrock" else "100"))
 # Memory summaries are short; bound defensively so a stray long body can't blow
 # the per-instance token limit.
 _MAX_CHARS = int(os.getenv("EMBEDDING_MAX_CHARS", "2000"))
+
+# Cohere input types for the Vertex task-type names used across the codebase.
+_COHERE_INPUT_TYPE = {
+    "RETRIEVAL_DOCUMENT": "search_document",
+    "RETRIEVAL_QUERY": "search_query",
+}
 
 
 def _client():
@@ -43,7 +74,17 @@ def _client():
     )
 
 
-def _embed_sync(texts: List[str], task_type: str) -> List[List[float]]:
+def _check_dim(v: List[float]) -> List[float]:
+    if len(v) != EMBEDDING_DIM:
+        raise ValueError(
+            f"embedding dim {len(v)} != {EMBEDDING_DIM} "
+            f"(provider={EMBEDDING_PROVIDER}); the {EMBEDDING_COLUMN} HNSW "
+            f"index requires {EMBEDDING_DIM}"
+        )
+    return v
+
+
+def _embed_sync_vertex(texts: List[str], task_type: str) -> List[List[float]]:
     from google.genai import types
     client = _client()
     cfg = types.EmbedContentConfig(
@@ -57,22 +98,58 @@ def _embed_sync(texts: List[str], task_type: str) -> List[List[float]]:
             model=EMBEDDING_MODEL, contents=chunk, config=cfg
         )
         for e in resp.embeddings:
-            v = list(e.values)
-            if len(v) != EMBEDDING_DIM:
-                raise ValueError(
-                    f"embedding dim {len(v)} != {EMBEDDING_DIM} "
-                    f"(model={EMBEDDING_MODEL}); the memory_items HNSW index "
-                    f"requires {EMBEDDING_DIM}"
-                )
-            out.append(v)
+            out.append(_check_dim(list(e.values)))
     return out
+
+
+def _embed_sync_bedrock(texts: List[str], task_type: str) -> List[List[float]]:
+    import boto3
+    from botocore.config import Config
+    client = boto3.client(
+        "bedrock-runtime", region_name=BEDROCK_REGION,
+        config=Config(read_timeout=LLM_CALL_TIMEOUT_S, connect_timeout=10),
+    )
+    input_type = _COHERE_INPUT_TYPE.get(task_type)
+    if input_type is None:
+        raise ValueError(f"unmapped embedding task_type: {task_type!r}")
+    out: List[List[float]] = []
+    for i in range(0, len(texts), _BATCH):
+        chunk = [((t or "")[:_MAX_CHARS] or " ") for t in texts[i:i + _BATCH]]
+        # Same sliding-window pacer as the Claude calls — Embed V4's global
+        # quota is 20 req/min; override via BEDROCK_RPM_LIMIT_GLOBAL_COHERE_...
+        _bedrock_pace_sync(BEDROCK_EMBEDDING_MODEL)
+        resp = client.invoke_model(
+            modelId=BEDROCK_EMBEDDING_MODEL,
+            body=json.dumps({
+                "texts": chunk,
+                "input_type": input_type,
+                "embedding_types": ["float"],
+                "output_dimension": EMBEDDING_DIM,
+            }),
+        )
+        body = json.loads(resp["body"].read())
+        embs = body.get("embeddings")
+        vecs = embs.get("float") if isinstance(embs, dict) else embs
+        if vecs is None or len(vecs) != len(chunk):
+            raise ValueError(
+                f"bedrock embed returned {0 if not vecs else len(vecs)} vectors "
+                f"for {len(chunk)} texts (model={BEDROCK_EMBEDDING_MODEL})")
+        for v in vecs:
+            out.append(_check_dim(list(v)))
+    return out
+
+
+def _embed_sync(texts: List[str], task_type: str) -> List[List[float]]:
+    if EMBEDDING_PROVIDER == "bedrock":
+        return _embed_sync_bedrock(texts, task_type)
+    return _embed_sync_vertex(texts, task_type)
 
 
 async def embed_texts(
     texts: Sequence[str], task_type: str = "RETRIEVAL_DOCUMENT"
 ) -> List[List[float]]:
-    """Embed a batch of texts → list of 768-float vectors (order preserved).
-    Runs the sync Vertex client in a thread so it doesn't block the event loop."""
+    """Embed a batch of texts → list of EMBEDDING_DIM-float vectors (order
+    preserved). Runs the sync client in a thread so it doesn't block the loop."""
     items = list(texts)
     if not items:
         return []

@@ -107,7 +107,7 @@ async def embed_transcript(SessionFactory, transcript_id: int, symbol: str,
     """Chunk + embed + store one transcript (idempotent replace).
     Returns the chunk count. Raises on embedding failure (caller fail-softs)."""
     from sqlalchemy import text as sql_text
-    from bharat_terminal.llm.embeddings import embed_texts
+    from bharat_terminal.llm.embeddings import embed_texts, EMBEDDING_COLUMN
 
     chunks = chunk_transcript(full_text, structure)
     if not chunks:
@@ -121,10 +121,10 @@ async def embed_transcript(SessionFactory, transcript_id: int, symbol: str,
             "DELETE FROM transcript_chunks WHERE transcript_id = :tid"),
             {"tid": transcript_id})
         for c, v in zip(chunks, vectors):
-            await db.execute(sql_text("""
+            await db.execute(sql_text(f"""
                 INSERT INTO transcript_chunks
                     (transcript_id, symbol, announced_at, chunk_index,
-                     char_start, char_end, section, embedding,
+                     char_start, char_end, section, {EMBEDDING_COLUMN},
                      embedding_version)
                 VALUES (:tid, :sym, :ann, :idx, :cs, :ce, :sec,
                         (:vec)::vector, :ver)

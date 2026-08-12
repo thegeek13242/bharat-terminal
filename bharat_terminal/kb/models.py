@@ -919,6 +919,9 @@ class MemoryItem(Base):
     source_news_ids: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     source_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
     embedding: Mapped[Optional[List[float]]] = mapped_column(Vector(768), nullable=True)
+    # Bedrock/Cohere space (migration 036); the ACTIVE column is named by
+    # llm.embeddings.EMBEDDING_COLUMN — writers/readers must go through it.
+    embedding_1024: Mapped[Optional[List[float]]] = mapped_column(Vector(1024), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 

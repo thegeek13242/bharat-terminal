@@ -25,6 +25,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bharat_terminal.kb.memory import core
+from bharat_terminal.llm.embeddings import EMBEDDING_COLUMN
 
 SCAN_LIMIT = int(os.getenv("MEMORY_SCAN_LIMIT", "300"))
 ANN_CANDIDATES = int(os.getenv("MEMORY_ANN_CANDIDATES", "80"))
@@ -70,10 +71,10 @@ async def retrieve_memory(
         params["q"] = "[" + ",".join(f"{x:.6f}" for x in query_embedding) + "]"
         params["lim"] = ANN_CANDIDATES
         cand_sql = text(f"""
-            SELECT {cols}, (1 - (embedding <=> (:q)::vector)) AS relevance
+            SELECT {cols}, (1 - ({EMBEDDING_COLUMN} <=> (:q)::vector)) AS relevance
             FROM memory_items
-            WHERE {where} AND event_time >= :since AND embedding IS NOT NULL
-            ORDER BY embedding <=> (:q)::vector
+            WHERE {where} AND event_time >= :since AND {EMBEDDING_COLUMN} IS NOT NULL
+            ORDER BY {EMBEDDING_COLUMN} <=> (:q)::vector
             LIMIT :lim
         """)
     else:
