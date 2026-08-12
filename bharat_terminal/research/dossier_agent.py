@@ -194,7 +194,7 @@ TOOL_GET_CORPORATE_ACTIONS = {
 TOOL_WEB_SEARCH = {
     "name": "web_search",
     "description": (
-        "Google-Search-grounded web lookup. Use ONLY to fill gaps our own data "
+        "Web-search-grounded lookup. Use ONLY to fill gaps our own data "
         "cannot — peer market shares, customer/supplier concentration, broker "
         "targets, qualitative news. Returns an answer plus source URLs to cite. "
         "Always try get_kb_company_context / get_financials / get_price_returns "

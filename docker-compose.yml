@@ -18,12 +18,18 @@ x-common-env: &common-env
   SIGNALS_MODEL: ${SIGNALS_MODEL:-gemini-3.1-pro-preview}
   DOSSIER_MODEL: ${DOSSIER_MODEL:-gemini-3.1-pro-preview}
   RELEVANCE_THRESHOLD: ${RELEVANCE_THRESHOLD:-0.35}
-  # LLM routing: claude-* -> Vertex (AnthropicVertex) unless LLM_PROVIDER=anthropic;
-  # gemini-* -> Vertex (google-genai). Auth via the VM service-account ADC.
+  # LLM routing: claude-* -> Vertex (AnthropicVertex) by default; LLM_PROVIDER=bedrock
+  # routes claude-* via Amazon Bedrock (AWS IAM auth: EC2 instance role, no key);
+  # LLM_PROVIDER=anthropic uses the legacy console API. gemini-* -> Vertex always.
   LLM_PROVIDER: ${LLM_PROVIDER:-vertex}
   VERTEX_PROJECT: ${VERTEX_PROJECT:-bharat-terminal}
   VERTEX_CLAUDE_REGION: ${VERTEX_CLAUDE_REGION:-global}
   VERTEX_GEMINI_REGION: ${VERTEX_GEMINI_REGION:-global}
+  # Bedrock (used when LLM_PROVIDER=bedrock). From ap-south-1 Claude 4.6+/5 is
+  # served only via global.* cross-region inference profiles (runtime endpoint).
+  BEDROCK_REGION: ${BEDROCK_REGION:-ap-south-1}
+  BEDROCK_CLAUDE_ENDPOINT: ${BEDROCK_CLAUDE_ENDPOINT:-runtime}
+  BEDROCK_CLAUDE_PROFILE: ${BEDROCK_CLAUDE_PROFILE:-global}
 
 services:
 
@@ -237,6 +243,10 @@ services:
     env_file: [".env"]
     environment:
       <<: *common-env
+      # Bedrock pacing: fleet budgets must sum under the 10 RPM/model account
+      # quota (analysis 5 + kb-monitor 2 + api 1 = 8, headroom for SDK retries).
+      # Raise/remove when the 2026-08-12 quota-increase case is granted.
+      BEDROCK_RPM_LIMIT: ${BEDROCK_RPM_LIMIT_KB_MONITOR:-2}
     command: ["python", "-m", "bharat_terminal.kb.manage", "monitor"]
     restart: unless-stopped
     logging: *default-logging
@@ -258,6 +268,10 @@ services:
     env_file: [".env"]
     environment:
       <<: *common-env
+      # Bedrock pacing (see kb-monitor note): kb-service's Bedrock traffic is
+      # query embeds for memory retrieval (Cohere quota 20 RPM, separate from
+      # Claude's) plus rare Claude calls.
+      BEDROCK_RPM_LIMIT: ${BEDROCK_RPM_LIMIT_KB:-4}
     ports:
       - "8001:8001"
     healthcheck:
@@ -337,6 +351,11 @@ services:
     env_file: [".env"]
     environment:
       <<: *common-env
+      # Bedrock pacing (see kb-monitor note). Haiku carries stage2 + summary +
+      # signals concurrently; Sonnet 4.6 is stage3's filing→trade path and ran
+      # clean at ~8 RPM unpaced, so it gets the larger slice.
+      BEDROCK_RPM_LIMIT: ${BEDROCK_RPM_LIMIT_ANALYSIS:-5}
+      BEDROCK_RPM_LIMIT_CLAUDE_SONNET_4_6: ${BEDROCK_RPM_SONNET_ANALYSIS:-7}
     restart: unless-stopped
     logging: *default-logging
 
@@ -446,6 +465,8 @@ services:
     env_file: [".env"]
     environment:
       <<: *common-env
+      # Bedrock pacing (see kb-monitor note): research chat is low-volume.
+      BEDROCK_RPM_LIMIT: ${BEDROCK_RPM_LIMIT_API:-1}
     ports:
       - "8000:8000"
     healthcheck:

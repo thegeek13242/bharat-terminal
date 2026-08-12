@@ -3,6 +3,8 @@ Core LLM wrapper: normalized request → provider → Anthropic-shaped response.
 
 Providers:
   - anthropic-vertex : Claude models via Vertex AI (AnthropicVertex), GCP ADC auth.
+  - anthropic-bedrock: Claude models via Amazon Bedrock (AnthropicBedrock /
+                       AnthropicBedrockMantle), AWS IAM auth (instance role).
   - anthropic        : Claude models via the legacy console API (api_key).
   - gemini-vertex    : Gemini models via Vertex AI (google-genai).
 
@@ -19,6 +21,8 @@ import time
 import asyncio
 import logging
 import itertools
+import threading
+import collections
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -33,8 +37,9 @@ _GEMINI_CALL_SEQ = itertools.count(1)
 
 # ── Provider selection ───────────────────────────────────────────────────────
 
-# For Claude models: "vertex" (default) routes via Vertex AI; "anthropic" uses the
-# legacy console API. Gemini models always go through Vertex.
+# For Claude models: "vertex" (default) routes via Vertex AI; "bedrock" via
+# Amazon Bedrock (AWS IAM auth, no key); "anthropic" uses the legacy console
+# API. Gemini models always go through Vertex.
 CLAUDE_BACKEND = os.getenv("LLM_PROVIDER", "vertex").lower()
 
 VERTEX_PROJECT = os.getenv("VERTEX_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT") or "bharat-terminal"
@@ -48,9 +53,115 @@ VERTEX_CLAUDE_REGION = os.getenv("VERTEX_CLAUDE_REGION", "global")
 # serves the older gemini-2.5-* ids, so it is the safe universal default.
 VERTEX_GEMINI_REGION = os.getenv("VERTEX_GEMINI_REGION", "global")
 
+# Backend for the agents' web_search function tool (grounded_search below):
+#   gemini (default): Gemini google_search grounding on Vertex — needs GCP auth.
+#   nova           : Amazon Nova web grounding on Bedrock — AWS-native billing,
+#                    single call, citations from Amazon's own web index (data
+#                    never leaves AWS infra per the Nova docs). US-CRIS only,
+#                    so the call runs cross-region (default us-east-1); needs
+#                    bedrock:InvokeTool on system-tool/amazon.nova_grounding.
+GROUNDING_BACKEND = os.getenv("GROUNDING_BACKEND", "gemini").lower()
 # Model used for Google Search grounding (web_search tool). A cheap thinking
 # Gemini is fine here; the dossier model stays whatever DOSSIER_MODEL says.
 GROUNDING_MODEL = os.getenv("GROUNDING_MODEL", "gemini-3.5-flash")
+NOVA_GROUNDING_MODEL = os.getenv("NOVA_GROUNDING_MODEL", "us.amazon.nova-2-lite-v1:0")
+NOVA_GROUNDING_REGION = os.getenv("NOVA_GROUNDING_REGION", "us-east-1")
+
+# ── Amazon Bedrock (Claude via AWS) ──────────────────────────────────────────
+# Two Bedrock endpoints serve Claude; both auth via the AWS credential chain
+# (EC2 instance role in prod — no API key):
+#   runtime (default): bedrock-runtime via AnthropicBedrock. From ap-south-1 the
+#     Claude 4.6+/5 models are served ONLY through `global.*` cross-region
+#     inference profiles (verified against the live catalog 2026-08-12); the
+#     apac.* profile family stops at legacy Sonnet 4.
+#   mantle : the Anthropic Messages API endpoint (AnthropicBedrockMantle,
+#     bedrock-mantle.<region>.api.aws). Separate quota pool (no RPM caps,
+#     cached reads free against input TPM) but needs bedrock-mantle:* IAM.
+BEDROCK_REGION = os.getenv("BEDROCK_REGION") or os.getenv("AWS_REGION") or "ap-south-1"
+BEDROCK_CLAUDE_ENDPOINT = os.getenv("BEDROCK_CLAUDE_ENDPOINT", "runtime").lower()
+# Inference-profile prefix for the runtime endpoint. "global" is the only
+# family serving Claude 4.6+/5 from ap-south-1; "" would use in-region ids.
+BEDROCK_CLAUDE_PROFILE = os.getenv("BEDROCK_CLAUDE_PROFILE", "global")
+# Mantle has its own region catalog: Claude 4.5+ is served from us-east-1 but
+# NOT from ap-south-1 (404s, verified 2026-08-12) — so the mantle client gets
+# its own region default instead of inheriting BEDROCK_REGION.
+BEDROCK_MANTLE_REGION = os.getenv("BEDROCK_MANTLE_REGION", "us-east-1")
+
+# ── Client-side RPM pacing for Bedrock (per-model sliding window) ────────────
+# The account's applied Bedrock quotas are clamped to 10 requests/min per model
+# (AWS default is 10,000; increase requested 2026-08-12, case open). Unpaced,
+# market-hours bursts terminally 429 ~40% of Haiku calls even after the SDK's
+# retries. The pacer makes calls QUEUE instead of FAIL: each process holds a
+# per-model sliding one-minute window and delays a call until a slot frees.
+# Accuracy-over-latency is standing policy — a late extraction beats a blank one.
+#
+# BEDROCK_RPM_LIMIT            per-process, per-model budget (0 = pacing off).
+# BEDROCK_RPM_LIMIT_<SNAKE>    per-model override, e.g.
+#                              BEDROCK_RPM_LIMIT_CLAUDE_SONNET_4_6=8.
+# Budgets are set PER SERVICE in docker-compose so the fleet sums under the
+# account quota. Retries the SDK issues inside one create() call bypass the
+# pacer, so keep the fleet sum a notch below the quota. Remove/raise the
+# budgets when the quota increase lands.
+BEDROCK_RPM_LIMIT = int(os.getenv("BEDROCK_RPM_LIMIT", "0"))
+# If a slot hasn't freed after this long, proceed anyway and let the SDK's
+# retry ladder fight for it — pacing must never deadlock the pipeline.
+BEDROCK_PACING_MAX_WAIT_S = float(os.getenv("BEDROCK_PACING_MAX_WAIT_S", "240"))
+
+_pacer_lock = threading.Lock()
+_pacer_windows: Dict[str, "collections.deque[float]"] = {}
+
+
+def _bedrock_rpm_limit(model: str) -> int:
+    override = os.getenv("BEDROCK_RPM_LIMIT_" + re.sub(r"[^A-Za-z0-9]", "_", model).upper())
+    return int(override) if override else BEDROCK_RPM_LIMIT
+
+
+def _pacer_reserve(model: str, limit: int) -> float:
+    """Try to claim a slot in `model`'s one-minute window.
+
+    Returns 0.0 if claimed, else seconds until the oldest slot expires.
+    """
+    now = time.monotonic()
+    with _pacer_lock:
+        window = _pacer_windows.setdefault(model, collections.deque())
+        while window and now - window[0] >= 60.0:
+            window.popleft()
+        if len(window) < limit:
+            window.append(now)
+            return 0.0
+        return max(0.05, 60.0 - (now - window[0]))
+
+
+def _bedrock_pace_sync(model: str) -> None:
+    limit = _bedrock_rpm_limit(model)
+    if limit <= 0:
+        return
+    deadline = time.monotonic() + BEDROCK_PACING_MAX_WAIT_S
+    while True:
+        wait = _pacer_reserve(model, limit)
+        if wait == 0.0:
+            return
+        if time.monotonic() + wait > deadline:
+            logger.warning("bedrock pacer: %s waited %ss without a slot — "
+                           "proceeding unpaced", model, int(BEDROCK_PACING_MAX_WAIT_S))
+            return
+        time.sleep(wait)
+
+
+async def _bedrock_pace_async(model: str) -> None:
+    limit = _bedrock_rpm_limit(model)
+    if limit <= 0:
+        return
+    deadline = time.monotonic() + BEDROCK_PACING_MAX_WAIT_S
+    while True:
+        wait = _pacer_reserve(model, limit)
+        if wait == 0.0:
+            return
+        if time.monotonic() + wait > deadline:
+            logger.warning("bedrock pacer: %s waited %ss without a slot — "
+                           "proceeding unpaced", model, int(BEDROCK_PACING_MAX_WAIT_S))
+            return
+        await asyncio.sleep(wait)
 
 # Gemini emits structured function calls less token-efficiently than Claude — a
 # complex tool schema can truncate to MALFORMED_FUNCTION_CALL at small budgets
@@ -107,7 +218,11 @@ def provider_for_model(model: str) -> str:
     if m.startswith("gemini"):
         return "gemini-vertex"
     if m.startswith("claude"):
-        return "anthropic" if CLAUDE_BACKEND == "anthropic" else "anthropic-vertex"
+        if CLAUDE_BACKEND == "anthropic":
+            return "anthropic"
+        if CLAUDE_BACKEND == "bedrock":
+            return "anthropic-bedrock"
+        return "anthropic-vertex"
     raise ValueError(f"Unrecognized model id (no provider mapping): {model!r}")
 
 
@@ -125,6 +240,42 @@ def to_vertex_claude_id(model: str) -> str:
     if m:
         return f"{m.group(1)}@{m.group(2)}"
     return model
+
+
+def to_bedrock_claude_id(model: str) -> str:
+    """
+    Map a console Claude id to its Bedrock id (verified against the live
+    ap-south-1 catalog, 2026-08-12).
+
+    runtime endpoint (dated ids carry Bedrock's -v1:0 suffix; 4.6+/5 ids are bare):
+      'claude-haiku-4-5-20251001' -> 'global.anthropic.claude-haiku-4-5-20251001-v1:0'
+      'claude-sonnet-4-6'         -> 'global.anthropic.claude-sonnet-4-6'
+      'claude-sonnet-5'           -> 'global.anthropic.claude-sonnet-5'
+    mantle endpoint (bare undated ids, no profile prefix):
+      'claude-haiku-4-5-20251001' -> 'anthropic.claude-haiku-4-5'
+    An explicit override may be supplied via BEDROCK_MODEL_<UPPER_SNAKE> env;
+    ids already carrying a provider/profile prefix pass through unchanged.
+    """
+    override = os.getenv("BEDROCK_MODEL_" + re.sub(r"[^A-Za-z0-9]", "_", model).upper())
+    if override:
+        return override
+    if re.match(r"^(global|us|eu|apac|au|jp|anthropic)\.", model):
+        return model
+    dated = re.match(r"^(claude-[a-z]+-\d+(?:-\d+)?)-(\d{8})$", model)
+    if BEDROCK_CLAUDE_ENDPOINT == "mantle":
+        return f"anthropic.{dated.group(1)}" if dated else f"anthropic.{model}"
+    base = f"anthropic.{dated.group(1)}-{dated.group(2)}-v1:0" if dated else f"anthropic.{model}"
+    return f"{BEDROCK_CLAUDE_PROFILE}.{base}" if BEDROCK_CLAUDE_PROFILE else base
+
+
+# Claude 5-family models reject sampling params (temperature/top_p/top_k) with
+# a 400; the 4.x family still accepts temperature. Matches e.g. claude-opus-5,
+# claude-sonnet-5, claude-fable-5 — not claude-haiku-4-5.
+_CLAUDE5_RE = re.compile(r"^claude-[a-z]+-([5-9]|\d{2,})(?:$|[.-])")
+
+
+def _is_claude5(model: str) -> bool:
+    return bool(_CLAUDE5_RE.match((model or "").lower()))
 
 
 # ── Normalized response (Anthropic-shaped) ───────────────────────────────────
@@ -187,23 +338,44 @@ class LLMResponse:
         return None
 
 
-# ── Anthropic providers (Vertex + console) ───────────────────────────────────
+# ── Anthropic providers (Vertex + Bedrock + console) ─────────────────────────
 
-def _anthropic_client(async_: bool, vertex: bool):
+def _anthropic_client(async_: bool, provider: str):
     import anthropic
-    if vertex:
+    if provider == "anthropic-vertex":
         cls = anthropic.AsyncAnthropicVertex if async_ else anthropic.AnthropicVertex
         return cls(project_id=VERTEX_PROJECT, region=VERTEX_CLAUDE_REGION,
                    timeout=LLM_CALL_TIMEOUT_S)
+    if provider == "anthropic-bedrock":
+        # AWS credential chain (instance role in prod) — no key material here.
+        # The SDK retries throttling (429) / 5xx with exponential backoff; the
+        # account's 10 RPM default quota needs more headroom than the SDK's
+        # default of 2 retries during market-hours bursts (raise via env or a
+        # Service Quotas increase, whichever lands first).
+        if BEDROCK_CLAUDE_ENDPOINT == "mantle":
+            cls = (anthropic.AsyncAnthropicBedrockMantle if async_
+                   else anthropic.AnthropicBedrockMantle)
+            region = BEDROCK_MANTLE_REGION
+        else:
+            cls = anthropic.AsyncAnthropicBedrock if async_ else anthropic.AnthropicBedrock
+            region = BEDROCK_REGION
+        return cls(aws_region=region, timeout=LLM_CALL_TIMEOUT_S,
+                   max_retries=int(os.getenv("BEDROCK_MAX_RETRIES", "5")))
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     cls = anthropic.AsyncAnthropic if async_ else anthropic.Anthropic
     return cls(api_key=api_key, timeout=LLM_CALL_TIMEOUT_S)
 
 
-def _anthropic_kwargs(model: str, vertex: bool, max_tokens: int, system, messages,
+def _anthropic_kwargs(model: str, provider: str, max_tokens: int, system, messages,
                       tools, tool_choice, temperature) -> Dict[str, Any]:
+    if provider == "anthropic-vertex":
+        mapped = to_vertex_claude_id(model)
+    elif provider == "anthropic-bedrock":
+        mapped = to_bedrock_claude_id(model)
+    else:
+        mapped = model
     kwargs: Dict[str, Any] = {
-        "model": to_vertex_claude_id(model) if vertex else model,
+        "model": mapped,
         "max_tokens": max_tokens,
         "messages": messages,
     }
@@ -214,7 +386,14 @@ def _anthropic_kwargs(model: str, vertex: bool, max_tokens: int, system, message
     if tool_choice is not None:
         kwargs["tool_choice"] = tool_choice
     if temperature is not None:
-        kwargs["temperature"] = temperature
+        if _is_claude5(model):
+            # Claude 5 models 400 on sampling params. The 0.0/0.4 retry ladders
+            # in transcript_* exist to escape Gemini flakes; drop the param
+            # rather than fail the call, and log so the ladder can be retired.
+            logger.warning("dropping temperature=%s for Claude 5 model %s "
+                           "(sampling params rejected by the API)", temperature, model)
+        else:
+            kwargs["temperature"] = temperature
     return kwargs
 
 
@@ -488,11 +667,12 @@ def complete(
 ) -> LLMResponse:
     """Synchronous completion. Routes to the provider for `model`."""
     provider = provider_for_model(model)
-    if provider in ("anthropic-vertex", "anthropic"):
-        vertex = provider == "anthropic-vertex"
-        client = _anthropic_client(async_=False, vertex=vertex)
-        kwargs = _anthropic_kwargs(model, vertex, max_tokens, system, messages,
+    if provider in ("anthropic-vertex", "anthropic-bedrock", "anthropic"):
+        client = _anthropic_client(async_=False, provider=provider)
+        kwargs = _anthropic_kwargs(model, provider, max_tokens, system, messages,
                                    tools, tool_choice, temperature)
+        if provider == "anthropic-bedrock":
+            _bedrock_pace_sync(model)
         return _wrap_anthropic_response(client.messages.create(**kwargs), model, provider)
     # gemini-vertex
     contents, cfg = _gemini_translate(system, messages, tools, tool_choice,
@@ -517,11 +697,12 @@ async def acomplete(
 ) -> LLMResponse:
     """Async completion. Routes to the provider for `model`."""
     provider = provider_for_model(model)
-    if provider in ("anthropic-vertex", "anthropic"):
-        vertex = provider == "anthropic-vertex"
-        client = _anthropic_client(async_=True, vertex=vertex)
-        kwargs = _anthropic_kwargs(model, vertex, max_tokens, system, messages,
+    if provider in ("anthropic-vertex", "anthropic-bedrock", "anthropic"):
+        client = _anthropic_client(async_=True, provider=provider)
+        kwargs = _anthropic_kwargs(model, provider, max_tokens, system, messages,
                                    tools, tool_choice, temperature)
+        if provider == "anthropic-bedrock":
+            await _bedrock_pace_async(model)
         resp = await _await_budget(client.messages.create(**kwargs),
                                    model=model, what="anthropic.messages.create")
         return _wrap_anthropic_response(resp, model, provider)
@@ -560,12 +741,13 @@ def _extract_sources(resp) -> List[str]:
 
 
 def _is_rate_limited(e: Exception) -> bool:
-    """True if an exception is a Vertex 429 / RESOURCE_EXHAUSTED rate limit."""
+    """True if an exception is a rate limit — Vertex 429 / RESOURCE_EXHAUSTED
+    or Bedrock ThrottlingException."""
     code = getattr(e, "code", None) or getattr(e, "status_code", None)
     if code == 429:
         return True
     s = str(e).upper()
-    return "RESOURCE_EXHAUSTED" in s or "429" in s
+    return "RESOURCE_EXHAUSTED" in s or "429" in s or "THROTTLING" in s
 
 
 # Google-Search grounding has its own (low) per-minute Vertex quota, separate
@@ -608,18 +790,89 @@ def _log_grounding_cost(model: str, usage: "LLMUsage", latency_ms: float) -> Non
         logger.warning("grounding cost-log emit failed: %s", str(e)[:200])
 
 
+def _nova_grounding_call(query: str, max_tokens: int) -> Dict[str, Any]:
+    """One synchronous Nova web-grounding call (Bedrock Converse, US CRIS).
+
+    Returns {"text", "sources", "_usage"}. Raises on error — retry/degrade
+    policy lives in grounded_search. boto3 arrives via the anthropic[bedrock]
+    extra, so every image with the wrapper's Bedrock path can run this.
+    """
+    import boto3
+    from botocore.config import Config
+    client = boto3.client(
+        "bedrock-runtime", region_name=NOVA_GROUNDING_REGION,
+        config=Config(read_timeout=LLM_CALL_TIMEOUT_S, connect_timeout=10,
+                      retries={"max_attempts": 0}),  # retry policy is ours, not botocore's
+    )
+    resp = client.converse(
+        modelId=NOVA_GROUNDING_MODEL,
+        messages=[{"role": "user", "content": [{"text": query}]}],
+        toolConfig={"tools": [{"systemTool": {"name": "nova_grounding"}}]},
+        inferenceConfig={"maxTokens": max_tokens},
+    )
+    text, sources = "", []
+    for c in resp["output"]["message"]["content"]:
+        if "text" in c:
+            text += c["text"]
+        cc = c.get("citationsContent")
+        blocks = cc if isinstance(cc, list) else ([cc] if cc else [])
+        for blk in blocks:
+            for cit in (blk.get("citations") or []) if isinstance(blk, dict) else []:
+                url = ((cit.get("location") or {}).get("web") or {}).get("url")
+                if url and url not in sources:
+                    sources.append(url)
+    u = resp.get("usage", {})
+    usage = LLMUsage(input_tokens=u.get("inputTokens", 0),
+                     output_tokens=u.get("outputTokens", 0))
+    return {"text": text, "sources": sources, "_usage": usage}
+
+
 async def grounded_search(
     query: str, *, model: Optional[str] = None, max_tokens: int = 2048,
 ) -> Dict[str, Any]:
-    """Google-Search-grounded answer for `query` via Gemini on Vertex.
+    """Web-grounded answer for `query` — the backend behind the agents'
+    `web_search` function tool, selected by GROUNDING_BACKEND (gemini | nova).
 
-    Backs the dossier agent's `web_search` *function* tool. Google Search
-    grounding cannot be mixed with function declarations in one request, so this
-    is a standalone grounded call with NO tools other than `google_search`.
     Returns ``{"text": str, "sources": [url, ...]}``. On a persistent rate limit
-    it degrades gracefully to an ``error`` dict so the agent proceeds without it
-    rather than crashing.
+    or timeout it degrades gracefully to an ``error`` dict so the agent proceeds
+    on DB-grounded data rather than crashing. Both backends log one cost record
+    per call as stage='dossier_grounding' with web_search_calls=1 (any per-query
+    grounding fee is not in compute_cost — the counter makes it applicable later).
     """
+    if GROUNDING_BACKEND == "nova":
+        for attempt in range(GROUNDING_MAX_RETRIES):
+            try:
+                _g0 = time.monotonic()
+                out = await _await_budget(
+                    asyncio.to_thread(_nova_grounding_call, query, max_tokens),
+                    model=NOVA_GROUNDING_MODEL, what="grounded_search[nova]")
+                usage = out.pop("_usage")
+                _log_grounding_cost(NOVA_GROUNDING_MODEL, usage,
+                                    (time.monotonic() - _g0) * 1000)
+                return out
+            except TimeoutError as e:
+                logger.warning("grounded_search[nova] timed out; degrading gracefully: %s",
+                               str(e)[:200])
+                return {"text": "", "sources": [],
+                        "error": "web_search timed out — proceed using DB-grounded data; "
+                                 "do not retry this query immediately."}
+            except Exception as e:
+                if not _is_rate_limited(e):
+                    raise
+                if attempt == GROUNDING_MAX_RETRIES - 1:
+                    logger.warning("grounded_search[nova] throttled after %d attempts; "
+                                   "degrading gracefully: %s", GROUNDING_MAX_RETRIES, str(e)[:200])
+                    return {"text": "", "sources": [],
+                            "error": "web_search temporarily rate-limited — proceed using "
+                                     "DB-grounded data; do not retry this query immediately."}
+                delay = 2.0 * (2 ** attempt)  # deterministic backoff: 2s, 4s, 8s
+                logger.info("grounded_search[nova] throttled; backing off %.0fs (attempt %d/%d)",
+                            delay, attempt + 1, GROUNDING_MAX_RETRIES)
+                await asyncio.sleep(delay)
+
+    # gemini backend: Google Search grounding on Vertex. Grounding cannot be
+    # mixed with function declarations in one request, so this is a standalone
+    # grounded call with NO tools other than `google_search`.
     from google.genai import types
 
     model = model or GROUNDING_MODEL

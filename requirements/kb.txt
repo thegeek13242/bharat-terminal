@@ -27,6 +27,11 @@ websocket-client==1.8.0
 # Event-memory index: Vertex embeddings (llm/embeddings.py) + Gemini digest
 # synthesis (kb/memory/digest.py) run inside the kb / kb-monitor services.
 # [vertex] pulls google-auth for ADC. Digest defaults to a Gemini model, so only
-# google-genai is needed (a Claude digest model would also need anthropic[vertex]).
+# google-genai is needed (embeddings + any Gemini-backed stage).
 google-genai>=1.21,<2   # Gemini 3 tool loops REQUIRE Part.thought_signature
+# Claude-backed stages in kb-monitor / transcript-watcher (dossier refresh,
+# memory digest, transcript structuring) go through llm/wrapper.py, which
+# imports the anthropic SDK lazily — the dependency MUST be in this image or
+# the first claude-* call fails at runtime (2026-08-03 incident class).
+anthropic[bedrock]>=0.121,<1
 pypdf==6.11.0            # concall transcript extraction (transcript_sync — full text, no clipping)

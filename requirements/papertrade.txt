@@ -15,6 +15,6 @@ redis==5.0.8
 aiohttp==3.9.3
 # C0 commentary extraction via the bharat_terminal.llm wrapper (Vertex ADC,
 # same pins as requirements/analysis.txt).
-anthropic[vertex]>=0.40,<1
+anthropic[vertex,bedrock]>=0.121,<1  # bedrock extra: boto3 for AWS IAM auth; >=0.121 for AnthropicBedrockMantle
 google-genai>=1.21,<2   # Gemini 3 tool loops REQUIRE Part.thought_signature
 

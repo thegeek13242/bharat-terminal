@@ -142,7 +142,7 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "name": "web_search",
         "description": (
-            "Google-grounded web search. ONLY for context our database cannot "
+            "Web-search-grounded lookup. ONLY for context our database cannot "
             "hold (industry news, competitor moves, regulation). Never for "
             "our companies' financials, prices, guidance, or transcripts — "
             "those come from the database tools and are authoritative."

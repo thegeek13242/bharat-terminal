@@ -62,11 +62,21 @@ class LLMCallRecord:
         if not self.timestamp:
             self.timestamp = datetime.now(timezone.utc).isoformat()
 
-# Pricing per 1M tokens (as of early 2025)
+# Pricing per 1M tokens. Keys are the ids stages pass to llm.acomplete (bare
+# console-form Claude ids — the wrapper maps to Bedrock/Vertex ids internally).
+# Claude rows = Bedrock/Anthropic list prices verified 2026-08-11 (Sonnet 5's
+# $2/$10 intro pricing made permanent by Anthropic 2026-08-10).
 MODEL_PRICING = {
-    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00},
+    "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
+    "claude-sonnet-5": {"input": 2.00, "output": 10.00},
+    "claude-opus-5": {"input": 5.00, "output": 25.00},
+    "claude-opus-4-8": {"input": 5.00, "output": 25.00},
+    # Amazon Nova on Bedrock (web-grounding backend; per-query grounding fee
+    # is billed separately by AWS and is not in compute_cost)
+    "us.amazon.nova-2-lite-v1:0": {"input": 0.30, "output": 2.50},
     # Gemini on Vertex (approx list price per 1M tokens)
+    "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
     "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
     "gemini-3.5-flash": {"input": 0.30, "output": 2.50},
     "gemini-3.1-pro-preview": {"input": 1.25, "output": 5.00},

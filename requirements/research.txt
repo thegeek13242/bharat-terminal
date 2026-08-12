@@ -1,6 +1,6 @@
 pydantic>=2.6,<3
 # [vertex] pulls google-auth for Vertex AI (AnthropicVertex) ADC auth
-anthropic[vertex]>=0.40,<1
+anthropic[vertex,bedrock]>=0.121,<1  # bedrock extra: boto3 for AWS IAM auth; >=0.121 for AnthropicBedrockMantle
 # Gemini on Vertex AI
 google-genai>=1.21,<2   # Gemini 3 tool loops REQUIRE Part.thought_signature
 httpx>=0.27,<1

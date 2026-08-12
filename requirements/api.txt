@@ -15,4 +15,8 @@ requests==2.32.3  # google.auth.transport.requests needs it to fetch Google's si
 # Transcript semantic search (/transcripts/search): query embedding via
 # google-genai (Vertex, see llm/embeddings.py) + pgvector for kb.models import.
 google-genai>=1.21,<2    # Gemini 3 tool loops REQUIRE Part.thought_signature replay
+# api-gateway runs research-chat (chat_engine -> llm/wrapper.py), which imports
+# the anthropic SDK lazily — without this, a claude-* RESEARCH_CHAT_MODEL fails
+# at request time inside bharat-api (2026-08-03 incident class).
+anthropic[bedrock]>=0.121,<1
 pgvector==0.2.5
