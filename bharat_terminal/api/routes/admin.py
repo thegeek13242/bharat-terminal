@@ -53,6 +53,11 @@ REDPANDA_METRICS_URL = os.getenv(
 EXPECTED_HEARTBEATS = (
     "analysis", "papertrade", "ingestion", "kb-monitor",
     "sentiment", "commodity", "transcript-watcher", "onboarding",
+    # Per-LOOP cycle stamps inside kb-monitor (monitor._cycle_beat): the
+    # service beat above is a dedicated task and keeps beating while a hung
+    # sibling coroutine goes quiet (2026-08-13 memory_index stall). These
+    # expire ~3 missed cycles after a loop stops completing.
+    "kb-monitor:memory_index", "kb-monitor:memory_digest",
 )
 
 _WINDOWS = {"1h": "1 hour", "24h": "24 hours", "7d": "7 days", "30d": "30 days"}

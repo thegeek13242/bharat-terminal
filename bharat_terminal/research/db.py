@@ -38,6 +38,15 @@ DATABASE_URL = os.getenv(
     "postgresql+asyncpg://bharat:bharat@postgres:5432/bharat_terminal",
 )
 
+# Per-statement ceiling. asyncpg has NO default command timeout, so a query on
+# a connection that dies mid-flight (pool_pre_ping only guards CHECKOUT) awaits
+# forever with no exception, no log, and no server-side trace — kb-monitor's
+# memory_index loop hung exactly this way for 14h on 2026-08-13. With the
+# ceiling the await raises, the loop's except logs it, and the next cycle
+# recovers on a fresh connection. Biggest legitimate statement observed (the
+# 120-day impact_reports scan) runs ~25s; 120s is 5x headroom.
+DB_COMMAND_TIMEOUT_S = float(os.getenv("DB_COMMAND_TIMEOUT_S", "120"))
+
 _engine = None
 _sessionmaker: Optional[async_sessionmaker[AsyncSession]] = None
 
@@ -45,7 +54,10 @@ _sessionmaker: Optional[async_sessionmaker[AsyncSession]] = None
 def _get_sessionmaker() -> async_sessionmaker[AsyncSession]:
     global _engine, _sessionmaker
     if _sessionmaker is None:
-        _engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+        _engine = create_async_engine(
+            DATABASE_URL, echo=False, pool_pre_ping=True, pool_recycle=1800,
+            connect_args={"command_timeout": DB_COMMAND_TIMEOUT_S},
+        )
         _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
     return _sessionmaker
 

@@ -48,6 +48,11 @@ def create_async_session() -> async_sessionmaker[AsyncSession]:
         # A now long-lived shared pool must not hand out connections the
         # server has already dropped.
         pool_recycle=1800, pool_pre_ping=True,
+        # Per-statement ceiling: asyncpg has no default command timeout, so a
+        # connection dying MID-QUERY hangs its awaiting coroutine forever and
+        # silently (2026-08-13 memory_index stall). Bounded = fails loudly.
+        connect_args={"command_timeout":
+                      float(os.getenv("DB_COMMAND_TIMEOUT_S", "120"))},
     )
     factory = async_sessionmaker(engine, class_=AsyncSession,
                                  expire_on_commit=False)

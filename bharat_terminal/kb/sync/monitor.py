@@ -539,6 +539,19 @@ class Monitor:
                 except Exception as e:
                     logger.error(f"[results_eval] Failed: {e}", exc_info=True)
 
+    async def _cycle_beat(self, loop_name: str, ttl_s: int) -> None:
+        """Per-loop last-completed-cycle stamp (hb:kb-monitor:<loop>).
+
+        The service-level heartbeat is a dedicated task, so it keeps beating
+        while a SIBLING coroutine is silently hung — which is exactly how the
+        2026-08-13 memory_index stall (dead DB connection, unbounded await)
+        hid behind a green /admin/health for 14h. A cycle stamp with a TTL of
+        ~3 intervals expires when the loop stops completing cycles and shows
+        as stalled. Stamped after every cycle, INCLUDING failed ones — an
+        erroring loop is alive and already logs; only a hang goes quiet."""
+        from bharat_terminal.heartbeat import abeat
+        await abeat(f"kb-monitor:{loop_name}", ttl_s)
+
     async def memory_index_refresh(self):
         """Keep the derived `memory_items` event index fresh: incremental refresh
         of the recent window (embeds only new/changed events) + a retention prune.
@@ -552,6 +565,7 @@ class Monitor:
                 await memory_index.prune()
             except Exception as e:
                 logger.error(f"[memory_index] refresh failed: {e}", exc_info=True)
+            await self._cycle_beat("memory_index", ttl_s=interval * 3)
             if not await self._sleep_seconds(interval):
                 break
 
@@ -569,6 +583,7 @@ class Monitor:
                 await digest.refresh_all()
             except Exception as e:
                 logger.error(f"[memory_digest] refresh failed: {e}", exc_info=True)
+            await self._cycle_beat("memory_digest", ttl_s=interval * 3)
             if not await self._sleep_seconds(interval):
                 break
 
