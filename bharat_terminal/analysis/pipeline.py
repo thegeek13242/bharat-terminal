@@ -37,6 +37,16 @@ class PipelineState(TypedDict):
     """State passed between pipeline stages."""
     news_item: NewsItem
     pipeline_start_time: float
+    # Stable id for THIS pipeline run's report. Fixed at entry (not in
+    # finalize) so a market-hours skeleton, the final report, and a late
+    # summary update all share one id — downstream upserts key on it.
+    report_id: str
+    # Optional async publish callback (main.py passes publisher.publish).
+    # When set, the PIPELINE owns every publish for this run — the skeleton,
+    # the final report, and the late summary update — so their relative order
+    # on the topic is guaranteed. When None (batch path), the caller
+    # publishes the returned report itself, exactly as before.
+    on_partial: Optional[Any]
 
     # Stage 1 outputs
     relevant: bool
@@ -95,8 +105,34 @@ async def filing_summary_node(state: PipelineState) -> PipelineState:
     (1-3s+) runs in parallel with stages 2-3 and is joined in finalize.
 
     Fail-soft: any rejection/error yields summary None — a missing summary is
-    fine, a wrong one is not (accuracy gate inside summarize_filing)."""
+    fine, a wrong one is not (accuracy gate inside summarize_filing).
+
+    Also the progressive-delivery emit point: this is the first node after
+    relevance passes, so during market hours a skeleton "analysing" report
+    goes out here — the filing hits the user's tape seconds after detection,
+    ~10s before impact scoring completes. Impacts are empty, so nothing about
+    it is signal-eligible (papertrade gates on company_impacts)."""
     ni = state["news_item"]
+    if state.get("on_partial") is not None and is_market_hours():
+        skeleton = ImpactReport(
+            id=state["report_id"],
+            news_id=ni.id,
+            news_item=ni,
+            relevant=True,
+            confidence=state["relevance_confidence"],
+            macro_theme=None,
+            affected_sectors=[],
+            company_impacts=[],
+            trade_signals=[],
+            processing_latency_ms=(time.time() - state["pipeline_start_time"]) * 1000,
+            created_at=datetime.now(timezone.utc),
+            analysis_status="analysing",
+        )
+        try:
+            await state["on_partial"](skeleton)
+        except Exception as e:  # never let tape delivery break the analysis
+            logger.warning(f"[progressive] skeleton publish failed for {ni.id}: {e}")
+
     if ni.source not in FILING_SOURCES or ni.summary:
         return state
     task = asyncio.create_task(
@@ -200,18 +236,60 @@ async def stage5_node(state: PipelineState) -> PipelineState:
     return {**state, "trade_signals": signals}
 
 
+# Late-summary attach tasks (market-hours signal-first path). Strong refs so
+# the tasks aren't GC'd mid-flight; bounded by SUMMARY_JOIN_TIMEOUT_S each.
+_summary_update_tasks: set = set()
+
+
+async def _attach_summary_later(report: ImpactReport, task, on_partial) -> None:
+    """Await the still-running filing summary and re-publish the report with it
+    (same report id, update_seq+1). Downstream upserts by id; the summary can
+    only be ADDED by this event, never removed (relay COALESCEs), so even a
+    mis-ordered consumer cannot lose it."""
+    try:
+        summary = await asyncio.wait_for(task, timeout=SUMMARY_JOIN_TIMEOUT_S)
+    except Exception as e:
+        logger.info(f"[filing_summary] late join failed/timed out (no summary): {e}")
+        return
+    if not summary:
+        return
+    updated = report.model_copy(update={
+        "news_item": report.news_item.model_copy(update={"summary": summary}),
+        "update_seq": report.update_seq + 1,
+    })
+    try:
+        await on_partial(updated)
+        logger.info(f"[filing_summary] late summary attached (report {report.id}, "
+                    f"update_seq={updated.update_seq})")
+    except Exception as e:
+        logger.warning(f"[filing_summary] late summary publish failed: {e}")
+
+
 async def finalize_node(state: PipelineState) -> PipelineState:
-    """Assemble final ImpactReport (joining the parallel summary task first)."""
+    """Assemble final ImpactReport (joining the parallel summary task first).
+
+    Market-hours signal-first (2026-08-13): when a publish callback is set and
+    the summary is still running, the report is NOT held back for the join —
+    the scored impacts publish immediately (they are what papertrade and the
+    tape react to) and the summary attaches via a follow-up update event. The
+    old blocking join (up to SUMMARY_JOIN_TIMEOUT_S on the tail) remains the
+    off-hours/batch behaviour, where latency is not a concern.
+    """
     news_item = state["news_item"]
+    on_partial = state.get("on_partial")
     task = state.get("summary_task")
+    late_summary_task = None
     if task is not None:
-        try:
-            summary = await asyncio.wait_for(task, timeout=SUMMARY_JOIN_TIMEOUT_S)
-            if summary:
-                news_item = news_item.model_copy(update={"summary": summary})
-        except Exception as e:
-            # Includes TimeoutError (task cancelled by wait_for) — no summary.
-            logger.info(f"[filing_summary] join failed/timed out (no summary): {e}")
+        if task.done() or on_partial is None or not is_market_hours():
+            try:
+                summary = await asyncio.wait_for(task, timeout=SUMMARY_JOIN_TIMEOUT_S)
+                if summary:
+                    news_item = news_item.model_copy(update={"summary": summary})
+            except Exception as e:
+                # Includes TimeoutError (task cancelled by wait_for) — no summary.
+                logger.info(f"[filing_summary] join failed/timed out (no summary): {e}")
+        else:
+            late_summary_task = task  # publish first, attach summary after
 
     elapsed_ms = (time.time() - state["pipeline_start_time"]) * 1000
 
@@ -221,7 +299,7 @@ async def finalize_node(state: PipelineState) -> PipelineState:
         logger.info(f"Pipeline completed in {elapsed_ms:.0f}ms for {state['news_item'].id}")
 
     report = ImpactReport(
-        id=str(uuid.uuid4()),
+        id=state["report_id"],
         news_id=news_item.id,
         news_item=news_item,
         relevant=state["relevant"],
@@ -239,14 +317,25 @@ async def finalize_node(state: PipelineState) -> PipelineState:
         created_at=datetime.now(timezone.utc),
     )
 
+    if on_partial is not None:
+        # Pipeline-owned publish: awaiting here (not in the caller) guarantees
+        # the late summary update — whose task is created below — can never
+        # reach the topic before the final report it updates.
+        await on_partial(report)
+        if late_summary_task is not None:
+            t = asyncio.create_task(
+                _attach_summary_later(report, late_summary_task, on_partial))
+            _summary_update_tasks.add(t)
+            t.add_done_callback(_summary_update_tasks.discard)
+
     return {**state, "impact_report": report}
 
 
-def skip_node(state: PipelineState) -> PipelineState:
+async def skip_node(state: PipelineState) -> PipelineState:
     """For irrelevant news: build minimal ImpactReport and skip LLM stages."""
     elapsed_ms = (time.time() - state["pipeline_start_time"]) * 1000
     report = ImpactReport(
-        id=str(uuid.uuid4()),
+        id=state["report_id"],
         news_id=state["news_item"].id,
         news_item=state["news_item"],
         relevant=False,
@@ -258,6 +347,10 @@ def skip_node(state: PipelineState) -> PipelineState:
         processing_latency_ms=elapsed_ms,
         created_at=datetime.now(timezone.utc),
     )
+    if state.get("on_partial") is not None:
+        # Pipeline-owned publish (see finalize_node) — irrelevant reports are
+        # persisted but never broadcast, same as before.
+        await state["on_partial"](report)
     return {**state, "impact_report": report}
 
 
@@ -310,13 +403,23 @@ def get_pipeline():
     return _pipeline
 
 
-async def process_news_item(news_item: NewsItem) -> ImpactReport:
-    """Process a single news item through the full pipeline."""
+async def process_news_item(news_item: NewsItem,
+                            on_partial=None) -> ImpactReport:
+    """Process a single news item through the full pipeline.
+
+    on_partial: optional async callback taking an ImpactReport. When given,
+    the pipeline publishes every event for this run through it — market-hours
+    skeleton, final report, late summary update — and the CALLER MUST NOT
+    publish the returned report again. When None (batch path), behaviour is
+    unchanged: the caller publishes the returned report.
+    """
     pipeline = get_pipeline()
 
     initial_state = PipelineState(
         news_item=news_item,
         pipeline_start_time=time.time(),
+        report_id=str(uuid.uuid4()),
+        on_partial=on_partial,
         relevant=False,
         relevance_confidence=0.0,
         relevance_reason="",

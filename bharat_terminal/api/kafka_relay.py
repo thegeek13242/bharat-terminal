@@ -95,15 +95,28 @@ async def _relay_loop():
 
 
 async def _handle_report(report: dict):
-    """Persist to Redis + DB, then broadcast to WebSocket clients."""
+    """Persist to Redis + DB, then broadcast to WebSocket clients.
+
+    Progressive delivery (2026-08-13): one report id may arrive several times —
+    a market-hours "analysing" skeleton, then the "complete" scored report,
+    then a late summary attach (update_seq=1). Events for one report ride one
+    partition (keyed by news_id), so this consumer sees them in publish order
+    and plain last-write-wins upserts are correct. analysis_audit stays
+    append-only: partials never touch it, and the first complete event wins.
+    """
     news_id = report.get("news_id", "")
     relevant = report.get("relevant", True)
     news_item: dict = report.get("news_item", {})
+    is_partial = report.get("analysis_status", "complete") == "analysing"
+    is_update = bool(report.get("update_seq", 0))
 
     # ── 1. Redis: cache news item in sorted set ────────────────────────────
     redis = await _get_redis()
     try:
-        if news_item and news_id:
+        # Only the FIRST complete event adds to news:recent — zadd members are
+        # whole-json, so re-adding a variant (partial without extraction, or
+        # update with summary) would duplicate the item in the feed cache.
+        if news_item and news_id and not is_partial and not is_update:
             # Score = unix timestamp for time-range queries
             ts_raw = news_item.get("timestamp_utc", "")
             try:
@@ -130,7 +143,8 @@ async def _handle_report(report: dict):
 
     # ── 3. PostgreSQL: durable storage ────────────────────────────────────
     try:
-        await _persist_to_db(report, news_item, news_id)
+        await _persist_to_db(report, news_item, news_id,
+                             is_partial=is_partial)
     except Exception as e:
         # Repeated persist failures = the feed is silently not being stored
         # (DB down / schema drift). Alert when it happens consistently.
@@ -140,6 +154,8 @@ async def _handle_report(report: dict):
     # ── 4. WebSocket broadcast ────────────────────────────────────────────
     if not relevant:
         return  # Don't clutter the feed with irrelevant noise
+    # Partials and updates broadcast too — the frontend updates the feed item
+    # in place by report id (analysis_status/update_seq ride in the payload).
 
     # Trade signals are internal eval telemetry — persisted above, but never
     # broadcast to browsers (SEBI RA scope).
@@ -152,10 +168,15 @@ async def _handle_report(report: dict):
     await manager.broadcast(event)
 
 
-async def _persist_to_db(report: dict, news_item: dict, news_id: str):
+async def _persist_to_db(report: dict, news_item: dict, news_id: str,
+                         is_partial: bool = False):
     session_factory = get_session_factory()
     async with session_factory() as session:
-        # Insert news item (ignore duplicates)
+        # Insert news item. A skeleton event creates the row first (WITHOUT a
+        # summary — the summary doesn't exist yet), so the conflict branch must
+        # let a later event FILL the summary without ever clearing one: the
+        # old DO NOTHING would have frozen summary at NULL forever once a
+        # skeleton row existed.
         if news_item and news_id:
             await session.execute(
                 text("""
@@ -165,7 +186,8 @@ async def _persist_to_db(report: dict, news_item: dict, news_id: str):
                     VALUES
                         (:id, :source, :timestamp_utc, :headline, :body, :summary, :url,
                          :ingest_latency_ms, :category, CAST(:symbols_mentioned AS jsonb))
-                    ON CONFLICT (id) DO NOTHING
+                    ON CONFLICT (id) DO UPDATE
+                        SET summary = COALESCE(EXCLUDED.summary, news_items.summary)
                 """),
                 {
                     "id": news_id,
@@ -181,7 +203,11 @@ async def _persist_to_db(report: dict, news_item: dict, news_id: str):
                 },
             )
 
-        # Insert impact report (ignore duplicates)
+        # Upsert impact report. Events for one id arrive partition-ordered
+        # (skeleton → complete → summary update), so last-write-wins is
+        # correct; the skeleton's row gets its impacts filled by the complete
+        # event. created_at (server default) stays at first-insert time —
+        # i.e. skeleton time for progressive items.
         report_id = report.get("id", "")
         if report_id:
             await session.execute(
@@ -194,7 +220,14 @@ async def _persist_to_db(report: dict, news_item: dict, news_id: str):
                         (:id, :news_id, :relevant, :confidence, :macro_theme,
                          CAST(:affected_sectors AS jsonb), CAST(:company_impacts AS jsonb),
                          CAST(:trade_signals AS jsonb), :processing_latency_ms)
-                    ON CONFLICT (id) DO NOTHING
+                    ON CONFLICT (id) DO UPDATE
+                        SET relevant = EXCLUDED.relevant,
+                            confidence = EXCLUDED.confidence,
+                            macro_theme = EXCLUDED.macro_theme,
+                            affected_sectors = EXCLUDED.affected_sectors,
+                            company_impacts = EXCLUDED.company_impacts,
+                            trade_signals = EXCLUDED.trade_signals,
+                            processing_latency_ms = EXCLUDED.processing_latency_ms
                 """),
                 {
                     "id": report_id,
@@ -216,6 +249,14 @@ async def _persist_to_db(report: dict, news_item: dict, news_id: str):
         # report never overwrites history. Provenance fields are read from the
         # report dict for forward-compatibility: they are NULL until the
         # analysis pipeline starts emitting them, then auto-populate here.
+        # Progressive-delivery partials are NOT audit events (no analysis
+        # output yet) and must never claim the id — the DO NOTHING conflict
+        # would then block the real record. First COMPLETE event wins; the
+        # later summary-update hits the conflict and is correctly ignored
+        # (audit captures analysis input/output, not the display summary).
+        if is_partial:
+            await session.commit()
+            return
         report_id = report.get("id", "")
         if report_id:
             await session.execute(

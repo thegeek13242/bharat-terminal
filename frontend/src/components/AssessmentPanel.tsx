@@ -81,6 +81,25 @@ export function AssessmentPanel({ report, ltpWs }: { report: ImpactReport | null
     };
   }, [symbol]);
 
+  // Progressive-delivery partial: the filing is on the tape but impact
+  // scoring is still running. The feed replaces this report in place (same
+  // id) when the complete assessment lands, so this state resolves itself.
+  if (report && report.analysis_status === 'analysing') {
+    return (
+      <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+        <div style={{ background: 'var(--bg-elev)', padding: '18px 24px', borderBottom: '1px solid var(--border)' }}>
+          <div className="line-clamp-2" style={{ fontFamily: 'var(--sans)', fontSize: 13, color: 'var(--ink-2)' }}>
+            {report.news_item?.headline}
+          </div>
+        </div>
+        <EmptyState
+          title="Analysing"
+          sub="Impact assessment is running — this panel fills in automatically in a few seconds."
+        />
+      </div>
+    );
+  }
+
   if (!report || !imp) {
     return <EmptyState title="Select an event" sub="Its structured assessment appears here." />;
   }

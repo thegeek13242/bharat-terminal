@@ -116,6 +116,18 @@ async def main():
         _rt_tasks.add(task)
         task.add_done_callback(_rt_tasks.discard)
 
+    async def _publish_event(report):
+        """Publish callback handed to the pipeline (progressive delivery,
+        2026-08-13): the pipeline calls this for the market-hours skeleton,
+        the final report, and the late summary update — in that order."""
+        await publisher.publish(report)
+        _state["last_publish"] = time.monotonic()
+        if report.analysis_status == "analysing":
+            logger.info(f"[RT] Published skeleton (analysing) for news {report.news_id}")
+        elif report.update_seq:
+            logger.info(f"[RT] Published update seq={report.update_seq} "
+                        f"for report {report.id}")
+
     async def _process_rt(news_item: NewsItem):
         """Full per-item pipeline run. Safe to run concurrently: cost is
         attributed via a task-local bucket (see llm_logger), publishes are
@@ -125,11 +137,13 @@ async def main():
         try:
             # Hard time budget per item: a single stuck item can never block
             # the consumer (which previously froze the whole feed for hours).
+            # The pipeline publishes through _publish_event (skeleton + final
+            # + summary update) — no publisher.publish() here, or the final
+            # report would hit the topic twice.
             report = await asyncio.wait_for(
-                process_news_item(news_item), timeout=ITEM_PROCESSING_TIMEOUT_S
+                process_news_item(news_item, on_partial=_publish_event),
+                timeout=ITEM_PROCESSING_TIMEOUT_S
             )
-            await publisher.publish(report)
-            _state["last_publish"] = time.monotonic()
             logger.info(
                 f"[RT] Published: relevant={report.relevant}, "
                 f"companies={len(report.company_impacts)}, "
@@ -283,6 +297,16 @@ async def main():
     if _rt_tasks:
         logger.info(f"[RT] Shutdown — waiting for {len(_rt_tasks)} in-flight item(s)")
         await asyncio.wait(_rt_tasks, timeout=ITEM_PROCESSING_TIMEOUT_S)
+
+    # Drain pending late-summary updates so they publish before the producer
+    # stops (each is bounded by SUMMARY_JOIN_TIMEOUT_S).
+    from bharat_terminal.analysis.pipeline import (_summary_update_tasks,
+                                                   SUMMARY_JOIN_TIMEOUT_S)
+    if _summary_update_tasks:
+        logger.info(f"[RT] Shutdown — waiting for {len(_summary_update_tasks)} "
+                    f"late summary update(s)")
+        await asyncio.wait(set(_summary_update_tasks),
+                           timeout=SUMMARY_JOIN_TIMEOUT_S)
 
     # Flush any remaining items on graceful shutdown
     if _batch_buf:

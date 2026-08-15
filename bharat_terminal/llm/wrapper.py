@@ -22,6 +22,7 @@ import asyncio
 import logging
 import itertools
 import threading
+import weakref
 import collections
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -340,7 +341,55 @@ class LLMResponse:
 
 # ── Anthropic providers (Vertex + Bedrock + console) ─────────────────────────
 
+# Client reuse: _anthropic_client() used to construct a fresh SDK client — and
+# with it a fresh HTTPS connection pool — on EVERY call, so each analysis stage
+# paid a new TLS handshake to the provider endpoint (3 handshakes per filing on
+# the hot path). Clients are now cached and reused: sync clients per process
+# (httpx clients are thread-safe), async clients per running event loop in a
+# WeakKeyDictionary — asyncio clients are loop-bound, and keying weakly by the
+# loop means short-lived loops (kb-monitor jobs) release their clients instead
+# of leaking connections (see the 2026-08-01 kb-monitor connection-leak
+# incident for why unbounded caches here are dangerous).
+_sync_client_cache: Dict[tuple, Any] = {}
+_async_client_cache: "weakref.WeakKeyDictionary[Any, Dict[tuple, Any]]" = None  # type: ignore[assignment]
+_client_cache_lock = threading.Lock()
+
+
 def _anthropic_client(async_: bool, provider: str):
+    global _async_client_cache
+    key = (provider, BEDROCK_CLAUDE_ENDPOINT if provider == "anthropic-bedrock" else "")
+    if async_:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            return _build_anthropic_client(async_, provider)
+        with _client_cache_lock:
+            if _async_client_cache is None:
+                _async_client_cache = weakref.WeakKeyDictionary()
+            per_loop = _async_client_cache.get(loop)
+            client = per_loop.get(key) if per_loop else None
+        if client is not None:
+            return client
+        client = _build_anthropic_client(async_, provider)
+        with _client_cache_lock:
+            self_dict = _async_client_cache.setdefault(loop, {})
+            # A concurrent builder may have won the race; prefer the stored one
+            # so every caller shares a single client per (loop, provider).
+            client = self_dict.setdefault(key, client)
+        return client
+    with _client_cache_lock:
+        client = _sync_client_cache.get(key)
+    if client is not None:
+        return client
+    client = _build_anthropic_client(async_, provider)
+    with _client_cache_lock:
+        client = _sync_client_cache.setdefault(key, client)
+    return client
+
+
+def _build_anthropic_client(async_: bool, provider: str):
     import anthropic
     if provider == "anthropic-vertex":
         cls = anthropic.AsyncAnthropicVertex if async_ else anthropic.AnthropicVertex
@@ -366,8 +415,47 @@ def _anthropic_client(async_: bool, provider: str):
     return cls(api_key=api_key, timeout=LLM_CALL_TIMEOUT_S)
 
 
+# Prompt caching (Anthropic-family providers). A cache_control breakpoint marks
+# the end of the request's STATIC prefix; the API renders tools → system →
+# messages, so a marker on the last system block caches tools+system, else the
+# last tool caches the tool schemas. Prefixes below the model's minimum
+# cacheable length (1024 tok Sonnet-tier, 4096 tok Haiku 4.5) are silently NOT
+# cached — the marker is then a harmless no-op. As of 2026-08-13 the analysis
+# stages' static prefixes are all BELOW those minimums (measured: stage3
+# tools+persona ~760 tok, filing_summary ~530, stage2 ~640), so this buys no
+# latency yet; it starts paying the moment the eval-gated Phase-2 prompt
+# reorder puts the rubric text ahead of the filing body. Verify hits via
+# llm_call_log.cached_tokens.
+_CACHE_CONTROL = {"type": "ephemeral"}
+
+
+def _mark_static_prefix_cached(kwargs: Dict[str, Any]) -> None:
+    """Add a cache_control breakpoint at the end of the static prefix.
+
+    Copies — never mutates — caller structures: stage tool schemas are
+    module-level constants shared across calls.
+    """
+    system = kwargs.get("system")
+    if isinstance(system, str):
+        kwargs["system"] = [{"type": "text", "text": system,
+                             "cache_control": dict(_CACHE_CONTROL)}]
+        return
+    if isinstance(system, list) and system:
+        last = system[-1]
+        if isinstance(last, dict) and "cache_control" not in last:
+            kwargs["system"] = system[:-1] + [
+                {**last, "cache_control": dict(_CACHE_CONTROL)}]
+        return
+    tools = kwargs.get("tools")
+    if isinstance(tools, list) and tools:
+        last = tools[-1]
+        if isinstance(last, dict) and "cache_control" not in last:
+            kwargs["tools"] = tools[:-1] + [
+                {**last, "cache_control": dict(_CACHE_CONTROL)}]
+
+
 def _anthropic_kwargs(model: str, provider: str, max_tokens: int, system, messages,
-                      tools, tool_choice, temperature) -> Dict[str, Any]:
+                      tools, tool_choice, temperature, cache: bool = False) -> Dict[str, Any]:
     if provider == "anthropic-vertex":
         mapped = to_vertex_claude_id(model)
     elif provider == "anthropic-bedrock":
@@ -394,6 +482,8 @@ def _anthropic_kwargs(model: str, provider: str, max_tokens: int, system, messag
                            "(sampling params rejected by the API)", temperature, model)
         else:
             kwargs["temperature"] = temperature
+    if cache:
+        _mark_static_prefix_cached(kwargs)
     return kwargs
 
 
@@ -664,13 +754,19 @@ def complete(
     *, model: str, messages: List[Dict[str, Any]], max_tokens: int = 1024,
     system: Optional[Any] = None, tools: Optional[List[Dict]] = None,
     tool_choice: Optional[Dict] = None, temperature: Optional[float] = None,
+    cache: bool = False,
 ) -> LLMResponse:
-    """Synchronous completion. Routes to the provider for `model`."""
+    """Synchronous completion. Routes to the provider for `model`.
+
+    cache=True adds a prompt-cache breakpoint after the static prefix on
+    Anthropic-family providers (no-op for Gemini and for prefixes under the
+    model's cacheable minimum).
+    """
     provider = provider_for_model(model)
     if provider in ("anthropic-vertex", "anthropic-bedrock", "anthropic"):
         client = _anthropic_client(async_=False, provider=provider)
         kwargs = _anthropic_kwargs(model, provider, max_tokens, system, messages,
-                                   tools, tool_choice, temperature)
+                                   tools, tool_choice, temperature, cache=cache)
         if provider == "anthropic-bedrock":
             _bedrock_pace_sync(model)
         return _wrap_anthropic_response(client.messages.create(**kwargs), model, provider)
@@ -694,13 +790,19 @@ async def acomplete(
     *, model: str, messages: List[Dict[str, Any]], max_tokens: int = 1024,
     system: Optional[Any] = None, tools: Optional[List[Dict]] = None,
     tool_choice: Optional[Dict] = None, temperature: Optional[float] = None,
+    cache: bool = False,
 ) -> LLMResponse:
-    """Async completion. Routes to the provider for `model`."""
+    """Async completion. Routes to the provider for `model`.
+
+    cache=True adds a prompt-cache breakpoint after the static prefix on
+    Anthropic-family providers (no-op for Gemini and for prefixes under the
+    model's cacheable minimum).
+    """
     provider = provider_for_model(model)
     if provider in ("anthropic-vertex", "anthropic-bedrock", "anthropic"):
         client = _anthropic_client(async_=True, provider=provider)
         kwargs = _anthropic_kwargs(model, provider, max_tokens, system, messages,
-                                   tools, tool_choice, temperature)
+                                   tools, tool_choice, temperature, cache=cache)
         if provider == "anthropic-bedrock":
             await _bedrock_pace_async(model)
         resp = await _await_budget(client.messages.create(**kwargs),

@@ -155,6 +155,7 @@ async def summarize_filing(headline: str, body: Optional[str], source: str,
             tools=[SUMMARY_TOOL],
             tool_choice={"type": "tool", "name": "summarize_filing"},
             messages=[{"role": "user", "content": _build_prompt(headline, text_body)}],
+            cache=True,
         )
         llm_logger.log(LLMCallRecord(
             call_id=str(uuid.uuid4()),
@@ -165,6 +166,7 @@ async def summarize_filing(headline: str, body: Optional[str], source: str,
             latency_ms=(time.time() - t0) * 1000,
             cost_usd=compute_cost(SUMMARY_MODEL, response.usage.input_tokens, response.usage.output_tokens),
             success=True,
+            cached_tokens=response.usage.cached_tokens,
             context_id=news_id,
         ))
 

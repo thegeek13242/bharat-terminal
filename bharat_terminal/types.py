@@ -151,6 +151,17 @@ class ImpactReport(BaseModel):
     router_meta: Optional[dict] = None
     processing_latency_ms: float
     created_at: datetime
+    # Progressive delivery (2026-08-13 market-hours latency work). A report id
+    # can now be published more than once as analysis of one news item unfolds:
+    #   analysis_status "analysing" — market-hours partial published right
+    #     after relevance passes (headline on the tape in seconds; impacts
+    #     empty, nothing signal-eligible);
+    #   analysis_status "complete"  — impacts are final (papertrade acts here).
+    # update_seq orders re-publishes of the SAME report id (0 = first complete
+    # publish; 1 = late filing-summary attach). Consumers that predate these
+    # fields see defaults and behave exactly as before.
+    analysis_status: str = "complete"
+    update_seq: int = 0
 
 
 class CommodityTick(BaseModel):

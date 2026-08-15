@@ -36,6 +36,11 @@ export interface ImpactReport {
   company_impacts: CompanyImpact[];
   processing_latency_ms: number;
   created_at: string;
+  // Progressive delivery: 'analysing' partials arrive seconds after detection
+  // (impacts still empty) and are replaced in place — same id — by the
+  // 'complete' report ~10s later. Absent on pre-rollout payloads = complete.
+  analysis_status?: 'analysing' | 'complete';
+  update_seq?: number;
 }
 
 // ── Companies browser ──────────────────────────────────────────────────

@@ -227,6 +227,7 @@ Tagging rules:
             tools=[EXTRACTION_TOOL],
             tool_choice={"type": "tool", "name": "extract_market_entities"},
             messages=[{"role": "user", "content": prompt}],
+            cache=True,
         )
 
         llm_latency = (time.time() - llm_start) * 1000
@@ -241,6 +242,7 @@ Tagging rules:
             latency_ms=llm_latency,
             cost_usd=compute_cost(LLM_MODEL, response.usage.input_tokens, response.usage.output_tokens),
             success=True,
+            cached_tokens=response.usage.cached_tokens,
             context_id=str(news_item.id),
         )
         llm_logger.log(record)

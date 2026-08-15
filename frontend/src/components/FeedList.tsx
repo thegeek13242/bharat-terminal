@@ -14,6 +14,18 @@ import {
 } from '@/lib/format';
 import { hasPricedIn } from '@/lib/richtext';
 
+/** Progressive-delivery partial: on the tape, impact scoring still running. */
+function isAnalysing(r: ImpactReport): boolean {
+  return r.analysis_status === 'analysing';
+}
+
+/** Skeletons normally complete in ~10-20s; past 5 min the run is dead. */
+function isFresh(createdAt?: string): boolean {
+  if (!createdAt) return false;
+  const t = Date.parse(createdAt);
+  return Number.isFinite(t) && Date.now() - t < 5 * 60 * 1000;
+}
+
 interface Props {
   reports: ImpactReport[];
   selectedId?: string;
@@ -246,16 +258,34 @@ export function FeedList({
                       </div>
                     </div>
                     <div style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
-                      <div className="mono" style={{ fontSize: 11.5, color: DIRECTION_VAR[dir], fontWeight: 600 }}>
-                        {DIRECTION_GLYPH[dir]} {reportImpactBand(r, imp?.magnitude)}
-                      </div>
-                      <div className="mono upper" style={{ fontSize: 10, letterSpacing: '0.08em', color: 'var(--ink-dim)', marginTop: 3 }}>
-                        {DIRECTION_LABEL[dir]}
-                      </div>
-                      {hasPricedIn(imp?.explanation) && (
-                        <div className="mono upper" style={{ fontSize: 8.5, letterSpacing: '0.08em', color: 'var(--head)', marginTop: 3 }}>
-                          Priced in
-                        </div>
+                      {isAnalysing(r) ? (
+                        /* Progressive delivery: the filing is on the tape but
+                           impact scoring is still running — the row updates in
+                           place (same id) when the complete report lands. A
+                           skeleton older than 5 min means the run died; show a
+                           quiet dash instead of pulsing forever. */
+                        isFresh(r.created_at) ? (
+                          <div className="mono upper" style={{ fontSize: 10, letterSpacing: '0.08em', color: 'var(--ink-dim)' }}>
+                            <span className="live-dot" style={{ marginRight: 5 }} />
+                            Analysing
+                          </div>
+                        ) : (
+                          <div className="mono" style={{ fontSize: 11.5, color: 'var(--ink-mute)' }}>—</div>
+                        )
+                      ) : (
+                        <>
+                          <div className="mono" style={{ fontSize: 11.5, color: DIRECTION_VAR[dir], fontWeight: 600 }}>
+                            {DIRECTION_GLYPH[dir]} {reportImpactBand(r, imp?.magnitude)}
+                          </div>
+                          <div className="mono upper" style={{ fontSize: 10, letterSpacing: '0.08em', color: 'var(--ink-dim)', marginTop: 3 }}>
+                            {DIRECTION_LABEL[dir]}
+                          </div>
+                          {hasPricedIn(imp?.explanation) && (
+                            <div className="mono upper" style={{ fontSize: 8.5, letterSpacing: '0.08em', color: 'var(--head)', marginTop: 3 }}>
+                              Priced in
+                            </div>
+                          )}
+                        </>
                       )}
                     </div>
                     {onToggleStar && (
