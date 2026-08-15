@@ -113,6 +113,37 @@ PAPER_PREOPEN_MIN_RATIO = float(os.getenv("PAPER_PREOPEN_MIN_RATIO", "1.0"))
 _PREOPEN_PROBE_START = dtime(9, 5, 30)
 _PREOPEN_PROBE_END = dtime(9, 7, 0)
 
+# Observe-only mode (founder decision 2026-08-15, from the first accuracy
+# readout of 141 scored gate decisions, 2026-08-03→08-14): the veto was
+# INVERTED for shorts — vetoed headwind shorts would have returned +2.35%
+# d1 / +5.68% d5 vs +1.65%/+3.99% for confirmed ones, because the pre-open
+# imbalance is largely priced into the auction open itself (confirmed shorts
+# gapped −1.18%, vetoed +0.56% — the gap-vs-capturable lesson again). Only
+# orderwin_long showed correct discrimination (+2.59% vs −0.96% at 5d,
+# n=8 — thin), so only it still ENFORCES its veto. Every other strategy is
+# probed and annotated identically — including "would_veto" when the book
+# says no — so the hypothetical gate stays measurable at full sample size.
+PAPER_PREOPEN_VETO_STRATEGIES = {
+    s.strip() for s in os.getenv(
+        "PAPER_PREOPEN_VETO_STRATEGIES", "orderwin_long").split(",")
+    if s.strip()
+}
+
+
+def _preopen_decision(side: str, strategy: str,
+                      ratio: float | None) -> tuple[bool | None, bool]:
+    """(confirmed, enforce) for a probed pending signal.
+
+    confirmed: None = indeterminate (no pre-open book, e.g. SME names) —
+    always proceeds. enforce: whether a False confirmation actually vetoes
+    (strategy in PAPER_PREOPEN_VETO_STRATEGIES) or is observe-only recorded.
+    """
+    confirmed = None
+    if ratio is not None:
+        confirmed = (ratio >= PAPER_PREOPEN_MIN_RATIO if side == "LONG"
+                     else ratio <= 1.0 / PAPER_PREOPEN_MIN_RATIO)
+    return confirmed, strategy in PAPER_PREOPEN_VETO_STRATEGIES
+
 _PEAD_SCAN_SQL = """
 SELECT es.id, es.symbol, es.sue_composite, es.announced_at, es.period_end
 FROM earnings_surprises es
@@ -518,12 +549,10 @@ async def main():
                         "best_sell": q.get("best_sell"),
                         "min_ratio": PAPER_PREOPEN_MIN_RATIO,
                     }}
-                    confirmed = None
-                    if ratio is not None:
-                        confirmed = (ratio >= PAPER_PREOPEN_MIN_RATIO
-                                     if r["side"] == "LONG"
-                                     else ratio <= 1.0 / PAPER_PREOPEN_MIN_RATIO)
-                    if confirmed is False:
+                    confirmed, enforce = _preopen_decision(
+                        r["side"], r["strategy"], ratio)
+                    snap["preopen_probe"]["veto_enforced"] = enforce
+                    if confirmed is False and enforce:
                         await engine.veto_pending(r["id"], "preopen_veto", snap)
                         logger.info(f"[PREOPEN] VETO #{r['id']} {r['side']} "
                                     f"{r['symbol']} ratio={ratio:.2f}")
@@ -531,10 +560,20 @@ async def main():
                         snap["preopen_probe"]["confirmed"] = (
                             bool(confirmed) if confirmed is not None
                             else "indeterminate")
+                        if confirmed is False:
+                            # Observe-only: the book said no, but this
+                            # strategy's veto is not enforced — record the
+                            # counterfactual and let the signal fill.
+                            snap["preopen_probe"]["would_veto"] = True
+                            logger.info(
+                                f"[PREOPEN] OBSERVE would-veto #{r['id']} "
+                                f"{r['side']} {r['symbol']} ratio={ratio:.2f}")
+                        else:
+                            logger.info(
+                                f"[PREOPEN] CONFIRM #{r['id']} {r['side']} "
+                                f"{r['symbol']} ratio="
+                                f"{'n/a' if ratio is None else f'{ratio:.2f}'}")
                         await engine.annotate_pending(r["id"], snap)
-                        logger.info(f"[PREOPEN] CONFIRM #{r['id']} {r['side']} "
-                                    f"{r['symbol']} ratio="
-                                    f"{'n/a' if ratio is None else f'{ratio:.2f}'}")
             except Exception as e:
                 logger.error(f"[PREOPEN] probe failed: {e}", exc_info=True)
 
