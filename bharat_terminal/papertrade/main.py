@@ -57,10 +57,15 @@ SNAPSHOT_INTERVAL_S = 300
 _SESSION_FLOOR_IST = dtime(9, 15)
 
 
-def _session_live() -> bool:
-    return (is_market_hours()
-            and datetime.now(ZoneInfo("Asia/Kolkata")).time()
-            >= _SESSION_FLOOR_IST)
+def _session_live(now: datetime | None = None) -> bool:
+    """Continuous session only: is_market_hours() minus the 09:00-09:15
+    pre-open auction. Injectable `now` for tests (same convention as
+    is_market_hours)."""
+    if now is None:
+        now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    else:
+        now = now.astimezone(ZoneInfo("Asia/Kolkata"))
+    return is_market_hours(now) and now.time() >= _SESSION_FLOOR_IST
 # Absorption-curve marks: LTP at decision (t0) then +5/15/30/60 min for
 # every DURING-SESSION hop-0 filing impact, traded or not. Measures how
 # much of the reaction our ~90s latency can actually reach, per cell.
@@ -185,14 +190,24 @@ async def main():
 
     # ── per-report handler ────────────────────────────────────────────────────
     async def handle_report(data: dict):
+        # Progressive-delivery events (2026-08-13): "analysing" skeletons carry
+        # no impacts, and update_seq>0 re-publishes carry the SAME impacts as
+        # the complete event already processed (entries/marks are idempotent by
+        # report id anyway — this just skips the redundant LTP fetch + re-eval).
+        if data.get("analysis_status", "complete") == "analysing" or data.get("update_seq", 0):
+            return
         try:
             report = ImpactReport(**data)
         except Exception as e:
             logger.error(f"Malformed ImpactReport skipped: {e}")
             return
+        # _session_live, NOT is_market_hours: a t0 mark taken 09:00-09:15
+        # records the pre-open indicative/stale LTP, not a tradeable print —
+        # the same phantom class as the 2026-07-31 fills. Pre-floor filings
+        # are covered by the OHLC gap decomposition like off-session ones.
         if (report.relevant
                 and report.news_item.source in ("NSE_FILINGS", "BSE_FILINGS")
-                and is_market_hours()):
+                and _session_live()):
             try:
                 await _capture_t0_marks(report)
             except Exception as e:
@@ -208,9 +223,17 @@ async def main():
             return
 
         live = [i for i in intents if i.rejected_reason is None]
-        market_open = is_market_hours()
+        # _session_live, NOT is_market_hours (2026-08-15 fix): a signal
+        # arriving 09:00-09:15 used to take the immediate-fill branch at a
+        # pre-open indicative LTP — MINID 2026-08-14 filled 09:00:32 at the
+        # PREVIOUS close (₹5.13+slip) vs a real auction open of ₹5.19, and it
+        # bypassed the pre-open book confirmation entirely. Pre-floor arrivals
+        # now queue as PENDING: those before ~09:05:30 get probed by
+        # preopen_confirm_loop, and fills happen at the Angel One auction
+        # `open` once the session floor lifts (mtm_loop).
+        session_live = _session_live()
         ltps: dict[str, float] = {}
-        if live and market_open:
+        if live and session_live:
             try:
                 ltps = await marks.get_ltps({i.symbol for i in live})
             except Exception as e:
@@ -221,11 +244,11 @@ async def main():
                 if intent.rejected_reason:
                     # e.g. stale_event: recorded, never silently dropped.
                     await engine.record_rejected(intent, intent.rejected_reason)
-                elif not market_open:
-                    # Off-session (most results filings land after 15:30 IST):
-                    # the pre-news LTP would be a fabricated fill — queue as
-                    # PENDING; the MTM loop fills it at the first LTP after
-                    # the next open.
+                elif not session_live:
+                    # Off-session or pre-open (most results filings land after
+                    # 15:30 IST): the pre-news/pre-open LTP would be a
+                    # fabricated fill — queue as PENDING; the MTM loop fills it
+                    # at the auction open / first LTP after the session floor.
                     await engine.queue_position(intent)
                 else:
                     await engine.open_position(intent, ltps.get(intent.symbol))
@@ -359,9 +382,13 @@ async def main():
                     _PEAD_SCAN_SQL, PEAD_SCAN_WINDOW_H, thr)
                 if not rows:
                     continue
-                market_open = is_market_hours()
+                # _session_live, NOT is_market_hours (2026-08-15, same fix as
+                # handle_report): a scan tick inside 09:00-09:15 would fill
+                # pead_long at a pre-open indicative LTP. Queue instead — the
+                # gap guard at pending-fill needs the REAL open anyway.
+                session_live = _session_live()
                 ltps: dict[str, float] = {}
-                if market_open:
+                if session_live:
                     try:
                         ltps = await marks.get_ltps({r["symbol"] for r in rows})
                     except Exception as e:
@@ -379,7 +406,7 @@ async def main():
                             "gate_flags": {"liquidity_pass": True,
                                            "sue_pass": True},
                         })
-                    if market_open:
+                    if session_live:
                         await engine.open_position(
                             intent, ltps.get(r["symbol"]))
                     else:
@@ -394,7 +421,9 @@ async def main():
         when the PEAD book empties."""
         while not shutdown_event.is_set():
             await asyncio.sleep(HEDGE_INTERVAL_S)
-            if not PAPER_HEDGE_ENABLED or not is_market_hours():
+            # _session_live: NFO has no pre-open auction — a hedge adjusted
+            # 09:00-09:15 would price at yesterday's futures LTP.
+            if not PAPER_HEDGE_ENABLED or not _session_live():
                 continue
             try:
                 pead = await engine.strategy_notional("pead_long")
