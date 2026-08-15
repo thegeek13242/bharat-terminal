@@ -1,21 +1,25 @@
 """PaperEngine.fill_pending — the queued-fill path for off-session signals.
 
-Carries the two strict xfails from the 2026-07-30 review:
-  C3 (CRITICAL): gross cap checked on the cash-sized qty BEFORE futures lot
-      inflation — a min-1-lot contract can blow through the cap unchecked.
-  M2 (MAJOR): zero_qty reject runs before lot logic, so a high-priced FUT
-      pending is rejected where the during-session path would open 1 lot.
+2026-07-30 review findings, all FIXED 2026-08-15:
+  C3 (CRITICAL): gross cap is now checked on the FINAL qty, after futures
+      lot inflation (fill_pending mirrors open_position's gate order).
+  M2 (MAJOR): lot logic now runs before the zero_qty check, so a
+      high-priced FUT pending fills as one lot like the live path.
+  C1 (CRITICAL): fill-price selection is extracted into main.py's pure
+      select_fill_price() — no `open` (no print today) means NO fill, so
+      non-auction series (BE/BZ/SM/ST, BSE) can no longer fill at
+      yesterday's carried-over LTP.
 
-C1 (fills before the pre-open auction) lives in main.py's mtm_loop, which is
-not unit-testable without extracting the cycle body — see
-test_c1_placeholder below.
+Also covers expire_stale_pending (2026-08-15): PENDING rows older than
+PAPER_PENDING_MAX_AGE_H become auditable 'pending_expired' rejects instead
+of parking invisibly forever (the Aug 7-12 stuck-queue class).
 """
 import json
 import math
-
-import pytest
+from datetime import datetime, time as dtime, timedelta, timezone
 
 from bharat_terminal.papertrade import engine as eng
+from bharat_terminal.papertrade.main import select_fill_price
 from conftest import pending_row
 
 SLIP = eng.PAPER_SLIPPAGE_BPS / 1e4
@@ -101,15 +105,11 @@ async def test_fut_pending_unknown_lot_rejects(engine, pool, fake_lots):
     assert reason == "no_lot_size"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="C3 (CRITICAL, review 2026-07-30): fill_pending checks the gross "
-           "cap on the CASH-sized qty, then inflates FUT qty to a minimum of "
-           "one lot with no re-check — the filled contract can exceed the "
-           "cap by the full lot value. open_position has the correct order. "
-           "Remove marker when the cap is re-checked after lot quantization.")
 async def test_c3_gross_cap_holds_after_lot_quantization(engine, pool,
                                                          fake_lots):
+    # C3 (review 2026-07-30), FIXED: the cap check runs on the final
+    # lot-quantized qty, so a min-1-lot contract can no longer blow
+    # through the gross cap unchecked.
     fake_lots["TEST"] = 500
     pool.gross = 400_000.0
     pool.pending = [pending_row(id=1, side="SHORT", instrument="FUT",
@@ -126,29 +126,65 @@ async def test_c3_gross_cap_holds_after_lot_quantization(engine, pool,
         assert reason == "gross_cap"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="M2 (MAJOR, review 2026-07-30): the zero_qty reject runs before "
-           "the lot logic, so a FUT pending on a high-priced symbol is "
-           "permanently rejected where open_position would fill one lot. "
-           "Remove marker when fill_pending mirrors open_position's order.")
 async def test_m2_fut_pending_min_one_lot_like_open_position(engine, pool,
                                                              fake_lots):
-    fake_lots["TEST"] = 10
+    # M2 (review 2026-07-30), FIXED: lot logic precedes the zero_qty check,
+    # matching open_position — a high-priced FUT pending fills as one lot.
+    # Price > per-trade notional (cash sizing would floor to 0) but the
+    # 1-lot contract stays under the gross cap — the C3 fix correctly
+    # rejects cap-busting contracts on BOTH paths now, so M2's scenario
+    # must be cap-compatible to isolate the min-one-lot behavior.
+    fake_lots["TEST"] = 2
     pool.pending = [pending_row(id=1, side="SHORT", instrument="FUT",
                                 strategy="headwind_short")]
-    await engine.fill_pending({"TEST": NOTIONAL * 1.5})
+    await engine.fill_pending({"TEST": NOTIONAL * 1.2})
     assert pool.fills, "expected a 1-lot fill, got a zero_qty reject"
-    assert pool.fills[0][1] == 10
+    assert pool.fills[0][1] == 2
 
 
-@pytest.mark.skip(
-    reason="C1 (CRITICAL, review 2026-07-30): queued fills execute at "
-           "09:00:02 IST before the pre-open auction because mtm_loop's "
-           "fill-price selection (main.py:227-278) falls back to stale LTP "
-           "when the day's open is absent. The cycle body must be extracted "
-           "into a testable function (design doc §2.2) before this can be a "
-           "real test: given now=09:00 and open=0/absent, fill_pending must "
-           "not be called with a live_ltp price for queued rows.")
-async def test_c1_no_fill_before_auction_open():
-    raise NotImplementedError
+# ── C1: fill-price selection (pure, extracted from mtm_loop 2026-08-15) ──
+
+def test_c1_no_fill_without_todays_print():
+    # `open` absent/zero = the symbol has not printed today (non-auction
+    # BE/BZ/SM/ST + BSE series before their first trade; any symbol on a
+    # data gap): the carried-over LTP must NEVER become a fill price.
+    assert select_fill_price(None, dtime(9, 16)) is None
+    assert select_fill_price({"ltp": 100.0}, dtime(9, 16)) is None
+    assert select_fill_price({"ltp": 100.0, "open": None},
+                             dtime(10, 0)) is None
+    assert select_fill_price({"ltp": 100.0, "open": 0.0},
+                             dtime(14, 0)) is None
+
+
+def test_c1_auction_open_wins_before_0945():
+    sel = select_fill_price({"ltp": 101.0, "open": 100.5}, dtime(9, 20))
+    assert sel == (100.5, "auction_open_angelone")
+
+
+def test_c1_live_ltp_wins_from_0945():
+    sel = select_fill_price({"ltp": 101.0, "open": 100.5}, dtime(9, 45))
+    assert sel == (101.0, "live_ltp")
+
+
+def test_c1_open_present_but_no_ltp_after_0945_waits():
+    assert select_fill_price({"ltp": None, "open": 100.5},
+                             dtime(10, 0)) is None
+
+
+# ── expire_stale_pending ─────────────────────────────────────────────────
+
+async def test_stale_pending_expires_auditably(engine, pool):
+    old = (datetime.now(timezone.utc)
+           - timedelta(hours=eng.PAPER_PENDING_MAX_AGE_H + 1))
+    pool.pending = [pending_row(id=1, created_at=old)]
+    assert await engine.expire_stale_pending() == 1
+    ((row_id, reason, prov_json),) = pool.pending_rejects
+    assert (row_id, reason) == (1, "pending_expired")
+    assert json.loads(prov_json)["expired_after_h"] == \
+        eng.PAPER_PENDING_MAX_AGE_H
+
+
+async def test_fresh_pending_not_expired(engine, pool):
+    pool.pending = [pending_row(id=1)]        # created now
+    assert await engine.expire_stale_pending() == 0
+    assert not pool.pending_rejects and len(pool.pending) == 1

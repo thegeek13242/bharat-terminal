@@ -39,3 +39,12 @@ def test_close_boundary_matches_market_hours():
 
 def test_weekend_not_live():
     assert not _session_live(ist(2026, 8, 15, 10, 0))  # Saturday
+
+
+def test_weekday_holiday_not_live():
+    # Gandhi Jayanti 2026-10-02 (Friday): before the holiday calendar,
+    # _session_live went true at 09:15 and pending fills/exits executed
+    # against the previous session's frozen prices.
+    t = ist(2026, 10, 2, 10, 0)
+    assert not is_market_hours(t)
+    assert not _session_live(t)

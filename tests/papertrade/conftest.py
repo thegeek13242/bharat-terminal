@@ -33,6 +33,7 @@ class FakePool:
         self.pead_sue = {}                # symbol -> sue_composite
         self.sue_threshold = None         # P90 threshold (None = window empty)
         self.live_pos = set()             # {(symbol, strategy)} concentration
+        self.known_symbols = None         # None = every symbol in companies
         self.pending = []                 # PENDING row dicts
         self.open_rows = []               # OPEN row dicts
         self.existing_keys = set()        # {(impact_id, symbol, strategy)}
@@ -113,6 +114,10 @@ class FakePool:
         if "percentile_cont" in sql:                      # _SUE_THRESHOLD_SQL
             self.sue_threshold_queries += 1
             return {"thr": self.sue_threshold}
+        if "FROM companies" in sql:                       # _SYMBOL_KNOWN_SQL
+            known = (self.known_symbols is None
+                     or args[0] in self.known_symbols)
+            return {"ok": 1} if known else None
         if "status IN ('PENDING', 'OPEN')" in sql:        # _LIVE_POS_SQL
             return {"ok": 1} if (args[0], args[1]) in self.live_pos else None
         if "paper_equity_snapshots" in sql:               # _SNAPSHOT_SQL

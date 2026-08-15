@@ -145,11 +145,15 @@ async def test_pead_requires_results_event(pool, make_report, etype):
 
 
 async def test_pead_gated_without_surprise_row(pool, make_report, etype):
+    # 2026-08-15: gated-out signals are auditable REJECTED intents, not
+    # log-only skips — the gate's false-veto rate must be measurable from
+    # the ledger.
     etype("results")
     pool.sue_threshold = 1.5                       # threshold exists, no SUE
-    out = await make_rules(pool).evaluate_report(
+    (intent,) = await make_rules(pool).evaluate_report(
         make_report(sentiment="positive", magnitude=3))
-    assert out == []
+    assert intent.strategy == "pead_long"
+    assert intent.rejected_reason == "no_sue_row"
 
 
 async def test_pead_gated_when_threshold_window_empty(pool, make_report,
@@ -157,18 +161,19 @@ async def test_pead_gated_when_threshold_window_empty(pool, make_report,
     etype("results")
     pool.pead_sue["TEST"] = 2.5
     pool.sue_threshold = None
-    out = await make_rules(pool).evaluate_report(
+    (intent,) = await make_rules(pool).evaluate_report(
         make_report(sentiment="positive", magnitude=3))
-    assert out == []
+    assert intent.rejected_reason == "sue_thr_missing"
 
 
 async def test_pead_gated_below_threshold(pool, make_report, etype):
     etype("results")
     pool.pead_sue["TEST"] = 1.0
     pool.sue_threshold = 1.5
-    out = await make_rules(pool).evaluate_report(
+    (intent,) = await make_rules(pool).evaluate_report(
         make_report(sentiment="positive", magnitude=3))
-    assert out == []
+    assert intent.rejected_reason == "sue_below_thr"
+    assert intent.provenance["gate_flags"]["sue_composite"] == 1.0
 
 
 async def test_sue_threshold_cached_for_an_hour(pool, make_report, etype):

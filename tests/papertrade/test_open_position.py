@@ -163,6 +163,36 @@ async def test_gap_guard_only_applies_to_pead(engine, pool, make_intent):
     assert pool.opened and not pool.rejected
 
 
+# ── unknown-symbol gate (2026-08-15) ─────────────────────────────────────
+
+async def test_unknown_symbol_rejects_at_open(engine, pool, make_intent):
+    # A symbol absent from companies (upstream extraction error — the JNPR
+    # case) must become an auditable reject, not an unfillable ledger row.
+    pool.known_symbols = {"RELIANCE"}
+    await engine.open_position(make_intent(symbol="JNPR"), 100.0)
+    (rej,) = pool.rejected
+    assert rej["reason"] == "unknown_symbol"
+    assert not pool.opened
+
+
+async def test_unknown_symbol_rejects_at_queue(engine, pool, make_intent):
+    pool.known_symbols = {"RELIANCE"}
+    await engine.queue_position(make_intent(symbol="JNPR"))
+    (rej,) = pool.rejected
+    assert rej["reason"] == "unknown_symbol"
+    assert not pool.queued
+
+
+async def test_hedge_symbol_exempt_from_companies_check(engine, pool,
+                                                        make_intent):
+    # NIFTYBEES (an ETF) is not a company; the hedge must not be gated.
+    pool.known_symbols = {"RELIANCE"}
+    await engine.open_position(
+        make_intent(strategy="pead_hedge", symbol="NIFTYBEES", side="SHORT",
+                    instrument="FUT"), 100.0)
+    assert pool.opened and not pool.rejected
+
+
 # ── idempotency ──────────────────────────────────────────────────────────
 
 async def test_replayed_signal_is_idempotent_noop(engine, pool, make_intent):

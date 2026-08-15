@@ -19,11 +19,11 @@ import json
 import logging
 import math
 import os
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta, timezone
 
 import asyncpg
 
-from bharat_terminal.analysis.market_hours import IST
+from bharat_terminal.analysis.market_hours import IST, trading_days_between
 from bharat_terminal.papertrade.rules import SignalIntent
 
 logger = logging.getLogger(__name__)
@@ -32,9 +32,18 @@ PAPER_SLIPPAGE_BPS = float(os.getenv("PAPER_SLIPPAGE_BPS", "10"))
 PAPER_NOTIONAL_PER_TRADE = float(os.getenv("PAPER_NOTIONAL_PER_TRADE", "100000"))
 PAPER_CAPITAL = float(os.getenv("PAPER_CAPITAL", "1000000"))
 PAPER_STOP_PCT = float(os.getenv("PAPER_STOP_PCT", "5.0"))
+# Holding periods are TRADING DAYS (sessions), matching the validated
+# horizons (C2 fix 2026-08-15; calendar-day counting exited PEAD ~30% early).
 PAPER_SHORT_HOLD_DAYS = int(os.getenv("PAPER_SHORT_HOLD_DAYS", "5"))
 PAPER_PEAD_HOLD_DAYS = int(os.getenv("PAPER_PEAD_HOLD_DAYS", "20"))
 PAPER_ORDERWIN_HOLD_DAYS = int(os.getenv("PAPER_ORDERWIN_HOLD_DAYS", "5"))
+# A PENDING row that has failed to fill for this long is no longer the
+# pre-registered next-open entry — filling it would test a different
+# strategy. 120h clears a normal weekend (66h) and a holiday-extended one
+# (~114h); anything older expires as an auditable 'pending_expired' reject.
+# Unresolvable symbols (delistings, upstream symbol errors) land here too
+# instead of parking invisibly forever (the Aug 7-12 stuck-PENDING class).
+PAPER_PENDING_MAX_AGE_H = float(os.getenv("PAPER_PENDING_MAX_AGE_H", "120"))
 # Vol-scaled trailing stop (founder decision 2026-07-28): trail distance =
 # PAPER_TRAIL_SIGMA x entry sigma60, anchored to the position's favorable
 # extreme. Replaces the flat 5% stop — a 5% stop is 8 sigma on a staid
@@ -145,10 +154,18 @@ UPDATE paper_trades
 SET status = 'CLOSED', exit_price = $2::float8, exit_at = now(),
     exit_reason = $3, mtm_price = $2::float8, mtm_at = now(),
     pnl = (CASE WHEN side = 'LONG' THEN ($2::float8 - entry_price)
-                ELSE (entry_price - $2::float8) END) * qty
+                ELSE (entry_price - $2::float8) END) * qty,
+    provenance = provenance || $4::jsonb
 WHERE id = $1 AND status = 'OPEN'
 RETURNING pnl
 """
+
+# Symbols must exist in the companies universe before a ledger row is
+# created for them (2026-08-15: an upstream symbol-extraction error produced
+# an orderwin_long on "JNPR" — absent from companies, unresolvable by the
+# quote path — which would have sat PENDING forever). pead_hedge is exempt:
+# the hedge instrument (NIFTYBEES/an ETF proxy) is not a company.
+_SYMBOL_KNOWN_SQL = "SELECT 1 FROM companies WHERE symbol = $1"
 
 _OPEN_ROWS_SQL = """
 SELECT id, strategy, symbol, side, instrument, qty, entry_price, entry_at,
@@ -223,6 +240,12 @@ class PaperEngine:
         prov["entry_ltp_raw"] = ltp
         prov["slippage_bps"] = PAPER_SLIPPAGE_BPS
 
+        if (intent.strategy != "pead_hedge"
+                and not await self._symbol_known(intent.symbol)):
+            logger.info(f"[REJECT] {intent.strategy} {intent.side} "
+                        f"{intent.symbol}: unknown_symbol")
+            return await self._insert_rejected(intent, "unknown_symbol", prov)
+
         if ltp is None or ltp <= 0:
             logger.info(f"[REJECT] {intent.strategy} {intent.side} "
                         f"{intent.symbol}: no_ltp")
@@ -293,6 +316,11 @@ class PaperEngine:
         equally harmless."""
         prov = dict(intent.provenance)
         prov["queued_off_session"] = True
+        if (intent.strategy != "pead_hedge"
+                and not await self._symbol_known(intent.symbol)):
+            logger.info(f"[REJECT] {intent.strategy} {intent.side} "
+                        f"{intent.symbol}: unknown_symbol (at queue)")
+            return await self._insert_rejected(intent, "unknown_symbol", prov)
         row = await self._pool.fetchrow(
             _QUEUE_SQL, intent.strategy, intent.impact_id, intent.news_id,
             intent.symbol, intent.side, intent.instrument,
@@ -333,8 +361,12 @@ class PaperEngine:
         """Fill PENDING rows at the supplied fill prices (morning cycles pass
         the day's OPEN — the pre-open auction equilibrium, via Angel One —
         for queued signals; otherwise live LTP). Adverse slippage, same math
-        as immediate fills. No price → stays PENDING and retries next cycle;
-        a made-up fill price would corrupt the pilot."""
+        AND SAME GATE ORDER as open_position (C3/M2 fix 2026-08-15: the cap
+        was checked on the cash-sized qty before lot inflation, so a min-1-lot
+        contract could blow through it unchecked; and zero_qty ran before lot
+        logic, permanently rejecting high-priced FUT pendings that the
+        during-session path would fill as one lot). No price → stays PENDING
+        and retries next cycle; a made-up fill price would corrupt the pilot."""
         filled = 0
         for r in await self._pool.fetch(_PENDING_ROWS_SQL):
             ltp = ltps.get(r["symbol"])
@@ -343,18 +375,10 @@ class PaperEngine:
             slip = PAPER_SLIPPAGE_BPS / 1e4
             entry = (ltp * (1 - slip) if r["side"] == "SHORT"
                      else ltp * (1 + slip))
-            qty = math.floor(PAPER_NOTIONAL_PER_TRADE / entry)
             fill_prov = {"fill_ltp_raw": ltp, "slippage_bps": PAPER_SLIPPAGE_BPS,
                          "filled_from_pending": True,
                          "fill_price_source": (price_sources or {}).get(
                              r["symbol"], "live_ltp")}
-            if qty < 1:
-                await self._pool.execute(
-                    _PENDING_REJECT_SQL, r["id"], "zero_qty",
-                    json.dumps(fill_prov, default=str))
-                logger.info(f"[REJECT] #{r['id']} {r['symbol']}: zero_qty "
-                            f"at pending fill {entry:.2f}")
-                continue
             if r["strategy"] == "pead_long":
                 gap_reject = await self._pead_gap_check(r["symbol"], ltp)
                 if gap_reject is not None:
@@ -366,15 +390,7 @@ class PaperEngine:
                                 f"gap_guard at pending fill "
                                 f"({gap_reject:+.2f}%)")
                     continue
-            gross = float(await self._pool.fetchval(_GROSS_SQL))
-            if gross + qty * entry > PAPER_GROSS_CAP:
-                await self._pool.execute(
-                    _PENDING_REJECT_SQL, r["id"], "gross_cap",
-                    json.dumps({**fill_prov, "gross_at_reject": round(gross)},
-                               default=str))
-                logger.info(f"[REJECT] #{r['id']} {r['symbol']}: gross_cap "
-                            f"at pending fill")
-                continue
+            want = PAPER_NOTIONAL_PER_TRADE / entry
             if r["instrument"] == "FUT" and r["strategy"] != "pead_hedge":
                 lot = await self._fut_lot_size(r["symbol"])
                 if not lot:
@@ -384,11 +400,29 @@ class PaperEngine:
                     logger.info(f"[REJECT] #{r['id']} {r['symbol']}: "
                                 f"no_lot_size at pending fill")
                     continue
-                n_lots = max(1, math.floor(qty / lot))
+                n_lots = max(1, math.floor(want / lot))
                 qty = n_lots * lot
                 fill_prov["lot_size"] = lot
                 fill_prov["n_lots"] = n_lots
                 fill_prov["contract_value"] = round(qty * entry)
+            else:
+                qty = math.floor(want)
+            if qty < 1:
+                await self._pool.execute(
+                    _PENDING_REJECT_SQL, r["id"], "zero_qty",
+                    json.dumps(fill_prov, default=str))
+                logger.info(f"[REJECT] #{r['id']} {r['symbol']}: zero_qty "
+                            f"at pending fill {entry:.2f}")
+                continue
+            gross = float(await self._pool.fetchval(_GROSS_SQL))
+            if gross + qty * entry > PAPER_GROSS_CAP:
+                await self._pool.execute(
+                    _PENDING_REJECT_SQL, r["id"], "gross_cap",
+                    json.dumps({**fill_prov, "gross_at_reject": round(gross)},
+                               default=str))
+                logger.info(f"[REJECT] #{r['id']} {r['symbol']}: gross_cap "
+                            f"at pending fill")
+                continue
             vol60 = await self._fetch_vol60(r["symbol"])
             await self._pool.execute(
                 _FILL_SQL, r["id"], qty, entry,
@@ -398,6 +432,40 @@ class PaperEngine:
                         f"{r['symbol']} x{qty} @ {entry:.2f} "
                         f"(queued {r['created_at']:%H:%M} UTC, ltp {ltp:.2f})")
         return filled
+
+    async def expire_stale_pending(self) -> int:
+        """REJECT PENDING rows older than PAPER_PENDING_MAX_AGE_H as
+        'pending_expired' — auditable, never silent. Catches unresolvable
+        symbols and any future fill-path regression: before this, a stuck
+        queue was only discoverable by reading the blotter (22 rows sat
+        PENDING for days during the Aug 7-12 outage with nothing flagging
+        them)."""
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(hours=PAPER_PENDING_MAX_AGE_H))
+        expired = 0
+        for r in await self._pool.fetch(_PENDING_ROWS_SQL):
+            if r["created_at"] > cutoff:
+                continue
+            await self._pool.execute(
+                _PENDING_REJECT_SQL, r["id"], "pending_expired",
+                json.dumps({"expired_after_h": PAPER_PENDING_MAX_AGE_H,
+                            "queued_at": str(r["created_at"])}, default=str))
+            logger.warning(
+                f"[EXPIRE] #{r['id']} {r['strategy']} {r['side']} "
+                f"{r['symbol']} PENDING since {r['created_at']:%Y-%m-%d %H:%M} "
+                f"UTC — pending_expired (never filled)")
+            expired += 1
+        return expired
+
+    async def _symbol_known(self, symbol: str) -> bool:
+        """Symbol exists in the companies universe. Fail-open on DB errors —
+        a transient hiccup must not reject real signals."""
+        try:
+            row = await self._pool.fetchrow(_SYMBOL_KNOWN_SQL, symbol.upper())
+            return row is not None
+        except Exception as e:
+            logger.warning(f"symbol check failed for {symbol}: {e}")
+            return True
 
     async def _pead_gap_check(self, symbol: str, ltp: float) -> float | None:
         """Returns the gap % if the fill price exceeds the previous close by
@@ -495,11 +563,22 @@ class PaperEngine:
         return marked
 
     async def close_position(self, row, price: float, reason: str) -> None:
-        res = await self._pool.fetchrow(_CLOSE_SQL, row["id"], price, reason)
+        """Close at the live price with the same adverse slippage haircut as
+        entries (2026-08-15: exits previously filled at the raw LTP — half
+        the friction model was missing and P&L flattered itself). LONG sells
+        lower, SHORT covers higher; the raw LTP is preserved in provenance."""
+        slip = PAPER_SLIPPAGE_BPS / 1e4
+        exit_px = (price * (1 - slip) if row["side"] == "LONG"
+                   else price * (1 + slip))
+        prov = {"exit_ltp_raw": price, "exit_slippage_bps": PAPER_SLIPPAGE_BPS}
+        res = await self._pool.fetchrow(
+            _CLOSE_SQL, row["id"], exit_px, reason,
+            json.dumps(prov, default=str))
         pnl = res["pnl"] if res else None
         logger.info(
             f"[CLOSE] #{row['id']} {row['strategy']} {row['side']} "
-            f"{row['symbol']} x{row['qty']} @ {price:.2f} "
+            f"{row['symbol']} x{row['qty']} @ {exit_px:.2f} "
+            f"(ltp {price:.2f}, slip {PAPER_SLIPPAGE_BPS}bps) "
             f"reason={reason} pnl={'n/a' if pnl is None else f'{pnl:.0f}'}")
 
     async def run_exits(self, ltps: dict[str, float]) -> int:
@@ -525,13 +604,14 @@ class PaperEngine:
     @staticmethod
     def _exit_reason(r, ltp: float | None, now_ist: datetime) -> str | None:
         entry_ist = r["entry_at"].astimezone(IST)
-        held_days = (now_ist.date() - entry_ist.date()).days
 
         # 1. Cash shorts are intraday-only: square off from 15:15 IST; if one
         #    survived overnight (service down at close), flatten at the next
-        #    opportunity rather than pretending the rule allows it.
+        #    opportunity rather than pretending the rule allows it. This
+        #    check stays CALENDAR-day: any later date means flatten now.
         if r["side"] == "SHORT" and r["instrument"] == "CASH":
-            if now_ist.time() >= SQUAREOFF_IST or held_days > 0:
+            if (now_ist.time() >= SQUAREOFF_IST
+                    or (now_ist.date() - entry_ist.date()).days > 0):
                 return "squareoff"
 
         # 2. Vol-scaled TRAILING stop anchored to the favorable extreme
@@ -560,13 +640,14 @@ class PaperEngine:
                 if r["side"] == "LONG" and ltp <= r["entry_price"] * (1 - stop):
                     return "stop"
 
-        # 3. Calendar-day holding periods. orderwin_long, like pead_long,
-        #    is an unconditional hold (no stop) — the validated D0T stat has
-        #    no stop conditioning.
+        # 3. TRADING-day holding periods (C2 fix 2026-08-15): the validated
+        #    horizons are sessions — PEAD's +2.11% is 20 trading days, and
+        #    calendar counting exited ~30% early (20 calendar ≈ 14 sessions).
+        #    Weekends and NSE holidays do not advance the clock.
         hold = {"pead_long": PAPER_PEAD_HOLD_DAYS,
                 "orderwin_long": PAPER_ORDERWIN_HOLD_DAYS,
                 }.get(r["strategy"], PAPER_SHORT_HOLD_DAYS)
-        if held_days >= hold:
+        if trading_days_between(entry_ist.date(), now_ist.date()) >= hold:
             return "time_exit"
         return None
 

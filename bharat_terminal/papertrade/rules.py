@@ -224,9 +224,12 @@ class RulesEngine:
     # ── public entrypoint ────────────────────────────────────────────────────
 
     async def evaluate_report(self, report: ImpactReport) -> list[SignalIntent]:
-        """Gate cascade → intents. Stale events yield REJECTED-marked intents
-        (auditable rows) rather than silence; sub-threshold gates log and skip.
-        """
+        """Gate cascade → intents. EVERY gate outcome is an auditable row:
+        stale events AND gated-out signals yield REJECTED-marked intents
+        (2026-08-15 — sub-threshold gates used to log and skip, so the
+        materiality/SUE gates' false-veto rates were unmeasurable from the
+        ledger once logs rotated; the pre-open probe records counterfactuals
+        and these gates now match it)."""
         intents: list[SignalIntent] = []
         ni = report.news_item
         headline = ni.headline or ""
@@ -356,9 +359,14 @@ class RulesEngine:
             None if p is None else bool(p >= PAPER_MATERIALITY_MIN))
         if p is not None and p < PAPER_MATERIALITY_MIN:
             logger.info(
-                f"[GATED] headwind_short {ci.symbol}: materiality p={p:.3f} "
-                f"< {PAPER_MATERIALITY_MIN}")
-            return []
+                f"[REJECT] headwind_short {ci.symbol}: materiality_gated "
+                f"(p={p:.3f} < {PAPER_MATERIALITY_MIN})")
+            return [SignalIntent(
+                "headwind_short", ci.symbol, "SHORT", "CASH",
+                report.id, report.news_id,
+                provenance={**base_prov, "materiality_p": p,
+                            "gate_flags": flags},
+                rejected_reason="materiality_gated")]
 
         fno = await self._fno_supplier()
         in_fno = ci.symbol.upper() in fno
@@ -401,18 +409,29 @@ class RulesEngine:
         flags["sue_found"] = sue is not None
         flags["sue_composite"] = sue
         flags["sue_threshold"] = thr
+        gate_prov = {**base_prov, "gate_flags": flags}
         if sue is None:
-            logger.info(f"[GATED] pead_long {ci.symbol}: no earnings_surprises "
-                        f"row within ±2d of filing")
-            return []
+            logger.info(f"[REJECT] pead_long {ci.symbol}: no_sue_row "
+                        f"(no earnings_surprises row within ±2d of filing)")
+            return [SignalIntent("pead_long", ci.symbol, "LONG", "CASH",
+                                 report.id, report.news_id,
+                                 provenance=gate_prov,
+                                 rejected_reason="no_sue_row")]
         if thr is None:
-            logger.info(f"[GATED] pead_long {ci.symbol}: SUE threshold "
-                        f"unavailable (trailing window empty)")
-            return []
+            logger.info(f"[REJECT] pead_long {ci.symbol}: sue_thr_missing "
+                        f"(trailing window empty)")
+            return [SignalIntent("pead_long", ci.symbol, "LONG", "CASH",
+                                 report.id, report.news_id,
+                                 provenance=gate_prov,
+                                 rejected_reason="sue_thr_missing")]
         if sue < thr:
-            logger.info(f"[GATED] pead_long {ci.symbol}: sue={sue:.3f} < "
-                        f"P{int(SUE_PERCENTILE * 100)}={thr:.3f}")
-            return []
+            logger.info(f"[REJECT] pead_long {ci.symbol}: sue_below_thr "
+                        f"({sue:.3f} < P{int(SUE_PERCENTILE * 100)}"
+                        f"={thr:.3f})")
+            return [SignalIntent("pead_long", ci.symbol, "LONG", "CASH",
+                                 report.id, report.news_id,
+                                 provenance=gate_prov,
+                                 rejected_reason="sue_below_thr")]
 
         flags["sue_pass"] = True
         prov = {**base_prov, "gate_flags": flags,

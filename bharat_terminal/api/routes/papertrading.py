@@ -27,11 +27,15 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 
-from bharat_terminal.analysis.market_hours import is_market_hours
+from bharat_terminal.analysis.market_hours import is_session_live
 from bharat_terminal.api.auth import require_internal_user
 from bharat_terminal.api.db import get_session_factory
 
 KB_SERVICE_URL = os.getenv("KB_SERVICE_URL", "http://kb-service:8001")
+
+# Same adverse haircut the engine applies (entries AND exits) — a manual
+# exit must not fill cheaper than the engine's own exits would.
+PAPER_SLIPPAGE_BPS = float(os.getenv("PAPER_SLIPPAGE_BPS", "10"))
 
 logger = logging.getLogger(__name__)
 router = APIRouter(
@@ -56,6 +60,14 @@ _UNREALIZED_SQL = """
     END
 """
 
+# Closed-trade QUALITY stats (hit rate, avg win/loss, profit factor) count
+# only rule-driven exits: 'manual' closes and legacy 'reset' liquidations
+# are administrative events, not strategy outcomes — blending them in is how
+# the Jul-30 reset artifacts read as "PEAD lost ₹41k" (2026-08-15 fix).
+# realized_pnl stays inclusive: equity is money regardless of why it moved.
+_RULE_EXIT = ("status = 'CLOSED' AND coalesce(exit_reason, '') "
+              "NOT IN ('manual', 'reset')")
+
 # Shared aggregate set for the totals row and the per-strategy breakdown so
 # the two can never drift apart.
 _STATS_SQL = f"""
@@ -70,13 +82,13 @@ _STATS_SQL = f"""
              FILTER (WHERE status = 'OPEN'), 0)::float8 AS gross_exposure,
     coalesce(sum(qty * entry_price)
              FILTER (WHERE status = 'OPEN'), 0)::float8 AS utilised_capital,
-    count(*) FILTER (WHERE status = 'CLOSED' AND pnl > 0) AS n_wins,
-    count(*) FILTER (WHERE status = 'CLOSED' AND pnl IS NOT NULL)
+    count(*) FILTER (WHERE {_RULE_EXIT} AND pnl > 0) AS n_wins,
+    count(*) FILTER (WHERE {_RULE_EXIT} AND pnl IS NOT NULL)
         AS n_evaluated,
-    sum(pnl) FILTER (WHERE status = 'CLOSED' AND pnl > 0)::float8 AS win_sum,
-    sum(pnl) FILTER (WHERE status = 'CLOSED' AND pnl < 0)::float8 AS loss_sum,
-    avg(pnl) FILTER (WHERE status = 'CLOSED' AND pnl > 0)::float8 AS avg_win,
-    avg(pnl) FILTER (WHERE status = 'CLOSED' AND pnl < 0)::float8 AS avg_loss
+    sum(pnl) FILTER (WHERE {_RULE_EXIT} AND pnl > 0)::float8 AS win_sum,
+    sum(pnl) FILTER (WHERE {_RULE_EXIT} AND pnl < 0)::float8 AS loss_sum,
+    avg(pnl) FILTER (WHERE {_RULE_EXIT} AND pnl > 0)::float8 AS avg_win,
+    avg(pnl) FILTER (WHERE {_RULE_EXIT} AND pnl < 0)::float8 AS avg_loss
 """
 
 _TRADE_COLUMNS = """
@@ -240,6 +252,32 @@ async def summary():
             ) d ORDER BY day
         """))).scalars().all()
 
+        # Gate-audit + pipeline-health readouts (2026-08-15): the reject
+        # breakdown makes gate behavior (stale_event share, veto rates)
+        # visible without SQL, and data_quality surfaces exactly the silent
+        # failures of Aug 7-12 — stuck pendings, frozen marks, missing
+        # snapshots — as numbers on the dashboard instead of forensics.
+        rejects = (await session.execute(text("""
+            SELECT coalesce(exit_reason, 'unspecified') AS reason,
+                   count(*) AS n
+            FROM paper_trades WHERE status = 'REJECTED'
+            GROUP BY 1 ORDER BY n DESC
+        """))).mappings().all()
+        dq = (await session.execute(text("""
+            SELECT
+              (SELECT count(*) FROM paper_trades
+                WHERE status = 'PENDING') AS n_pending,
+              (SELECT EXTRACT(EPOCH FROM (now() - min(created_at))) / 3600.0
+                 FROM paper_trades WHERE status = 'PENDING')
+                AS oldest_pending_h,
+              (SELECT EXTRACT(EPOCH FROM (now() - min(mtm_at))) / 3600.0
+                 FROM paper_trades WHERE status = 'OPEN')
+                AS stalest_open_mark_h,
+              (SELECT count(*) FROM paper_trades
+                WHERE status = 'OPEN' AND mtm_at IS NULL) AS n_open_unmarked,
+              (SELECT max(ts) FROM paper_equity_snapshots) AS last_snapshot_at
+        """))).mappings().one()
+
     realized = float(t["realized_pnl"])
     unrealized = float(t["unrealized_pnl"])
     total_pnl = realized + unrealized
@@ -301,6 +339,15 @@ async def summary():
         "max_drawdown_pct": _rnd(mdd),
         "sharpe": _rnd(sharpe, 3),
         "n_daily_points": len(daily_equity),
+        "rejects_by_reason": {r["reason"]: r["n"] for r in rejects},
+        "data_quality": {
+            "n_pending": dq["n_pending"],
+            "oldest_pending_h": _rnd(dq["oldest_pending_h"], 1),
+            "stalest_open_mark_h": _rnd(dq["stalest_open_mark_h"], 1),
+            "n_open_unmarked": dq["n_open_unmarked"],
+            "last_snapshot_at": (dq["last_snapshot_at"].isoformat()
+                                 if dq["last_snapshot_at"] else None),
+        },
     }
     out.update(_closed_stats(t))
     return out
@@ -367,11 +414,15 @@ async def manual_exit(trade_id: int,
         if row["status"] != "OPEN":
             raise HTTPException(409, f"trade_is_{row['status'].lower()}")
 
-        if not is_market_hours():
+        # is_session_live, NOT is_market_hours (2026-08-15): 09:00-09:15 is
+        # the pre-open auction — a manual close there would fill at the
+        # indicative/stale LTP, the exact phantom class the engine's
+        # session-floor fix eliminated.
+        if not is_session_live():
             raise HTTPException(
-                409, "market_closed — a manual exit now would fill at a "
-                     "stale price; retry during market hours (the engine's "
-                     "own exit rules keep running)")
+                409, "session_not_live — manual exits fill only during "
+                     "continuous trading (09:15-15:30 IST, trading days); "
+                     "the engine's own exit rules keep running")
 
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -386,6 +437,11 @@ async def manual_exit(trade_id: int,
         if ltp <= 0:
             raise HTTPException(502, "ltp_unavailable")
 
+        # Same adverse slippage as the engine's exits (2026-08-15): LONG
+        # sells lower, SHORT covers higher; raw LTP preserved in provenance.
+        slip = PAPER_SLIPPAGE_BPS / 1e4
+        exit_px = (ltp * (1 - slip) if row["side"] == "LONG"
+                   else ltp * (1 + slip))
         res = await session.execute(text("""
             UPDATE paper_trades
             SET status = 'CLOSED', exit_price = :px, exit_at = now(),
@@ -395,14 +451,15 @@ async def manual_exit(trade_id: int,
                 provenance = provenance || cast(:prov AS jsonb)
             WHERE id = :id AND status = 'OPEN'
             RETURNING pnl
-        """), {"id": trade_id, "px": ltp,
+        """), {"id": trade_id, "px": exit_px,
                "prov": json.dumps({"exited_by": actor,
-                                   "exit_ltp_raw": ltp})})
+                                   "exit_ltp_raw": ltp,
+                                   "exit_slippage_bps": PAPER_SLIPPAGE_BPS})})
         await session.commit()
         pnl = res.scalar_one_or_none()
         if pnl is None:
             raise HTTPException(409, "trade_changed_state_retry")
         logger.info(f"[MANUAL] #{trade_id} {row['symbol']} closed by {actor} "
-                    f"@ {ltp} pnl={pnl}")
+                    f"@ {exit_px} (ltp {ltp}) pnl={pnl}")
         return {"id": trade_id, "action": "closed",
-                "exit_price": ltp, "pnl": _rnd(pnl)}
+                "exit_price": _rnd(exit_px), "pnl": _rnd(pnl)}

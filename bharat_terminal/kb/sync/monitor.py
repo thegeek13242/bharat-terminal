@@ -539,6 +539,61 @@ class Monitor:
                 except Exception as e:
                     logger.error(f"[results_eval] Failed: {e}", exc_info=True)
 
+    async def heartbeat_watchdog(self):
+        """Active alerting on stale worker heartbeats (2026-08-15).
+
+        WHY: heartbeats were previously read only by the pull-only
+        /admin/health — papertrade was dead for three full trading days
+        (Aug 10-12: zero equity snapshots, marks frozen at Aug 7) and
+        nothing told anyone. kb-monitor is the right watcher: it runs 24/7
+        and cannot watch itself die (its own beat is watched by /admin).
+
+        Every 60s during the live session (plus a settle grace after the
+        09:15 floor), each key in HEARTBEAT_WATCHDOG_KEYS must exist in
+        Redis. `papertrade` proves the process is scheduled (TTL 180s);
+        `papertrade:mtm` is stamped only after a SUCCESSFUL MTM cycle body,
+        so a loop that runs but fails every cycle also trips the alert.
+        Alert spam is bounded by guardrails' per-kind cooldown.
+        """
+        keys = [k.strip() for k in os.getenv(
+            "HEARTBEAT_WATCHDOG_KEYS", "papertrade,papertrade:mtm").split(",")
+            if k.strip()]
+        if not keys:
+            return
+        from bharat_terminal.analysis.market_hours import (SESSION_FLOOR,
+                                                           is_session_live)
+        import redis.asyncio as aioredis
+        client = aioredis.from_url(
+            os.getenv("REDIS_URL", "redis://redis:6379/0"),
+            decode_responses=True, socket_timeout=5, socket_connect_timeout=5)
+        grace = timedelta(minutes=5)
+        while not self._shutdown.is_set():
+            if not await self._sleep_seconds(60):
+                return
+            now = datetime.now(IST)
+            if not is_session_live(now):
+                continue
+            floor_dt = datetime.combine(now.date(), SESSION_FLOOR, tzinfo=IST)
+            if now < floor_dt + grace:
+                continue                     # let services settle post-open
+            for k in keys:
+                try:
+                    alive = await client.get(f"hb:{k}")
+                except Exception as e:
+                    logger.warning(f"[WATCHDOG] redis read failed: {e}")
+                    break
+                if alive is None:
+                    msg = (f"hb:{k} absent during the live session — worker "
+                           f"loop dead or its cycles are failing (the "
+                           f"Aug 10-12 papertrade outage class)")
+                    logger.error(f"[WATCHDOG] {msg}")
+                    try:
+                        from bharat_terminal.alerts import get_monitor
+                        get_monitor().alert_now("HEARTBEAT_STALLED", msg)
+                    except Exception as e:
+                        logger.error(f"[WATCHDOG] alert failed: {e}")
+            await self._cycle_beat("watchdog", 300)
+
     async def _cycle_beat(self, loop_name: str, ttl_s: int) -> None:
         """Per-loop last-completed-cycle stamp (hb:kb-monitor:<loop>).
 
@@ -728,6 +783,7 @@ class Monitor:
             asyncio.create_task(self.daily_results_sentiment_eval(), name="results_eval"),
             asyncio.create_task(self.dossier_refresh_loop(),   name="dossier_refresh"),
             asyncio.create_task(self.retention_prune_loop(),   name="retention_prune"),
+            asyncio.create_task(self.heartbeat_watchdog(),     name="hb_watchdog"),
             # Liveness beat for /admin/health: every sync loop above sleeps
             # for hours between scheduled runs, so a dedicated 60s beat is the
             # only honest "this process is alive" signal.

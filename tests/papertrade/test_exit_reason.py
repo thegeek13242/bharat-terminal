@@ -3,16 +3,16 @@ repo: squareoff, vol-scaled trailing stops, flat-stop fallback, per-strategy
 holds, pead/hedge exemptions. Pure static method of (row, ltp, now_ist).
 
 Review-finding regressions carried here:
-  C2 (CRITICAL): holds count calendar days; validated PEAD horizon is 20
-      TRADING days -> xfail(strict=True) until fixed.
-  Comment-vs-code discrepancy (flagged 2026-07-31): engine.py says
-      "orderwin_long, like pead_long, is an unconditional hold (no stop)"
-      but the code exempts only pead_long. Current behavior is PINNED below
-      (test_orderwin_currently_gets_trailing_stop) so whichever way the
-      founder decides, the change is deliberate and visible.
+  C2 (CRITICAL, review 2026-07-30) FIXED 2026-08-15: holds now count
+      TRADING days via market_hours.trading_days_between — weekends and
+      NSE holidays no longer advance the clock.
+  Comment-vs-code discrepancy (flagged 2026-07-31): the stale engine.py
+      comment claiming orderwin_long is "an unconditional hold (no stop)"
+      was removed 2026-08-15; the CODE still applies the trailing stop to
+      orderwin_long, and that behavior remains PINNED below
+      (test_orderwin_currently_gets_trailing_stop). Removing the stop is a
+      founder decision, not a drive-by.
 """
-import pytest
-
 from bharat_terminal.papertrade import engine as eng
 from conftest import ist_dt, open_row
 
@@ -149,25 +149,35 @@ def test_orderwin_currently_gets_trailing_stop():
     assert exit_reason(r, trigger, ist_dt(2026, 7, 30, 11, 0)) == "trail_stop"
 
 
-# ── 4. holding periods ───────────────────────────────────────────────────
+# ── 4. holding periods (TRADING days — C2 fixed 2026-08-15) ──────────────
 
 def test_pead_time_exit_at_hold_boundary():
+    # Entry Wed 2026-07-01; 20 TRADING days later is Wed 2026-07-29
+    # (Jul 2-3, 6-10, 13-17, 20-24, 27-29 — no July holidays in 2026).
     r = open_row(strategy="pead_long", side="LONG", instrument="CASH",
                  entry_price=100.0, entry_at=ist_dt(2026, 7, 1, 10, 0))
-    hold = eng.PAPER_PEAD_HOLD_DAYS
-    day_before = ist_dt(2026, 7, 1 + hold - 1, 11, 0)
-    on_day = ist_dt(2026, 7, 1 + hold, 11, 0)
-    assert exit_reason(r, 100.0, day_before) is None
-    assert exit_reason(r, 100.0, on_day) == "time_exit"
+    assert eng.PAPER_PEAD_HOLD_DAYS == 20     # test.sh pins the env
+    assert exit_reason(r, 100.0, ist_dt(2026, 7, 28, 11, 0)) is None
+    assert exit_reason(r, 100.0, ist_dt(2026, 7, 29, 11, 0)) == "time_exit"
 
 
 def test_fut_short_time_exit_after_short_hold():
+    # Entry Mon 2026-07-20; 5 TRADING days later is Mon 2026-07-27
+    # (Jul 21-24 are 4 sessions; the weekend does not advance the clock).
     r = open_row(side="SHORT", instrument="FUT", entry_price=100.0,
                  entry_at=ist_dt(2026, 7, 20, 10, 0))
-    hold = eng.PAPER_SHORT_HOLD_DAYS
-    assert exit_reason(r, 100.0, ist_dt(2026, 7, 20 + hold - 1, 11, 0)) is None
-    assert exit_reason(r, 100.0,
-                       ist_dt(2026, 7, 20 + hold, 11, 0)) == "time_exit"
+    assert eng.PAPER_SHORT_HOLD_DAYS == 5
+    assert exit_reason(r, 100.0, ist_dt(2026, 7, 24, 11, 0)) is None
+    assert exit_reason(r, 100.0, ist_dt(2026, 7, 27, 11, 0)) == "time_exit"
+
+
+def test_hold_clock_skips_nse_holidays():
+    # Entry Wed 2026-09-30, 5-session hold: Oct 1, 5, 6, 7, 8 — Gandhi
+    # Jayanti (Fri Oct 2) plus the weekend add three calendar days.
+    r = open_row(strategy="orderwin_long", side="LONG", instrument="CASH",
+                 entry_price=100.0, entry_at=ist_dt(2026, 9, 30, 10, 0))
+    assert exit_reason(r, 100.0, ist_dt(2026, 10, 7, 11, 0)) is None
+    assert exit_reason(r, 100.0, ist_dt(2026, 10, 8, 11, 0)) == "time_exit"
 
 
 def test_time_exit_fires_even_without_ltp():
@@ -177,16 +187,9 @@ def test_time_exit_fires_even_without_ltp():
     assert exit_reason(r, None, ist_dt(2026, 7, 30, 11, 0)) == "time_exit"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="C2 (CRITICAL, review 2026-07-30): holds count CALENDAR days but "
-           "the validated PEAD horizon is 20 TRADING days — 2026-07-03 to "
-           "2026-07-23 is 20 calendar but only 14 trading days, so the "
-           "position must still be held. Remove this marker when the hold "
-           "logic switches to trading days.")
 def test_c2_pead_hold_counts_trading_days():
+    # C2 (review 2026-07-30), FIXED 2026-08-15: 2026-07-03 -> 2026-07-23 is
+    # 20 calendar but only 14 trading days — the position must still be held.
     r = open_row(strategy="pead_long", side="LONG", instrument="CASH",
                  entry_price=100.0, entry_at=ist_dt(2026, 7, 3, 11, 0))
-    # 14 trading days elapsed (Jul 6-10, 13-17, 20-23) — under a 20
-    # TRADING-day hold this must not exit yet.
     assert exit_reason(r, 100.0, ist_dt(2026, 7, 23, 11, 0)) is None

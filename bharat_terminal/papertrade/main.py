@@ -18,12 +18,14 @@ import logging
 import os
 import signal
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from aiokafka import AIOKafkaConsumer
 
-from bharat_terminal.analysis.market_hours import is_market_hours
+from bharat_terminal.analysis.market_hours import (SESSION_FLOOR,
+                                                   is_session_live,
+                                                   is_trading_day)
 from bharat_terminal.heartbeat import abeat
 from bharat_terminal.papertrade import marks
 from bharat_terminal.papertrade.engine import PaperEngine
@@ -47,25 +49,52 @@ CONSUMER_GROUP = "papertrade"
 # unless a fill/close happened.
 MTM_INTERVAL_S = int(os.getenv("PAPER_MTM_INTERVAL_S", "5"))
 SNAPSHOT_INTERVAL_S = 300
+# Consecutive live-session cycles a tracked symbol may return no quote
+# before the one-shot SYMBOL-DRY alert (~5 min at the 5s MTM interval).
+PAPER_SYMBOL_DRY_CYCLES = int(os.getenv("PAPER_SYMBOL_DRY_CYCLES", "60"))
 
 # Continuous trading starts 09:15 IST. is_market_hours() opens at 09:00 —
 # but 09:00-09:15 is the pre-open auction: quotes are stale/indicative and
 # the day's `open` doesn't exist yet. Filling/marking there produced the
 # 2026-07-31 phantoms (REFEX filled at yesterday's LTP and "stopped" 60ms
 # later on the real −6.7% open; HYUNDAI/BESTAGRO stopped on indicative
-# prices). NOTHING trades or marks before this floor.
-_SESSION_FLOOR_IST = dtime(9, 15)
+# prices). NOTHING trades or marks before this floor. The implementation
+# moved to analysis.market_hours (2026-08-15) so the dashboard's manual-exit
+# endpoint shares the exact same floor; the historical names stay as aliases.
+_SESSION_FLOOR_IST = SESSION_FLOOR
 
 
 def _session_live(now: datetime | None = None) -> bool:
-    """Continuous session only: is_market_hours() minus the 09:00-09:15
-    pre-open auction. Injectable `now` for tests (same convention as
-    is_market_hours)."""
-    if now is None:
-        now = datetime.now(ZoneInfo("Asia/Kolkata"))
-    else:
-        now = now.astimezone(ZoneInfo("Asia/Kolkata"))
-    return is_market_hours(now) and now.time() >= _SESSION_FLOOR_IST
+    """Compat alias for market_hours.is_session_live (moved 2026-08-15)."""
+    return is_session_live(now)
+
+
+# Queued fills need evidence the symbol has actually PRINTED today: Angel
+# One's `open` appears only once the day's auction/first trade sets it,
+# while `ltp` persists from the previous session. BE/BZ/SM/ST and BSE
+# series never enter the pre-open auction, so just after 09:15 their LTP is
+# still yesterday's print — the C1 phantom class (REFEX/MINID), which the
+# 09:15 floor narrowed but did not close. Before 09:45 the fill IS the
+# auction open (a real next-open order executes in the 09:07 auction);
+# after that the auction price is stale and the live LTP wins.
+_AUCTION_PRICE_CUTOFF = dtime(9, 45)
+
+
+def select_fill_price(quote: dict | None,
+                      now_time: dtime) -> tuple[float, str] | None:
+    """(price, source) to fill a queued PENDING row this cycle, or None to
+    keep waiting. Pure function so the C1 regression is unit-testable."""
+    if not quote:
+        return None
+    day_open = quote.get("open")
+    if not day_open or day_open <= 0:
+        return None                     # no print today yet — do not fill
+    if now_time < _AUCTION_PRICE_CUTOFF:
+        return float(day_open), "auction_open_angelone"
+    ltp = quote.get("ltp")
+    if ltp and ltp > 0:
+        return float(ltp), "live_ltp"
+    return None
 # Absorption-curve marks: LTP at decision (t0) then +5/15/30/60 min for
 # every DURING-SESSION hop-0 filing impact, traded or not. Measures how
 # much of the reaction our ~90s latency can actually reach, per cell.
@@ -190,10 +219,50 @@ async def main():
         loop.add_signal_handler(sig, shutdown_event.set)
 
     # (due_epoch, impact_id, symbol, mark) — in-memory queue for follow-up
-    # marks. Deliberately not crash-persistent: t0 rows survive in the DB and
-    # a restart only loses the later marks of signals in flight (rare, visible
-    # as missing t5+ rows — never miscounted as zero reaction).
+    # marks. t0 rows survive in the DB; on restart _rebuild_mark_queue()
+    # re-arms the NOT-YET-DUE followups from recent t0 rows (2026-08-15 —
+    # the queue previously just died with the process: 28% of t60 marks
+    # missing). Past-due marks stay missing rather than firing late and
+    # mislabeled — never miscounted as zero reaction.
     _mark_queue: list[tuple[float, str, str, str]] = []
+
+    async def _rebuild_mark_queue():
+        """Re-arm future t5/t15/t30/t60 marks for t0 rows younger than the
+        largest offset (60 min + grace)."""
+        try:
+            rows = await engine.pool.fetch("""
+                SELECT t0.impact_id, t0.symbol, t0.ts,
+                       array_agg(m.mark) AS have
+                FROM paper_signal_marks t0
+                LEFT JOIN paper_signal_marks m
+                  ON m.impact_id = t0.impact_id AND m.symbol = t0.symbol
+                 AND m.mark != 't0'
+                WHERE t0.mark = 't0'
+                  AND t0.ts >= now() - interval '65 minutes'
+                GROUP BY 1, 2, 3
+            """)
+        except Exception as e:
+            logger.warning(f"[MARKS] queue rebuild failed (non-fatal): {e}")
+            return
+        now_mono = time.monotonic()
+        now_utc = datetime.now(timezone.utc)
+        armed = 0
+        for r in rows:
+            have = set(r["have"] or ()) - {None}
+            for offset_s, mark in MARK_OFFSETS:
+                if mark in have:
+                    continue
+                due_in = (r["ts"] + timedelta(seconds=offset_s)
+                          - now_utc).total_seconds()
+                if due_in > 0:
+                    _mark_queue.append(
+                        (now_mono + due_in, r["impact_id"], r["symbol"], mark))
+                    armed += 1
+        if armed:
+            logger.info(f"[MARKS] re-armed {armed} follow-up mark(s) "
+                        f"after restart")
+
+    await _rebuild_mark_queue()
 
     async def _capture_t0_marks(report: "ImpactReport"):
         symbols = {ci.symbol.upper() for ci in report.company_impacts
@@ -263,12 +332,16 @@ async def main():
         # preopen_confirm_loop, and fills happen at the Angel One auction
         # `open` once the session floor lifts (mtm_loop).
         session_live = _session_live()
-        ltps: dict[str, float] = {}
+        quotes: dict[str, dict] = {}
         if live and session_live:
             try:
-                ltps = await marks.get_ltps({i.symbol for i in live})
+                quotes = await marks.get_quotes({i.symbol for i in live})
             except Exception as e:
-                logger.warning(f"LTP fetch failed — intents fill as no_ltp: {e}")
+                # 2026-08-15: a transient quote failure used to become a
+                # PERMANENT no_ltp reject (idempotency key blocks retries).
+                # Queue instead — the MTM loop fills once quotes recover.
+                logger.warning(f"quote fetch failed — intents queue for "
+                               f"retry: {e}")
 
         for intent in intents:
             try:
@@ -282,7 +355,17 @@ async def main():
                     # at the auction open / first LTP after the session floor.
                     await engine.queue_position(intent)
                 else:
-                    await engine.open_position(intent, ltps.get(intent.symbol))
+                    q = quotes.get(intent.symbol)
+                    if q and q.get("ltp") and q.get("open"):
+                        await engine.open_position(intent, q["ltp"])
+                    else:
+                        # No quote, or no evidence of a print TODAY (`open`
+                        # absent: illiquid BE/SM/ST/BSE names before their
+                        # first trade — filling at the carried-over LTP is
+                        # the C1 phantom class). Queue for the MTM loop's
+                        # print-gated fill instead of rejecting forever.
+                        intent.provenance["queued_no_today_print"] = True
+                        await engine.queue_position(intent)
             except Exception as e:
                 logger.error(f"engine action failed for {intent.strategy}/"
                              f"{intent.symbol}: {e}", exc_info=True)
@@ -300,40 +383,47 @@ async def main():
     async def mtm_loop():
         """Fill queued PENDING signals, then mark OPEN positions and apply
         exit rules (stop / holding period / the >=15:15 IST cash-short
-        squareoff) every 60s during market hours."""
+        squareoff) every cycle during the live session."""
         ltp_dry_cycles = 0
+        # Per-symbol quote-miss streaks (2026-08-15): the LTP-DRY alert only
+        # fires when the WHOLE book gets zero quotes — a single symbol that
+        # stops resolving (suspension, series migration, an upstream symbol
+        # error) used to freeze its marks and exits invisibly.
+        sym_dry: dict[str, int] = {}
         while not shutdown_event.is_set():
             await asyncio.sleep(MTM_INTERVAL_S)
             # Liveness beat for /admin/health — before the session gate, so
-            # the loop reads alive off-hours too.
+            # the loop reads alive off-hours too. NOTE this only proves the
+            # loop is SCHEDULED; hb:papertrade:mtm below proves cycles are
+            # actually COMPLETING (stamped after a successful body only).
             await abeat("papertrade")
             if not _session_live():
                 continue
             try:
                 symbols = await engine.open_symbols()
                 pending = await engine.pending_symbols()
+                expired = await engine.expire_stale_pending()
                 # open_symbols() returns a list, pending_symbols() a set —
                 # `list | set` crashed every MTM cycle (2026-07-29 hotfix;
                 # it blocked the at-open pending fills).
                 todo = set(symbols) | set(pending)
                 if not todo:
+                    await abeat("papertrade:mtm")
                     continue
                 quotes = await marks.get_quotes(todo)
                 ltps = {s: q["ltp"] for s, q in quotes.items()}
-                # Queued (overnight) signals fill at the day's OPEN — the
-                # pre-open auction equilibrium price, straight from Angel One
-                # (founder 2026-07-30: a real next-open order executes in the
-                # 09:07 auction, not at whatever LTP prints minutes later).
-                # After 09:45 IST the auction price is stale — live LTP wins.
-                fill_prices = dict(ltps)
+                # Queued signals fill ONLY with evidence of a print today
+                # (select_fill_price: day `open` present → auction open
+                # before 09:45, live LTP after; no `open` → wait). The old
+                # bare-LTP fallback filled non-auction series at yesterday's
+                # price (C1).
+                fill_prices: dict[str, float] = {}
                 fill_sources: dict[str, str] = {}
-                now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
-                if pending and now_ist.time() < dtime(9, 45):
-                    for s in pending:
-                        q = quotes.get(s)
-                        if q and q.get("open"):
-                            fill_prices[s] = q["open"]
-                            fill_sources[s] = "auction_open_angelone"
+                now_t = datetime.now(ZoneInfo("Asia/Kolkata")).time()
+                for s in pending:
+                    sel = select_fill_price(quotes.get(s), now_t)
+                    if sel:
+                        fill_prices[s], fill_sources[s] = sel
                 # Fail LOUD when the whole book gets zero quotes (2026-07-29:
                 # Angel One's expired REST JWT silently returned empty quotes
                 # and the at-open fills sat pending for 10 minutes with only
@@ -354,13 +444,39 @@ async def main():
                             logger.error(f"[LTP-DRY] alert failed: {e}")
                 else:
                     ltp_dry_cycles = 0
+                # Per-symbol starvation: alert once when a tracked symbol has
+                # returned no quote for PAPER_SYMBOL_DRY_CYCLES consecutive
+                # live-session cycles (~5 min at the 5s interval).
+                for s in todo:
+                    if s in quotes:
+                        sym_dry.pop(s, None)
+                        continue
+                    sym_dry[s] = sym_dry.get(s, 0) + 1
+                    if sym_dry[s] == PAPER_SYMBOL_DRY_CYCLES:
+                        msg = (f"{s}: no quote for {PAPER_SYMBOL_DRY_CYCLES} "
+                               f"consecutive live-session cycles — its marks/"
+                               f"fills/exits are FROZEN (unresolvable symbol? "
+                               f"suspension? series migration?)")
+                        logger.error(f"[SYMBOL-DRY] {msg}")
+                        try:
+                            from bharat_terminal.alerts import get_monitor
+                            get_monitor().alert_now(
+                                "PAPERTRADE_SYMBOL_DRY", msg)
+                        except Exception as e:
+                            logger.error(f"[SYMBOL-DRY] alert failed: {e}")
                 filled = (await engine.fill_pending(
-                    fill_prices, price_sources=fill_sources)) if pending else 0
+                    fill_prices, price_sources=fill_sources)
+                    if fill_prices else 0)
                 marked = await engine.mark_open_positions(ltps)
                 closed = await engine.run_exits(ltps)
-                log = logger.info if (filled or closed) else logger.debug
+                log = (logger.info if (filled or closed or expired)
+                       else logger.debug)
                 log(f"[MTM] open={len(symbols)} pending={len(pending)} "
-                    f"filled={filled} marked={marked} closed={closed}")
+                    f"filled={filled} marked={marked} closed={closed} "
+                    f"expired={expired}")
+                # Work-stamp: cycles are completing, not merely scheduled.
+                # Expires (TTL 180s) when bodies fail — the watchdog's signal.
+                await abeat("papertrade:mtm")
             except Exception as e:
                 logger.error(f"[MTM] cycle failed: {e}", exc_info=True)
 
@@ -418,12 +534,14 @@ async def main():
                 # pead_long at a pre-open indicative LTP. Queue instead — the
                 # gap guard at pending-fill needs the REAL open anyway.
                 session_live = _session_live()
-                ltps: dict[str, float] = {}
+                quotes: dict[str, dict] = {}
                 if session_live:
                     try:
-                        ltps = await marks.get_ltps({r["symbol"] for r in rows})
+                        quotes = await marks.get_quotes(
+                            {r["symbol"] for r in rows})
                     except Exception as e:
-                        logger.warning(f"[PEAD-SCAN] LTP fetch failed: {e}")
+                        logger.warning(f"[PEAD-SCAN] quote fetch failed — "
+                                       f"hits queue for retry: {e}")
                 for r in rows:
                     intent = SignalIntent(
                         "pead_long", r["symbol"], "LONG", "CASH",
@@ -437,10 +555,14 @@ async def main():
                             "gate_flags": {"liquidity_pass": True,
                                            "sue_pass": True},
                         })
-                    if session_live:
-                        await engine.open_position(
-                            intent, ltps.get(r["symbol"]))
+                    q = quotes.get(r["symbol"])
+                    if session_live and q and q.get("ltp") and q.get("open"):
+                        await engine.open_position(intent, q["ltp"])
                     else:
+                        # Off-session, no quote, or no print today (`open`
+                        # absent) — queue; the MTM loop fills print-gated.
+                        if session_live:
+                            intent.provenance["queued_no_today_print"] = True
                         await engine.queue_position(intent)
             except Exception as e:
                 logger.error(f"[PEAD-SCAN] cycle failed: {e}", exc_info=True)
@@ -515,7 +637,11 @@ async def main():
         while not shutdown_event.is_set():
             await asyncio.sleep(10)
             now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
-            if (not PAPER_PREOPEN_CONFIRM or now_ist.weekday() >= 5
+            # is_trading_day, not weekday (2026-08-15): on a weekday NSE
+            # holiday the "pre-open book" is the previous session's stale
+            # data — a veto decided on it would kill real queued signals.
+            if (not PAPER_PREOPEN_CONFIRM
+                    or not is_trading_day(now_ist.date())
                     or not (_PREOPEN_PROBE_START <= now_ist.time()
                             <= _PREOPEN_PROBE_END)
                     or last_run_day == now_ist.date()):
