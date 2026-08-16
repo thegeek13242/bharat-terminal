@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from typing import AsyncIterator, Dict
 from zoneinfo import ZoneInfo
 
+import aiohttp
+
 from bharat_terminal.types import NewsItem
 from bharat_terminal.ingestion.pdf_fetch import fetch_pdf_text
 from bharat_terminal.ingestion.dedup import text_fingerprint
@@ -51,6 +53,16 @@ ATTACHMENT_URL = "https://www.bseindia.com/xml-data/corpfiling/AttachLive/{name}
 # state stops after the first fully-seen page; the cap only bounds cold starts.
 MAX_PAGES = int(os.getenv("BSE_ANN_MAX_PAGES", "25"))
 SCRIP_MAP_REFRESH_S = 6 * 3600
+
+# Explicit per-request timeout for the announcements API (2026-08-16 wedge
+# audit): api.bseindia.com is documented-flaky (empty bodies + read
+# timeouts, fine on retry — same behavior the kb backfill walker retries
+# around). The session default already bounds requests, but this endpoint
+# earns tighter, self-documenting limits: fail fast, let the next cycle
+# retry.
+_ANN_REQ_TIMEOUT_S = float(os.getenv("BSE_ANN_REQUEST_TIMEOUT_S", "20"))
+_ANN_TIMEOUT = aiohttp.ClientTimeout(total=_ANN_REQ_TIMEOUT_S, connect=8,
+                                     sock_read=10)
 
 
 class BSEFilingsAdapter(BaseAdapter):
@@ -102,7 +114,11 @@ class BSEFilingsAdapter(BaseAdapter):
             return
         try:
             import asyncpg
-            conn = await asyncpg.connect(dsn=dsn, timeout=15)
+            # command_timeout added 2026-08-16 (wedge audit): connect's
+            # `timeout` bounds only the handshake — a wedged connection
+            # could park conn.fetch() forever with no exception.
+            conn = await asyncpg.connect(dsn=dsn, timeout=15,
+                                         command_timeout=20)
             try:
                 rows = await conn.fetch(
                     "SELECT bse_scrip_code, symbol FROM companies "
@@ -179,7 +195,8 @@ class BSEFilingsAdapter(BaseAdapter):
             while page <= MAX_PAGES:
                 url = ANNOUNCEMENTS_URL.format(page=page, date=day)
                 try:
-                    async with session.get(url, headers=self.HEADERS) as resp:
+                    async with session.get(url, headers=self.HEADERS,
+                                           timeout=_ANN_TIMEOUT) as resp:
                         resp.raise_for_status()
                         raw = await resp.text()
                     if not raw or not raw.strip().startswith("{"):

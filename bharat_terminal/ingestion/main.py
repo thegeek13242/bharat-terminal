@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 import redis.asyncio as aioredis
 
 from bharat_terminal.heartbeat import abeat
+from bharat_terminal.ingestion.liveness import (respawn_candidates,
+                                                stalled_adapters)
 from bharat_terminal.ingestion.kafka_producer import NewsKafkaProducer
 from bharat_terminal.ingestion.dedup import DedupFilter, url_fingerprint
 from bharat_terminal.ingestion.article_fetcher import ArticleFetcher
@@ -291,35 +293,33 @@ async def main():
         finally:
             await adapter.close()
 
-    def check_adapter_liveness(adapter_list, now, stall_after):
-        """Pure: [(source_name, idle_s)] for adapters whose loop froze."""
-        stalled = []
-        for a in adapter_list:
-            ts = getattr(a, "last_cycle_ts", None)
-            if ts is None:
-                continue
-            idle = now - ts
-            slow = a.poll_interval_slow or a.poll_interval_seconds or 60
-            if idle > max(3 * slow, stall_after):
-                stalled.append((a.source_name, idle))
-        return stalled
-
     async def liveness_watchdog():
-        """Per-adapter stall detection (2026-07-20 postmortem): the crash
-        alert only fires on exceptions; a silently parked loop needs a
-        heartbeat check. Alerts name the adapter so triage starts at the
-        right stage instead of 'pipeline'."""
+        """Per-adapter stall detection (2026-07-20 postmortem) + SELF-HEAL
+        (2026-08-16, BSE wedge after the EC2 hard crash): the crash alert
+        only fires on exceptions, and a silently parked loop previously got
+        an alert but still needed a human `docker restart`. Now: alert at
+        the stall floor, and past the (higher) respawn floor cancel the
+        parked adapter task and respawn it — cancellation lands at the
+        wedged await regardless of which await it is, and adapter.close()
+        in adapter_task's finally discards the wedged HTTP session. Respawns
+        are rate-limited per adapter (liveness.respawn_candidates) so a
+        genuinely broken source degrades to a visible respawn-heartbeat,
+        never a flap loop."""
         import time as _time
         stall_after = float(os.getenv("ADAPTER_STALL_ALERT_S", "300"))
+        respawn_after = float(os.getenv("ADAPTER_RESPAWN_AFTER_S", "1200"))
+        respawn_min_gap = float(
+            os.getenv("ADAPTER_RESPAWN_MIN_INTERVAL_S", "600"))
         hb_every = float(os.getenv("ADAPTER_HEARTBEAT_LOG_S", "900"))
         last_hb = 0.0
+        last_respawn: dict = {}
         while True:
             await asyncio.sleep(60)
             # Liveness beat for /admin/health (per-adapter stalls are alerted
             # separately below; this proves the process loop itself).
             await abeat("ingestion")
             now = _time.time()
-            for name, idle in check_adapter_liveness(adapters, now, stall_after):
+            for name, idle in stalled_adapters(adapters, now, stall_after):
                 logger.error(f"[liveness] {name} loop stalled — no cycle "
                              f"for {idle:.0f}s")
                 try:
@@ -332,6 +332,37 @@ async def main():
                         f"docker kill -s USR1 bharat-ingestion for task stacks.")
                 except Exception:
                     pass
+            for adapter, idle in respawn_candidates(
+                    adapters, now, respawn_after, last_respawn,
+                    respawn_min_gap):
+                name = adapter.source_name
+                last_respawn[name] = now
+                logger.error(f"[liveness] {name} parked {idle:.0f}s — "
+                             f"cancelling and respawning the adapter task")
+                old = adapter_tasks.get(name)
+                if old is not None and not old.done():
+                    old.cancel()
+                    try:
+                        # CancelledError lands at the parked await; the
+                        # adapter_task's finally closes the (possibly
+                        # wedged) HTTP session on the way out.
+                        await asyncio.wait_for(old, timeout=15)
+                    except Exception:
+                        pass    # timeout/cancel/crash — respawn regardless
+                adapter.last_cycle_ts = now     # fresh grace period
+                adapter_tasks[name] = asyncio.create_task(
+                    adapter_task(adapter), name=f"adapter-{name}")
+                try:
+                    from bharat_terminal.alerts import get_monitor
+                    get_monitor().alert_now(
+                        f"INGESTION_ADAPTER_RESPAWNED_{name}",
+                        f"{name} adapter was parked for {idle:.0f}s and has "
+                        f"been auto-respawned (self-heal, 2026-08-16). If "
+                        f"this repeats every ~{respawn_min_gap / 60:.0f} min "
+                        f"the source itself is broken — investigate, do not "
+                        f"just watch the respawns.")
+                except Exception:
+                    pass
             if now - last_hb >= hb_every:
                 last_hb = now
                 beats = ", ".join(
@@ -339,8 +370,14 @@ async def main():
                     for a in adapters)
                 logger.info(f"[liveness] adapter cycles: {beats}")
 
-    tasks = [asyncio.create_task(adapter_task(a)) for a in adapters]
-    tasks.append(asyncio.create_task(liveness_watchdog(), name="liveness-watchdog"))
+    adapter_tasks: dict = {
+        a.source_name: asyncio.create_task(
+            adapter_task(a), name=f"adapter-{a.source_name}")
+        for a in adapters
+    }
+    watchdog_task = asyncio.create_task(
+        liveness_watchdog(), name="liveness-watchdog")
+    tasks = list(adapter_tasks.values()) + [watchdog_task]
     logger.info(
         f"Started {len(tasks)} news adapter tasks + 1 sentiment adapter "
         f"(dedup={'on' if dedup else 'off'}, fetcher={'on' if fetcher else 'off'}, "
@@ -350,10 +387,13 @@ async def main():
     await shutdown_event.wait()
 
     logger.info("Cancelling adapter tasks...")
-    for task in tasks:
+    # adapter_tasks, not the boot-time `tasks` list: a self-heal respawn
+    # replaces entries, and shutdown must cancel the CURRENT tasks.
+    live_tasks = list(adapter_tasks.values()) + [watchdog_task]
+    for task in live_tasks:
         task.cancel()
 
-    await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.gather(*live_tasks, return_exceptions=True)
 
     await polymarket.stop()
 

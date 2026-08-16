@@ -128,7 +128,11 @@ class BaseAdapter(ABC):
 
     async def get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            # sock_read added 2026-08-16 (BSE wedge audit): `total` bounds a
+            # request end-to-end, but a stalled read on a half-dead
+            # connection burns the whole 30s every time; sock_read=15 fails
+            # it at the first silent gap instead.
+            timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
             headers = {"User-Agent": "BharatTerminal/1.0 (Financial Research Tool)"}
             self._session = aiohttp.ClientSession(timeout=timeout, headers=headers)
         return self._session
