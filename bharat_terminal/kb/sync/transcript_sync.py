@@ -50,10 +50,18 @@ _WS_RE = re.compile(r"[ \t]+")
 _MULTI_NL_RE = re.compile(r"\n{3,}")
 
 
+_SURROGATES_RE = re.compile("[\ud800-\udfff]")
+
+
 def _clean(text_: str) -> str:
     """Whitespace normalisation only — never content removal (see
-    ingestion/pdf_fetch._clean for the ligature rationale)."""
+    ingestion/pdf_fetch._clean for the ligature rationale). Exception:
+    lone UTF-16 surrogates are stripped — pypdf decodes some PDF glyphs
+    (icon fonts, private-use codepoints) into unpaired surrogates, which
+    are not valid UTF-8 and make Postgres reject the ENTIRE row (the
+    2026-08-18 TBOTEK wedge: one such doc froze the whole backfill queue)."""
     text_ = text_.replace("\x00", "").replace("�", "")
+    text_ = _SURROGATES_RE.sub("", text_)
     text_ = re.sub(r"-\n(?=[a-z])", "", text_)  # "compa-\nny" -> "company"
     text_ = _WS_RE.sub(" ", text_)
     text_ = _MULTI_NL_RE.sub("\n\n", text_)
@@ -260,8 +268,7 @@ async def sync_transcripts(
                     status = "needs_ocr"  # scanned/image PDF — text is a stub
                 chars = len(full_text) if full_text else None
 
-            async with SessionFactory() as db:
-                await db.execute(text("""
+            _UPSERT = text("""
                     INSERT INTO concall_transcripts
                         (symbol, news_id, source, headline, announced_at,
                          pdf_url, pdf_bytes, page_count, char_count,
@@ -276,15 +283,43 @@ async def sync_transcripts(
                         char_count = EXCLUDED.char_count,
                         parse_status = EXCLUDED.parse_status,
                         updated_at = now()
-                """), {
-                    "sym": symbol, "nid": r.id, "src": r.source,
-                    "head": r.headline, "ann": r.timestamp_utc, "url": r.url,
-                    "bytes": len(data) if data else None, "pages": pages,
-                    "chars": chars, "text": full_text,
-                    "status": status,
-                    "period": derive_period(full_text, r.timestamp_utc),
-                })
-                await db.commit()
+            """)
+            params = {
+                "sym": symbol, "nid": r.id, "src": r.source,
+                "head": r.headline, "ann": r.timestamp_utc, "url": r.url,
+                "bytes": len(data) if data else None, "pages": pages,
+                "chars": chars, "text": full_text,
+                "status": status,
+                "period": derive_period(full_text, r.timestamp_utc),
+            }
+            try:
+                async with SessionFactory() as db:
+                    await db.execute(_UPSERT, params)
+                    await db.commit()
+            except Exception as e:
+                # 2026-08-18 wedge postmortem: an unstorable document (lone
+                # UTF-16 surrogates in extracted text) raised here, killed
+                # the whole cycle, and — because the pending queue re-picks
+                # it first every cycle — froze the backfill for hours. One
+                # document must never block the queue: record a minimal
+                # store_failed row (no full_text) so the item leaves the
+                # pending set, and keep moving. Retryable later via
+                # --retry-failed once the cause is fixed.
+                logger.error(f"[transcripts] store FAILED for {symbol} "
+                             f"{r.id}: {type(e).__name__}: {str(e)[:200]} — "
+                             f"recording store_failed, queue continues")
+                try:
+                    async with SessionFactory() as db:
+                        await db.execute(_UPSERT, {
+                            **params, "text": None, "chars": None,
+                            "period": None, "status": "store_failed"})
+                        await db.commit()
+                    stats["store_failed"] = stats.get("store_failed", 0) + 1
+                except Exception as e2:
+                    logger.error(f"[transcripts] fallback store also failed "
+                                 f"for {r.id}: {e2}")
+                await asyncio.sleep(POLITENESS_DELAY_S)
+                continue
 
             stats[status] = stats.get(status, 0) + 1
             if status == "ok":
