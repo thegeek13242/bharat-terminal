@@ -388,13 +388,45 @@ class AngelOneMCXAdapter:
         Populates self._token_metadata (tagged by `exch`) so `_parse_tick`
         can build a CommodityTick for each incoming tick.
         """
+        # Resumable download (2026-08-21): the CDN closes connections
+        # mid-body at random offsets (ClientPayloadError "payload is not
+        # completed") but honours HTTP Range, so truncated attempts
+        # accumulate instead of restarting from zero — the 2026-07-28
+        # timeout fix alone could not survive today's CDN behaviour.
+        buf = bytearray()
+        total = None
+        last_err = "incomplete"
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
                 total=SCRIP_MASTER_TIMEOUT_S, sock_read=60)
         ) as session:
-            async with session.get(SCRIP_MASTER_URL) as resp:
-                resp.raise_for_status()
-                raw = await resp.read()
+            for attempt in range(1, 13):
+                headers = {"Range": f"bytes={len(buf)}-"} if buf else {}
+                try:
+                    async with session.get(SCRIP_MASTER_URL, headers=headers) as resp:
+                        if resp.status == 200:
+                            if buf:
+                                buf = bytearray()      # Range ignored: restart
+                            total = resp.content_length or total
+                        elif resp.status == 206:
+                            cr = resp.headers.get("Content-Range", "")
+                            if "/" in cr and cr.rsplit("/", 1)[1].isdigit():
+                                total = int(cr.rsplit("/", 1)[1])
+                        else:
+                            resp.raise_for_status()
+                        async for chunk in resp.content.iter_chunked(1 << 16):
+                            buf.extend(chunk)
+                    if total is None or len(buf) >= total:
+                        break
+                    last_err = f"short body ({len(buf)}/{total})"
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    last_err = f"{type(e).__name__} at {len(buf)} bytes"
+                logger.info(f"[{self.source_name}] scrip-master attempt "
+                            f"{attempt}/12: {last_err} — resuming")
+                await asyncio.sleep(min(30.0, 2.0 * attempt))
+            else:
+                raise RuntimeError(f"scrip master incomplete after 12 attempts: {last_err}")
+        raw = bytes(buf)
         try:
             scrip_list = json.loads(raw)
         except Exception as e:

@@ -57,6 +57,7 @@ _scrip_loaded_at: float = 0.0
 _TOKEN_CACHE_KEY = "live_price:equity_tokens:v1"
 _TOKEN_CACHE_TTL_S = 7 * 24 * 3600
 _SCRIP_TIMEOUT = httpx.Timeout(60.0, connect=15.0)   # per-read, not total
+_SCRIP_MAX_ATTEMPTS = 12
 _SEARCH_NEG_TTL_S = 3600
 _refresh_task: Optional[asyncio.Task] = None
 _search_neg: Dict[str, float] = {}
@@ -99,14 +100,55 @@ def _parse_scrip_master(rows) -> tuple[Dict[str, str], Dict[str, str]]:
     return tokens, bse_tokens
 
 
+async def _download_scrip_master(client: httpx.AsyncClient,
+                                 url: str = SCRIP_MASTER_URL,
+                                 max_attempts: int = _SCRIP_MAX_ATTEMPTS) -> bytes:
+    """Resumable download. Angel One's CDN (measured 2026-08-21) closes the
+    connection mid-body at random offsets (0.7MB, 2.9MB of 37MB); it does
+    honour HTTP Range (206), so truncated attempts ACCUMULATE instead of
+    restarting from zero. A 200 in reply to a Range request means the server
+    ignored it — start over with that body."""
+    buf = bytearray()
+    total: Optional[int] = None
+    last_err = "incomplete"
+    for attempt in range(1, max_attempts + 1):
+        headers = {"Range": f"bytes={len(buf)}-"} if buf else {}
+        try:
+            async with client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code == 200:
+                    if buf:
+                        buf = bytearray()          # Range ignored: restart
+                    cl = resp.headers.get("content-length")
+                    total = int(cl) if cl else total
+                elif resp.status_code == 206:
+                    cr = resp.headers.get("content-range", "")
+                    if "/" in cr and cr.rsplit("/", 1)[1].isdigit():
+                        total = int(cr.rsplit("/", 1)[1])
+                elif resp.status_code == 416 and total and len(buf) >= total:
+                    return bytes(buf)              # already complete
+                else:
+                    resp.raise_for_status()
+                async for chunk in resp.aiter_bytes():
+                    buf.extend(chunk)
+            if total is None or len(buf) >= total:
+                return bytes(buf)
+            last_err = f"short body ({len(buf)}/{total})"
+        except httpx.HTTPError as e:               # truncated/closed: resume
+            last_err = f"{type(e).__name__} at {len(buf)} bytes"
+        logger.info(f"[live_price] scrip-master attempt {attempt}/{max_attempts}: "
+                    f"{last_err} — resuming")
+        await asyncio.sleep(min(30.0, 2.0 * attempt))
+    raise RuntimeError(f"scrip master incomplete after {max_attempts} attempts: {last_err}")
+
+
 async def _refresh_from_cdn(redis_client) -> None:
-    """Background: download + parse the scrip master; on success swap the
-    maps in and persist them to Redis. Fail-open with a typed log line."""
+    """Background: download (resumable) + parse the scrip master; on success
+    swap the maps in and persist them to Redis. Fail-open with a typed log."""
     global _equity_tokens, _bse_equity_tokens, _scrip_loaded_at
     try:
         async with httpx.AsyncClient(timeout=_SCRIP_TIMEOUT) as client:
-            resp = await client.get(SCRIP_MASTER_URL)
-        tokens, bse_tokens = _parse_scrip_master(resp.json())
+            raw = await _download_scrip_master(client)
+        tokens, bse_tokens = _parse_scrip_master(json.loads(raw))
         if not tokens:
             raise RuntimeError("scrip master parsed but yielded 0 NSE tokens")
         _equity_tokens, _bse_equity_tokens = tokens, bse_tokens
@@ -197,70 +239,69 @@ def _pick_search_match(rows, symbol: str, exch: str) -> Optional[str]:
     return best
 
 
-def _resolve_via_search(sc, symbol: str) -> Optional[tuple]:
-    """Sync (run in a thread): (exchange, token) via SmartAPI searchScrip,
-    NSE first then BSE. Uses the SDK's raw request so we get the rows, not
-    the SDK's pretty-printed summary string."""
+_SEARCH_MIN_GAP_S = 1.1          # Angel One searchScrip: ~1 request/second
+_SEARCH_MAX_PER_CALL = 3         # ~6s per request: inside callers' 10s client timeout
+_search_last_ts = 0.0
+
+
+def _resolve_via_search(sc, symbol: str) -> tuple:
+    """Sync (run in a thread): ("hit", exchange, token) | ("miss", None, None)
+    | ("error", None, None) via SmartAPI searchScrip, NSE first then BSE.
+    Uses the SDK's raw request so we get the rows, not its summary string.
+    A MISS is only the API's explicit not-found (status False, AB4047-class);
+    rate limits / network errors are ERRORS and must NOT be negative-cached
+    (2026-08-21: caching them benched 18 live symbols for an hour)."""
+    saw_error = False
     for exch in ("NSE", "BSE"):
         try:
             res = sc._postRequest("api.search.scrip",
                                   {"exchange": exch, "searchscrip": symbol})
         except Exception:
+            saw_error = True
             continue
-        tok = _pick_search_match((res or {}).get("data") or [], symbol, exch)
+        if not isinstance(res, dict):
+            saw_error = True
+            continue
+        tok = _pick_search_match(res.get("data") or [], symbol, exch)
         if tok:
-            return exch, tok
-    return None
+            return "hit", exch, tok
+        if res.get("status") is not False:
+            saw_error = True              # unexpected shape: don't bench it
+    return ("error" if saw_error else "miss"), None, None
 
 
 async def _resolve_unmapped(sc, symbols: List[str]) -> None:
     """Fill in-memory maps for symbols the scrip master didn't cover (or
-    when the maps are empty), one searchScrip call per symbol, memoized
-    with a 1h negative cache so a bad symbol can't hammer the API."""
+    when the maps are empty): at most _SEARCH_MAX_PER_CALL lookups per
+    request, spaced >= 1.1s apart (API rate limit), misses negative-cached
+    for 1h, errors retried on the next request."""
+    global _search_last_ts
     now = time.time()
+    budget = _SEARCH_MAX_PER_CALL
     for s in symbols:
+        if budget <= 0:
+            break
         sym = (s or "").upper()
         if not sym or sym in _equity_tokens or sym in _bse_equity_tokens:
             continue
         if now - _search_neg.get(sym, 0) < _SEARCH_NEG_TTL_S:
             continue
+        wait = _SEARCH_MIN_GAP_S - (time.time() - _search_last_ts)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _search_last_ts = time.time()
+        budget -= 1
         try:
-            hit = await asyncio.to_thread(_resolve_via_search, sc, sym)
+            kind, exch, tok = await asyncio.to_thread(_resolve_via_search, sc, sym)
         except Exception as e:
             logger.debug(f"[live_price] searchScrip failed for {sym}: {e}")
-            hit = None
-        if hit:
-            exch, tok = hit
+            kind, exch, tok = "error", None, None
+        if kind == "hit":
             (_equity_tokens if exch == "NSE" else _bse_equity_tokens)[sym] = tok
             logger.info(f"[live_price] {sym}: token resolved via searchScrip ({exch})")
-        else:
+        elif kind == "miss":
             _search_neg[sym] = now
-
-
-def _smartconnect_from_redis(session_json: str):
-    """Build a token-reusing SmartConnect (no generateSession) from the
-    ingestion-published session. Returns None if the SDK/session is unavailable."""
-    try:
-        from SmartApi import SmartConnect
-    except Exception:
-        return None
-    try:
-        sess = json.loads(session_json)
-        sc = SmartConnect(api_key=sess.get("api_key"))
-        # generateSession returns the jwt already prefixed with "Bearer "; the SDK
-        # re-adds "Bearer " in _request, so strip it here to avoid "Bearer Bearer …"
-        # (which Angel One rejects with AG8001 Invalid Token).
-        tok = (sess.get("access_token") or "")
-        if tok.startswith("Bearer "):
-            tok = tok[7:]
-        sc.setAccessToken(tok)
-        ft = sess.get("feed_token")
-        if ft and hasattr(sc, "setFeedToken"):
-            sc.setFeedToken(ft)
-        return sc
-    except Exception as e:
-        logger.warning(f"[live_price] could not build SmartConnect from session (fail-open): {e}")
-        return None
+            logger.info(f"[live_price] {sym}: not found via searchScrip (benched 1h)")
 
 
 async def get_current_ltps(symbols: List[str], redis_client) -> Dict[str, Dict[str, float]]:
