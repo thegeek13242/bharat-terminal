@@ -57,7 +57,11 @@ _scrip_loaded_at: float = 0.0
 _TOKEN_CACHE_KEY = "live_price:equity_tokens:v1"
 _TOKEN_CACHE_TTL_S = 7 * 24 * 3600
 _SCRIP_TIMEOUT = httpx.Timeout(60.0, connect=15.0)   # per-read, not total
-_SCRIP_MAX_ATTEMPTS = 12
+_SCRIP_MAX_ATTEMPTS = 40
+# Partial-download state persists ACROSS refresh cycles: measured 2026-08-21,
+# Angel One's ELB cut connections every ~1-3MB and a 12-attempt run died at
+# 29.8MB/37MB — the next cycle must resume from there, not from zero.
+_dl_state: Dict[str, object] = {"buf": bytearray(), "total": None}
 _SEARCH_NEG_TTL_S = 3600
 _refresh_task: Optional[asyncio.Task] = None
 _search_neg: Dict[str, float] = {}
@@ -102,14 +106,16 @@ def _parse_scrip_master(rows) -> tuple[Dict[str, str], Dict[str, str]]:
 
 async def _download_scrip_master(client: httpx.AsyncClient,
                                  url: str = SCRIP_MASTER_URL,
-                                 max_attempts: int = _SCRIP_MAX_ATTEMPTS) -> bytes:
+                                 max_attempts: int = _SCRIP_MAX_ATTEMPTS,
+                                 state: Optional[Dict[str, object]] = None) -> bytes:
     """Resumable download. Angel One's CDN (measured 2026-08-21) closes the
     connection mid-body at random offsets (0.7MB, 2.9MB of 37MB); it does
     honour HTTP Range (206), so truncated attempts ACCUMULATE instead of
     restarting from zero. A 200 in reply to a Range request means the server
     ignored it — start over with that body."""
-    buf = bytearray()
-    total: Optional[int] = None
+    st = state if state is not None else _dl_state
+    buf: bytearray = st["buf"]            # type: ignore[assignment]
+    total: Optional[int] = st.get("total")  # type: ignore[assignment]
     last_err = "incomplete"
     for attempt in range(1, max_attempts + 1):
         headers = {"Range": f"bytes={len(buf)}-"} if buf else {}
@@ -117,7 +123,7 @@ async def _download_scrip_master(client: httpx.AsyncClient,
             async with client.stream("GET", url, headers=headers) as resp:
                 if resp.status_code == 200:
                     if buf:
-                        buf = bytearray()          # Range ignored: restart
+                        del buf[:]                 # Range ignored: restart (in place)
                     cl = resp.headers.get("content-length")
                     total = int(cl) if cl else total
                 elif resp.status_code == 206:
@@ -125,20 +131,25 @@ async def _download_scrip_master(client: httpx.AsyncClient,
                     if "/" in cr and cr.rsplit("/", 1)[1].isdigit():
                         total = int(cr.rsplit("/", 1)[1])
                 elif resp.status_code == 416 and total and len(buf) >= total:
-                    return bytes(buf)              # already complete
+                    out = bytes(buf); del buf[:]; st["total"] = None
+                    return out                     # already complete
                 else:
                     resp.raise_for_status()
                 async for chunk in resp.aiter_bytes():
                     buf.extend(chunk)
+            st["total"] = total
             if total is None or len(buf) >= total:
-                return bytes(buf)
+                out = bytes(buf); del buf[:]; st["total"] = None
+                return out
             last_err = f"short body ({len(buf)}/{total})"
         except httpx.HTTPError as e:               # truncated/closed: resume
             last_err = f"{type(e).__name__} at {len(buf)} bytes"
         logger.info(f"[live_price] scrip-master attempt {attempt}/{max_attempts}: "
                     f"{last_err} — resuming")
-        await asyncio.sleep(min(30.0, 2.0 * attempt))
-    raise RuntimeError(f"scrip master incomplete after {max_attempts} attempts: {last_err}")
+        await asyncio.sleep(min(15.0, 1.0 * attempt))
+    # Keep buf/total in `st` so the NEXT refresh cycle resumes from here.
+    raise RuntimeError(f"scrip master incomplete after {max_attempts} attempts "
+                       f"({len(buf)}/{total} bytes kept for resume): {last_err}")
 
 
 async def _refresh_from_cdn(redis_client) -> None:

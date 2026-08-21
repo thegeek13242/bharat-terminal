@@ -393,20 +393,25 @@ class AngelOneMCXAdapter:
         # completed") but honours HTTP Range, so truncated attempts
         # accumulate instead of restarting from zero — the 2026-07-28
         # timeout fix alone could not survive today's CDN behaviour.
-        buf = bytearray()
-        total = None
+        # Partial progress persists across supervisor reconnects (measured
+        # 2026-08-21: the ELB cut every ~1-3MB; 12 attempts from zero could
+        # not cover 37MB, but resuming across cycles can).
+        if not hasattr(self, "_scrip_dl"):
+            self._scrip_dl = {"buf": bytearray(), "total": None}
+        buf = self._scrip_dl["buf"]
+        total = self._scrip_dl["total"]
         last_err = "incomplete"
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
                 total=SCRIP_MASTER_TIMEOUT_S, sock_read=60)
         ) as session:
-            for attempt in range(1, 13):
+            for attempt in range(1, 41):
                 headers = {"Range": f"bytes={len(buf)}-"} if buf else {}
                 try:
                     async with session.get(SCRIP_MASTER_URL, headers=headers) as resp:
                         if resp.status == 200:
                             if buf:
-                                buf = bytearray()      # Range ignored: restart
+                                del buf[:]             # Range ignored: restart (in place)
                             total = resp.content_length or total
                         elif resp.status == 206:
                             cr = resp.headers.get("Content-Range", "")
@@ -416,17 +421,22 @@ class AngelOneMCXAdapter:
                             resp.raise_for_status()
                         async for chunk in resp.content.iter_chunked(1 << 16):
                             buf.extend(chunk)
+                    self._scrip_dl["total"] = total
                     if total is None or len(buf) >= total:
                         break
                     last_err = f"short body ({len(buf)}/{total})"
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     last_err = f"{type(e).__name__} at {len(buf)} bytes"
                 logger.info(f"[{self.source_name}] scrip-master attempt "
-                            f"{attempt}/12: {last_err} — resuming")
-                await asyncio.sleep(min(30.0, 2.0 * attempt))
+                            f"{attempt}/40: {last_err} — resuming")
+                await asyncio.sleep(min(15.0, 1.0 * attempt))
             else:
-                raise RuntimeError(f"scrip master incomplete after 12 attempts: {last_err}")
+                # progress stays in self._scrip_dl for the next reconnect
+                raise RuntimeError(f"scrip master incomplete after 40 attempts "
+                                   f"({len(buf)}/{total} bytes kept): {last_err}")
         raw = bytes(buf)
+        del buf[:]
+        self._scrip_dl["total"] = None
         try:
             scrip_list = json.loads(raw)
         except Exception as e:

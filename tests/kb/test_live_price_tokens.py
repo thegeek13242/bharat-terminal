@@ -85,3 +85,81 @@ def test_request_path_helpers_exist():
                  "_refresh_from_cdn", "_download_scrip_master",
                  "_load_cached_tokens", "get_current_ltps", "get_full_quotes"):
         assert callable(getattr(lp, name)), name
+
+
+# ── resumable download against a connection-cutting server ──────────────
+# Simulates what Angel One's scrip-master ELB did on 2026-08-21: honours
+# Range (206) but closes the connection every few KB. The loop must
+# accumulate across attempts AND across calls (shared state), and must
+# restart if the server ignores Range (200).
+import asyncio
+
+import httpx
+import pytest
+
+from bharat_terminal.kb.live_price import _download_scrip_master
+
+BODY = bytes(range(256)) * 40            # 10,240 bytes
+CUT = 3000                               # server closes after 3000 bytes
+
+
+class CuttingStream(httpx.AsyncByteStream):
+    def __init__(self, data, cut):
+        self.data, self.cut = data, cut
+
+    async def __aiter__(self):
+        yield self.data[:self.cut]
+        if len(self.data) > self.cut:
+            raise httpx.RemoteProtocolError("peer closed connection")
+
+
+def cutting_server(request):
+    rng = request.headers.get("Range")
+    start = int(rng.split("=")[1].rstrip("-")) if rng else 0
+    if start >= len(BODY):
+        return httpx.Response(416)
+    chunk = BODY[start:]
+    status = 206 if rng else 200
+    headers = {"Content-Range": f"bytes {start}-{len(BODY)-1}/{len(BODY)}"} if rng \
+        else {"Content-Length": str(len(BODY))}
+    return httpx.Response(status, headers=headers,
+                          stream=CuttingStream(chunk, CUT))
+
+
+@pytest.fixture(autouse=True)
+def no_sleep(monkeypatch):
+    async def _nosleep(_): pass
+    monkeypatch.setattr(asyncio, "sleep", _nosleep)
+
+
+async def test_resume_accumulates_across_cuts():
+    state = {"buf": bytearray(), "total": None}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(cutting_server)) as c:
+        out = await _download_scrip_master(c, "https://x/scrip.json",
+                                           max_attempts=10, state=state)
+    assert out == BODY                       # 4 cuts, fully assembled
+    assert state["buf"] == b"" and state["total"] is None   # cleared on success
+
+
+async def test_progress_persists_across_calls_when_attempts_run_out():
+    state = {"buf": bytearray(), "total": None}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(cutting_server)) as c:
+        with pytest.raises(RuntimeError):
+            await _download_scrip_master(c, "https://x/scrip.json",
+                                         max_attempts=2, state=state)
+        kept = len(state["buf"])
+        assert kept == 2 * CUT               # two cuts' worth retained
+        out = await _download_scrip_master(c, "https://x/scrip.json",
+                                           max_attempts=10, state=state)
+    assert out == BODY                       # second call resumed, not restarted
+
+
+async def test_server_ignoring_range_restarts_buffer():
+    def ignores_range(request):
+        return httpx.Response(200, headers={"Content-Length": str(len(BODY))},
+                              stream=CuttingStream(BODY, len(BODY)))
+    state = {"buf": bytearray(b"stale-partial"), "total": None}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(ignores_range)) as c:
+        out = await _download_scrip_master(c, "https://x/scrip.json",
+                                           max_attempts=3, state=state)
+    assert out == BODY                       # stale partial discarded
