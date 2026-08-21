@@ -304,6 +304,32 @@ async def _resolve_unmapped(sc, symbols: List[str]) -> None:
             logger.info(f"[live_price] {sym}: not found via searchScrip (benched 1h)")
 
 
+def _smartconnect_from_redis(session_json: str):
+    """Build a token-reusing SmartConnect (no generateSession) from the
+    ingestion-published session. Returns None if the SDK/session is unavailable."""
+    try:
+        from SmartApi import SmartConnect
+    except Exception:
+        return None
+    try:
+        sess = json.loads(session_json)
+        sc = SmartConnect(api_key=sess.get("api_key"))
+        # generateSession returns the jwt already prefixed with "Bearer "; the SDK
+        # re-adds "Bearer " in _request, so strip it here to avoid "Bearer Bearer …"
+        # (which Angel One rejects with AG8001 Invalid Token).
+        tok = (sess.get("access_token") or "")
+        if tok.startswith("Bearer "):
+            tok = tok[7:]
+        sc.setAccessToken(tok)
+        ft = sess.get("feed_token")
+        if ft and hasattr(sc, "setFeedToken"):
+            sc.setFeedToken(ft)
+        return sc
+    except Exception as e:
+        logger.warning(f"[live_price] could not build SmartConnect from session (fail-open): {e}")
+        return None
+
+
 async def get_current_ltps(symbols: List[str], redis_client) -> Dict[str, Dict[str, float]]:
     """Return {symbol: {"ltp": float, "prev_close": float}} for NSE/BSE equities,
     using the shared Angel One session. NSE resolves first (dual-listed symbols

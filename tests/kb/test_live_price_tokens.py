@@ -71,3 +71,17 @@ def test_search_bse_matches_tradingsymbol_exactly():
 
 def test_search_ignores_rows_without_token():
     assert _pick_search_match(search(("LT-EQ", "")), "LT", "NSE") is None
+
+
+# ── module surface smoke test ────────────────────────────────────────────
+# 2026-08-21: a text-slice patch silently swallowed _smartconnect_from_redis
+# and every /ltp call 500'd with a NameError that py_compile cannot see.
+# Pin the private surface the request path depends on.
+
+def test_request_path_helpers_exist():
+    from bharat_terminal.kb import live_price as lp
+    for name in ("_smartconnect_from_redis", "_ensure_equity_tokens",
+                 "_resolve_unmapped", "_resolve_via_search",
+                 "_refresh_from_cdn", "_download_scrip_master",
+                 "_load_cached_tokens", "get_current_ltps", "get_full_quotes"):
+        assert callable(getattr(lp, name)), name
