@@ -484,7 +484,24 @@ def _anthropic_kwargs(model: str, provider: str, max_tokens: int, system, messag
             kwargs["temperature"] = temperature
     if cache:
         _mark_static_prefix_cached(kwargs)
+    beta = anthropic_beta_for(model, provider)
+    if beta:
+        # Per-model opt-in beta header, e.g. context-1m-2025-08-07 on Bedrock:
+        # Bedrock meters 1M-context requests under a SEPARATE tokens-per-day
+        # quota ("... V1 1M Context Length", 54M/day vs 10.8M standard on this
+        # account, 2026-08-22), so a bulk job can run without draining the
+        # live pipeline's bucket. Env-driven so only the job's container opts in.
+        kwargs["extra_headers"] = {"anthropic-beta": beta}
     return kwargs
+
+
+def anthropic_beta_for(model: str, provider: str) -> Optional[str]:
+    """BEDROCK_ANTHROPIC_BETA_<MODEL_UPPER_SNAKE> -> header value, Bedrock only."""
+    if provider != "anthropic-bedrock":
+        return None
+    key = "BEDROCK_ANTHROPIC_BETA_" + re.sub(r"[^A-Za-z0-9]", "_", model).upper()
+    val = (os.getenv(key) or "").strip()
+    return val or None
 
 
 def _wrap_anthropic_response(resp, model: str, provider: str) -> LLMResponse:
