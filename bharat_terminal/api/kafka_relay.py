@@ -33,6 +33,13 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 NEWS_CACHE_TTL_HOURS = 24
 REDIS_NEWS_KEY = "news:recent"
 
+# Reconnect backoff for consumer.start(). Without it, an api container that
+# boots before redpanda accepts connections (host reboots 2026-08-16 and
+# 2026-08-21) kills this task silently — /health stays green while the feed
+# freezes. Retry forever; the alert monitor makes a down relay loud.
+CONNECT_RETRY_INITIAL_S = 2.0
+CONNECT_RETRY_MAX_S = 60.0
+
 _consumer_task: Optional[asyncio.Task] = None
 _redis: Optional[aioredis.Redis] = None
 
@@ -46,7 +53,7 @@ async def _get_redis() -> aioredis.Redis:
 
 async def start_kafka_relay():
     global _consumer_task
-    _consumer_task = asyncio.create_task(_relay_loop())
+    _consumer_task = asyncio.create_task(_relay_loop(), name="kafka-relay")
     logger.info("Kafka relay started")
 
 
@@ -64,34 +71,46 @@ async def stop_kafka_relay():
 
 
 async def _relay_loop():
-    consumer = AIOKafkaConsumer(
-        TOPIC_ANALYSED,
-        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        group_id="frontend-consumers",
-        auto_offset_reset="latest",
-        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-        enable_auto_commit=True,
-    )
+    backoff = CONNECT_RETRY_INITIAL_S
+    while True:
+        consumer = AIOKafkaConsumer(
+            TOPIC_ANALYSED,
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            group_id="frontend-consumers",
+            auto_offset_reset="latest",
+            value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+            enable_auto_commit=True,
+        )
+        try:
+            await consumer.start()
+        except asyncio.CancelledError:
+            await consumer.stop()
+            raise
+        except Exception as e:
+            await consumer.stop()
+            get_monitor().record_breach("API_RELAY_DOWN", str(e)[:200])
+            logger.error(f"Relay cannot reach Kafka (retrying in {backoff:.0f}s): {e}")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, CONNECT_RETRY_MAX_S)
+            continue
 
-    try:
-        await consumer.start()
+        backoff = CONNECT_RETRY_INITIAL_S
         logger.info(f"Relay consuming from {TOPIC_ANALYSED}")
-
-        while True:
-            try:
-                msg = await consumer.getone()
-                report: dict = msg.value
-                await _handle_report(report)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                get_monitor().record_breach("API_RELAY_ERROR", str(e)[:200])
-                logger.error(f"Relay error: {e}", exc_info=True)
-
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await consumer.stop()
+        try:
+            while True:
+                try:
+                    msg = await consumer.getone()
+                    report: dict = msg.value
+                    await _handle_report(report)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    get_monitor().record_breach("API_RELAY_ERROR", str(e)[:200])
+                    logger.error(f"Relay error: {e}", exc_info=True)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            await consumer.stop()
 
 
 async def _handle_report(report: dict):
@@ -182,12 +201,15 @@ async def _persist_to_db(report: dict, news_item: dict, news_id: str,
                 text("""
                     INSERT INTO news_items
                         (id, source, timestamp_utc, headline, body, summary, url,
-                         ingest_latency_ms, category, symbols_mentioned)
+                         ingest_latency_ms, category, subcategory, symbols_mentioned)
                     VALUES
                         (:id, :source, :timestamp_utc, :headline, :body, :summary, :url,
-                         :ingest_latency_ms, :category, CAST(:symbols_mentioned AS jsonb))
+                         :ingest_latency_ms, :category, :subcategory,
+                         CAST(:symbols_mentioned AS jsonb))
                     ON CONFLICT (id) DO UPDATE
-                        SET summary = COALESCE(EXCLUDED.summary, news_items.summary)
+                        SET summary = COALESCE(EXCLUDED.summary, news_items.summary),
+                            subcategory = COALESCE(EXCLUDED.subcategory,
+                                                   news_items.subcategory)
                 """),
                 {
                     "id": news_id,
@@ -199,6 +221,7 @@ async def _persist_to_db(report: dict, news_item: dict, news_id: str,
                     "url": news_item.get("url", ""),
                     "ingest_latency_ms": news_item.get("ingest_latency_ms", 0.0),
                     "category": news_item.get("category"),
+                    "subcategory": news_item.get("subcategory"),
                     "symbols_mentioned": json.dumps(news_item.get("symbols_mentioned", [])),
                 },
             )
