@@ -26,7 +26,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-from typing import AsyncIterator, Dict
+from typing import AsyncIterator, Dict, Optional
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -167,6 +167,14 @@ class BSEFilingsAdapter(BaseAdapter):
         return cls._SCRIP_IN_HEADLINE_RE.sub(" - ", (newssub or "").strip(), count=1)
 
     @staticmethod
+    def _subcategory(row: dict) -> Optional[str]:
+        """The exchange's fine-grained tag, kept VERBATIM (no upper/snake
+        mangling like _category does) — it is a controlled vocabulary and
+        downstream matches on the exact string."""
+        raw = (row.get("SUBCATNAME") or "").strip()
+        return raw[:120] or None
+
+    @staticmethod
     def _category(row: dict) -> str:
         raw = (row.get("CATEGORYNAME") or "").strip()
         if not raw or raw == "-":
@@ -248,6 +256,7 @@ class BSEFilingsAdapter(BaseAdapter):
                         "headline": headline,
                         "ts": self._parse_news_dt(row, datetime.now(timezone.utc)),
                         "category": self._category(row),
+                        "subcategory": self._subcategory(row),
                         "attachment": ATTACHMENT_URL.format(name=attachment) if attachment else None,
                         "row": row,
                     })
@@ -286,6 +295,7 @@ class BSEFilingsAdapter(BaseAdapter):
                             raw_html=None,
                             ingest_latency_ms=ingest_latency,
                             category=p["category"],
+                            subcategory=p["subcategory"],
                             symbols_mentioned=[p["symbol"]],
                             # PDF-derived text only: the fallback fields differ
                             # between exchanges and must never dedup.

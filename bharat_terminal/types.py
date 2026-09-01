@@ -19,6 +19,11 @@ class NewsItem(BaseModel):
     raw_html: Optional[str] = None
     ingest_latency_ms: float
     category: Optional[str] = None   # "CORPORATE_FILING" | "NEWS" | "ANNOUNCEMENT"
+    # The EXCHANGE's own fine-grained tag (BSE SUBCATNAME), e.g. "Award of
+    # Order / Receipt of Order", "Earnings Call Transcript", "Investor
+    # Presentation". Ground truth for event classes we otherwise infer with
+    # keywords + an LLM taxonomy. None for sources that publish no subcategory.
+    subcategory: Optional[str] = None
     symbols_mentioned: List[str] = Field(default_factory=list)
 
     # ── Pillar 2 extensions ───────────────────────────────────────────────
