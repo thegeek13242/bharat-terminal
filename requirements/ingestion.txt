@@ -12,7 +12,7 @@ httpx==0.27.0
 trafilatura==1.12.2
 readability-lxml==0.8.1
 # NSE filing PDF-attachment text extraction (pure-Python, no poppler/system deps)
-pypdf==6.11.0
+pypdf==6.16.1
 # BSE filings adapter: SCRIP_CD -> symbol universe map is read from Postgres
 # (matches the kb service's pinned asyncpg version)
 asyncpg==0.29.0
