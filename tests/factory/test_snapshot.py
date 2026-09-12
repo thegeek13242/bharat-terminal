@@ -1,7 +1,12 @@
 """Snapshot manifests and integrity gates.
 
-The timestamp test is built from the REAL measured distribution: 99 of 503
-gaps sitting at +5.5h, the rest spread across a normal publishing lag.
+The clock fixtures mirror the REAL measured distribution (2026-09-12, 502
+matched pairs): median 0.91h, p25 0.09h, p75 5.81h, p90 7.83h, 3.4% negative,
+bimodal because bse_xbrl lands in ~0.2h and nse_xbrl in ~6.2h.
+
+The pair of clock tests encodes the correction that cost us a wrong claim: a
+publication lag must NOT read as a timezone mislabel, and a real constant
+offset must still be caught.
 """
 from __future__ import annotations
 
@@ -15,12 +20,14 @@ from bharat_terminal.factory.snapshot.integrity import (
     FAIL,
     PASS,
     WARN,
+    check_clock_lag,
+    check_constant_offset,
     check_null_share,
     check_row_delta,
     check_snapshot_age,
     check_source_freshness,
-    check_timestamp_ist_as_utc,
     check_universe_survivorship,
+    clock_lag_stats,
     run_integrity_suite,
 )
 from bharat_terminal.factory.snapshot.manifest import (
@@ -32,6 +39,19 @@ from bharat_terminal.factory.snapshot.manifest import (
 )
 
 NOW = datetime(2026, 9, 12, 2, 0, tzinfo=timezone.utc)
+
+
+def measured_gaps() -> list:
+    """502 gaps shaped like production: two feeds, no constant offset."""
+    return (
+        [0.0] * 180 + [0.2] * 30 + [0.9] * 60 + [1.5] * 40 + [3.0] * 40
+        + [5.7] * 76 + [6.5] * 40 + [7.8] * 30 + [12.0] * 6
+    )
+
+
+def mislabelled_gaps() -> list:
+    """What a genuine IST-stored-as-UTC bug would look like: a delta at 5.5."""
+    return [5.5] * 100 + [0.0] * 300 + [0.5] * 60 + [1.5] * 42
 
 
 # ── manifest ─────────────────────────────────────────────────────────────
@@ -50,11 +70,11 @@ def make_manifest(**kw) -> Manifest:
         sealed_from=date(2025, 9, 12),
         tables={
             "price_points": TableSnapshot("price_points", 3_672_681, "a" * 64,
-                                          "price_points.parquet", "2026-09-11"),
+                                          "price_points.csv.gz", "2026-09-11"),
             "earnings_surprises": TableSnapshot("earnings_surprises", 43_082, "b" * 64,
-                                                "earnings_surprises.parquet", "2026-09-11"),
+                                                "earnings_surprises.csv.gz", "2026-09-11"),
         },
-        code_commit="7e72cd0" + "0" * 33,
+        code_commit="e438be3" + "0" * 33,
     )
     base.update(kw)
     return Manifest(**base)
@@ -74,22 +94,21 @@ def test_manifest_digest_changes_with_content():
     a = make_manifest()
     b = make_manifest(tables={**a.tables,
                               "price_points": TableSnapshot("price_points", 3_672_680, "a" * 64,
-                                                            "price_points.parquet", "2026-09-11")})
+                                                            "price_points.csv.gz", "2026-09-11")})
     assert a.digest != b.digest
 
 
 def test_manifest_age_hours():
-    m = make_manifest()
-    assert m.age_hours(NOW + timedelta(hours=3)) == pytest.approx(3.0)
+    assert make_manifest().age_hours(NOW + timedelta(hours=3)) == pytest.approx(3.0)
 
 
 def test_manifest_verify_detects_tampering(tmp_path):
     payload = b"col_a,col_b\n1,2\n"
-    path = tmp_path / "price_points.parquet"
+    path = tmp_path / "price_points.csv.gz"
     path.write_bytes(payload)
     m = make_manifest(tables={
         "price_points": TableSnapshot("price_points", 1, sha256_file(str(path)),
-                                      "price_points.parquet", "2026-09-11"),
+                                      "price_points.csv.gz", "2026-09-11"),
     })
     assert m.verify(str(tmp_path)) == []
 
@@ -101,7 +120,7 @@ def test_manifest_verify_detects_tampering(tmp_path):
 def test_manifest_verify_reports_missing_file(tmp_path):
     m = make_manifest(tables={
         "price_points": TableSnapshot("price_points", 1, sha256_bytes(b"x"),
-                                      "missing.parquet", "2026-09-11"),
+                                      "missing.csv.gz", "2026-09-11"),
     })
     assert "file missing" in m.verify(str(tmp_path))[0]
 
@@ -119,19 +138,17 @@ def test_snapshot_age_fails_closed_when_stale():
 
 
 def test_freshness_passes_when_current():
-    r = check_source_freshness("price_points", date(2026, 9, 11), date(2026, 9, 11))
-    assert r.status == PASS
+    assert check_source_freshness("price_points", date(2026, 9, 11),
+                                  date(2026, 9, 11)).status == PASS
 
 
 def test_freshness_counts_sessions_not_calendar_days():
     """A Monday snapshot must not read a long weekend as a stalled feed."""
     trading = [date(2026, 9, 10), date(2026, 9, 11), date(2026, 9, 14)]
-    r = check_source_freshness("price_points", date(2026, 9, 11), date(2026, 9, 14),
-                               trading_dates=trading)
-    assert r.status == PASS       # one session behind
-    r2 = check_source_freshness("price_points", date(2026, 9, 10), date(2026, 9, 14),
-                                trading_dates=trading)
-    assert r2.status == FAIL      # two sessions behind
+    assert check_source_freshness("price_points", date(2026, 9, 11), date(2026, 9, 14),
+                                  trading_dates=trading).status == PASS
+    assert check_source_freshness("price_points", date(2026, 9, 10), date(2026, 9, 14),
+                                  trading_dates=trading).status == FAIL
 
 
 def test_freshness_fails_on_empty_source():
@@ -157,35 +174,49 @@ def test_row_delta_without_history_is_not_a_failure():
     assert check_row_delta("factory_new_table", 10, None).status == PASS
 
 
-# ── the live timestamp finding ───────────────────────────────────────────
+# ── clock quality: lag vs constant offset ────────────────────────────────
 
-def measured_gaps() -> list:
-    """503 gaps: 99 piled at +5.5h, the rest a plausible publishing lag."""
-    spike = [5.5] * 99
-    lag = [0.0] * 250 + [0.5] * 60 + [1.0] * 40 + [2.0] * 30 + [3.5] * 14 + [8.0] * 10
-    return spike + lag
-
-
-def test_ist_as_utc_spike_is_detected():
-    r = check_timestamp_ist_as_utc(measured_gaps())
-    assert r.flag == "ts_ist_as_utc"
-    assert r.status == WARN                 # a flag, not a block
-    assert r.value == pytest.approx(99 / 503, abs=1e-3)
+def test_lag_stats_match_the_production_shape():
+    st = clock_lag_stats(measured_gaps())
+    assert st.n == 502
+    assert st.median == pytest.approx(0.9, abs=0.2)
+    assert st.p90 >= 6.0
+    assert st.share_within_30min == pytest.approx(0.42, abs=0.05)
 
 
-def test_clean_publishing_lag_raises_no_flag():
-    clean = [0.0] * 300 + [0.5] * 100 + [1.5] * 60 + [3.0] * 43
-    r = check_timestamp_ist_as_utc(clean)
-    assert r.flag is None and r.status == PASS
+def test_lagging_clock_is_flagged():
+    r = check_clock_lag(measured_gaps())
+    assert r.flag == "clock_lags_dissemination"
+    assert r.status == WARN            # a flag, not a block
 
 
-def test_tolerance_does_not_catch_a_genuine_five_hour_lag():
-    r = check_timestamp_ist_as_utc([5.0] * 200 + [0.0] * 300)
-    assert r.flag is None
+def test_prompt_clock_raises_no_lag_flag():
+    quick = [0.0] * 300 + [0.1] * 150 + [0.3] * 52
+    assert check_clock_lag(quick).flag is None
+
+
+def test_publication_lag_is_not_reported_as_a_timezone_bug():
+    """The correction: the NSE XBRL hump peaks near 5.7h and must NOT fire."""
+    r = check_constant_offset(measured_gaps())
+    assert r.status == PASS and r.flag is None
+
+
+def test_a_real_constant_offset_is_still_caught():
+    r = check_constant_offset(mislabelled_gaps())
+    assert r.flag == "clock_constant_offset"
+    assert r.status == WARN
+
+
+def test_constant_offset_needs_concentration_not_just_volume():
+    """A broad hump centred exactly on 5.5 is still a lag, not an offset."""
+    hump = ([5.3] * 60 + [5.4] * 60 + [5.5] * 70 + [5.6] * 60 + [5.7] * 60
+            + [0.0] * 192)
+    assert check_constant_offset(hump).flag is None
 
 
 def test_no_overlapping_sightings_warns_rather_than_passing_silently():
-    assert check_timestamp_ist_as_utc([]).status == WARN
+    assert check_clock_lag([]).status == WARN
+    assert check_constant_offset([]).status == WARN
 
 
 # ── survivorship ─────────────────────────────────────────────────────────
@@ -214,10 +245,11 @@ def test_suite_collects_failures_and_flags():
     )
     assert suite.ok is False
     assert "freshness:result_events" in suite.failures
-    assert set(suite.flags) == {"ts_ist_as_utc", "survivorship"}
+    assert set(suite.flags) == {"clock_lags_dissemination", "survivorship"}
     d = suite.as_dict()
-    # age + 2 freshness + row delta + null share + timestamp + survivorship
-    assert d["ok"] is False and len(d["results"]) == 7
+    # age + 2 freshness + row delta + null share + clock lag + constant offset
+    # + survivorship
+    assert d["ok"] is False and len(d["results"]) == 8
 
 
 def test_healthy_snapshot_passes_with_flags_only():
@@ -231,4 +263,5 @@ def test_healthy_snapshot_passes_with_flags_only():
     )
     assert suite.ok is True
     assert suite.failures == ()
-    assert "ts_ist_as_utc" in suite.flags
+    assert "clock_lags_dissemination" in suite.flags
+    assert "clock_constant_offset" not in suite.flags

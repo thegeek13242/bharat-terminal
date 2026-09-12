@@ -60,9 +60,10 @@ class EventSource(str, Enum):
 class EventClock(str, Enum):
     """When the information became actionable.
 
-    `announcement_date` is date-granularity on purpose: ~20% of
-    earnings_surprises.announced_at rows carry IST wall-clock stored as UTC
-    (verified 2026-09-11), which makes any intraday rule on that column wrong.
+    `announcement_date` is date-granularity on purpose: announced_at is a
+    source-provided timestamp that trails first dissemination by a median 0.9h
+    overall and 6.2h via the NSE XBRL path (measured 2026-09-12), so it cannot
+    time an intraday entry.
     """
 
     announcement_date = "announcement_date"

@@ -2,9 +2,10 @@
 
 Nothing reaches the backtester without passing every check here. The checks
 encode this project's verified data hazards (RESEARCH_FACTORY_SPEC_v2 §1.1,
-§6.3): a timestamp column that is IST-in-UTC on a fifth of rows, unadjusted
-closes, an empty point-in-time universe, a sector label filled 18.8% of the
-time, and an event-analysis history that only starts 2026-05-10.
+§6.3): an event clock that trails dissemination by a median 0.9h (6.2h via the
+NSE XBRL path), unadjusted closes, an empty point-in-time universe, a sector
+label filled 18.8% of the time, and an event-analysis history that only starts
+2026-05-10.
 
 Pure functions over injected context — no DB, no network — so the whole thing
 is unit-testable and reproducible.
@@ -104,7 +105,8 @@ class CompileContext:
     dataset_version: str
     snapshot_age_hours: float
     source_max_dates: Dict[str, date] = field(default_factory=dict)
-    # Integrity findings open against the snapshot, e.g. {"ts_ist_as_utc"}.
+    # Integrity findings open against the snapshot, e.g.
+    # {"clock_lags_dissemination"}.
     integrity_flags: frozenset = frozenset()
     # Findings severe enough to stop all new work.
     integrity_failures: frozenset = frozenset()
@@ -202,18 +204,18 @@ def compile_spec(spec: HypothesisSpec, ctx: CompileContext) -> CompileResult:
         errors.append(CompileError(
             "E003", "entry.rule",
             f"entry rule {rule.value!r} needs a timestamp, but clock "
-            f"'announcement_date' is date-granularity. ~20% of announced_at rows "
-            f"are IST stored as UTC (verified 2026-09-11), so intraday rules on it "
-            f"are unsound. Use clock 'exchange_first_seen'.",
+            f"'announcement_date' is date-granularity, and announced_at trails first "
+            f"dissemination by a median 0.9h (6.2h via nse_xbrl, measured 2026-09-12), "
+            f"so it cannot time an intraday entry. Use clock 'exchange_first_seen'.",
         ))
     if clock is EventClock.announcement_date and spec.entry.delay_minutes > 0:
         errors.append(CompileError(
             "E003", "entry.delay_minutes",
             "a minute-level delay is meaningless on a date-granularity clock",
         ))
-    if clock is EventClock.announcement_date and "ts_ist_as_utc" in ctx.integrity_flags:
-        # Mislabelled rows are LATER than truth, so a next-session entry is
-        # conservative (it can lag, never peek). Record the bias; don't block.
+    if clock is EventClock.announcement_date and "clock_lags_dissemination" in ctx.integrity_flags:
+        # The stored clock is LATER than dissemination, so a next-session entry
+        # is conservative (it can lag, never peek). Record the bias; don't block.
         bias.append("ts_late")
         constraints.append("entry_timing_conservative")
 

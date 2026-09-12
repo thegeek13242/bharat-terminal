@@ -1,14 +1,30 @@
 """Integrity gates — run on every snapshot, before any experiment may use it.
 
 This project's characteristic failure is stale or subtly wrong data producing
-confident output. So the snapshot is guilty until proven innocent: a FAIL
-blocks all new experiments (compiler E015), and a FLAG attaches a bias marker
-that follows the result into the ledger and the report.
+confident output. So a snapshot is guilty until proven innocent: a FAIL blocks
+all new experiments (compiler E015), and a FLAG attaches a bias marker that
+follows the result into the ledger and the report.
 
-The timestamp check is the live one. `earnings_surprises.announced_at` carries
-IST wall-clock stored as UTC on a subset of rows — verified 2026-09-11 as a
-sharp +5.5h spike in 99 of 503 gaps measured against the first news sighting
-of the same result.
+CLOCK LAG — what was actually measured (2026-09-12, 502 matched pairs, 45 days)
+------------------------------------------------------------------------------
+`earnings_surprises.announced_at` was compared against the earliest independent
+RESULT sighting in `news_items`:
+
+    median 0.91h · p25 0.09h · p75 5.81h · p90 7.83h · 3.4% negative
+    by upstream source: bse_xbrl median 0.20h, nse_xbrl median 6.15h
+
+The distribution is BIMODAL because it mixes two feeds, not because of a
+timezone bug. An earlier reading of coarse half-hour buckets looked like a
+"+5.5h spike"; at 0.1h resolution it is a broad hump peaking at 5.6-5.9h, and
+the decisive test settles it: of 502 pairs, **zero** have the stored UTC
+time-of-day equal to the true IST wall-clock time-of-day, which a constant
++5.5h mislabel would produce in bulk. `announced_at` is simply a source-provided
+timestamp (NSE broadcast/filing date, or the BSE index time) that lags first
+dissemination.
+
+That is still a real hazard — it is not the dissemination clock — so it is
+measured and flagged, and the compiler refuses intraday rules on it. But it is
+a publication lag, not a mislabel, and the gate says so.
 """
 from __future__ import annotations
 
@@ -151,42 +167,114 @@ def check_null_share(
     )
 
 
-def check_timestamp_ist_as_utc(
+# ── clock quality ────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class LagStats:
+    n: int
+    median: float
+    p90: float
+    share_within_30min: float
+    share_negative: float
+
+
+def clock_lag_stats(gaps_hours: Sequence[float]) -> LagStats:
+    """Summarize (stored clock - first independent sighting), in hours."""
+    xs = sorted(float(g) for g in gaps_hours)
+    n = len(xs)
+    if n == 0:
+        return LagStats(0, 0.0, 0.0, 0.0, 0.0)
+
+    def q(p: float) -> float:
+        if n == 1:
+            return xs[0]
+        pos = p * (n - 1)
+        lo = int(pos)
+        hi = min(lo + 1, n - 1)
+        frac = pos - lo
+        return xs[lo] * (1 - frac) + xs[hi] * frac
+
+    return LagStats(
+        n=n,
+        median=q(0.5),
+        p90=q(0.9),
+        share_within_30min=sum(1 for g in xs if abs(g) <= 0.5) / n,
+        share_negative=sum(1 for g in xs if g < -0.05) / n,
+    )
+
+
+def check_clock_lag(
     gaps_hours: Sequence[float],
     table: str = "earnings_surprises",
     column: str = "announced_at",
-    tolerance_hours: float = 0.25,
-    min_share: float = 0.05,
+    max_median_hours: float = 0.5,
 ) -> IntegrityResult:
-    """Detect IST wall-clock stored as UTC.
+    """Does this clock actually mark dissemination, or does it trail it?
 
-    `gaps_hours` are (stored timestamp - first independent sighting) in hours.
-    A genuine publishing lag spreads out; a timezone mislabel piles up at
-    exactly +5.5h. When the spike carries at least `min_share` of the sample we
-    raise the `ts_ist_as_utc` flag.
-
-    This is a FLAG, not a FAIL: the offset makes stored times LATER than truth,
-    so next-session entries lag rather than peek. The compiler separately
-    refuses intraday rules on this clock (E003).
+    Measured 2026-09-12: median 0.91h overall — bse_xbrl 0.20h, nse_xbrl 6.15h.
+    A clock that trails dissemination cannot time an intraday entry, so when the
+    median lag exceeds the threshold we raise `clock_lags_dissemination`. The
+    compiler refuses intraday rules on such a clock regardless (E003).
     """
-    check = f"timestamp_offset:{table}.{column}"
+    check = f"clock_lag:{table}.{column}"
+    st = clock_lag_stats(gaps_hours)
+    if st.n == 0:
+        return IntegrityResult(check, WARN, "no overlapping sightings to compare", 0,
+                               max_median_hours)
+
+    detail = (f"median lag {st.median:.2f}h, p90 {st.p90:.2f}h, "
+              f"{st.share_within_30min:.0%} within 30min, {st.share_negative:.1%} negative "
+              f"(n={st.n})")
+    if st.median > max_median_hours:
+        return IntegrityResult(check, WARN, detail, round(st.median, 2), max_median_hours,
+                               flag="clock_lags_dissemination")
+    return IntegrityResult(check, PASS, detail, round(st.median, 2), max_median_hours)
+
+
+def check_constant_offset(
+    gaps_hours: Sequence[float],
+    table: str = "earnings_surprises",
+    column: str = "announced_at",
+    offset_hours: float = IST_UTC_OFFSET_HOURS,
+    bin_hours: float = 0.1,
+    min_share: float = 0.05,
+    min_concentration: float = 3.0,
+) -> IntegrityResult:
+    """Detect a CONSTANT clock offset, e.g. IST wall-clock stored as UTC.
+
+    A timezone mislabel is a delta function: every affected row sits at exactly
+    the offset. A publication lag is a smooth hump. So a mere pile-up near the
+    offset is not enough — the offset bin must also dominate its neighbours by
+    `min_concentration`. Without that test, the NSE XBRL lag (which peaks at
+    5.6-5.9h) reads as a timezone bug. It is not one.
+    """
+    check = f"constant_offset:{table}.{column}"
     n = len(gaps_hours)
     if n == 0:
         return IntegrityResult(check, WARN, "no overlapping sightings to compare", 0, min_share)
 
-    spike = sum(1 for g in gaps_hours
-                if abs(g - IST_UTC_OFFSET_HOURS) <= tolerance_hours)
-    share = spike / n
-    if share >= min_share:
+    half = bin_hours / 2.0
+
+    def count_near(centre: float) -> int:
+        return sum(1 for g in gaps_hours if abs(float(g) - centre) <= half)
+
+    at_offset = count_near(offset_hours)
+    neighbours = [count_near(offset_hours + k * bin_hours) for k in (-3, -2, -1, 1, 2, 3)]
+    neighbour_mean = (sum(neighbours) / len(neighbours)) if neighbours else 0.0
+    share = at_offset / n
+    concentration = (at_offset / neighbour_mean) if neighbour_mean > 0 else float(at_offset)
+
+    if share >= min_share and concentration >= min_concentration:
         return IntegrityResult(
             check, WARN,
-            f"{spike}/{n} ({share:.1%}) of gaps sit at +{IST_UTC_OFFSET_HOURS}h — "
-            f"IST stored as UTC on part of {table}.{column}",
-            round(share, 4), min_share, flag="ts_ist_as_utc",
+            f"{at_offset}/{n} ({share:.1%}) sit at exactly +{offset_hours}h, "
+            f"{concentration:.1f}x the neighbouring bins — constant offset, not a lag",
+            round(share, 4), min_share, flag="clock_constant_offset",
         )
     return IntegrityResult(
         check, PASS,
-        f"no timezone spike: {spike}/{n} ({share:.1%}) near +{IST_UTC_OFFSET_HOURS}h",
+        f"no constant offset at +{offset_hours}h: {at_offset}/{n} ({share:.1%}), "
+        f"{concentration:.1f}x neighbours (needs {min_concentration}x)",
         round(share, 4), min_share,
     )
 
@@ -231,7 +319,8 @@ def run_integrity_suite(
     for table, column, share in null_shares:
         suite.add(check_null_share(table, column, share))
     if timestamp_gaps_hours is not None:
-        suite.add(check_timestamp_ist_as_utc(timestamp_gaps_hours))
+        suite.add(check_clock_lag(timestamp_gaps_hours))
+        suite.add(check_constant_offset(timestamp_gaps_hours))
     if survivorship is not None:
         suite.add(check_universe_survivorship(*survivorship))
     return suite

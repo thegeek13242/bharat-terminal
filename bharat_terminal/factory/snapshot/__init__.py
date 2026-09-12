@@ -8,18 +8,23 @@ dataset_version must produce the same result_hash, or E6 fails loudly.
 Snapshots also decouple research compute from the production database: the
 backtester reads files, so a sweep cannot compete with the live pipeline for
 Postgres connections — a real failure mode on this host, which has hit 72 of
-100 connections before.
+100 before.
 """
 from __future__ import annotations
 
 from bharat_terminal.factory.snapshot.integrity import (
     IntegrityResult,
     IntegritySuite,
+    LagStats,
+    check_clock_lag,
+    check_constant_offset,
     check_null_share,
     check_row_delta,
     check_snapshot_age,
     check_source_freshness,
-    check_timestamp_ist_as_utc,
+    check_universe_survivorship,
+    clock_lag_stats,
+    run_integrity_suite,
 )
 from bharat_terminal.factory.snapshot.manifest import (
     Manifest,
@@ -32,14 +37,19 @@ from bharat_terminal.factory.snapshot.manifest import (
 __all__ = [
     "IntegrityResult",
     "IntegritySuite",
+    "LagStats",
     "Manifest",
     "TableSnapshot",
+    "check_clock_lag",
+    "check_constant_offset",
     "check_null_share",
     "check_row_delta",
     "check_snapshot_age",
     "check_source_freshness",
-    "check_timestamp_ist_as_utc",
+    "check_universe_survivorship",
+    "clock_lag_stats",
     "dataset_version_for",
+    "run_integrity_suite",
     "sha256_bytes",
     "sha256_file",
 ]

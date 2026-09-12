@@ -40,7 +40,7 @@ def test_baseline_spec_compiles(spec, ctx):
     assert "E006" in result.checks_deferred
 
 
-def test_ist_as_utc_flag_marks_entry_conservative(spec, ctx):
+def test_clock_lag_flag_marks_entry_conservative(spec, ctx):
     result = compile_spec(spec, ctx)
     assert "ts_late" in result.plan.bias_flags
     assert "entry_timing_conservative" in result.plan.constraints

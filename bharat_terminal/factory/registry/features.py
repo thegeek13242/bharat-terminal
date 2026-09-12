@@ -58,7 +58,9 @@ _FEATURES: List[FeatureSpec] = [
         data_tier="H", history_start=date(2020, 1, 1), value_kind="float",
         description="Composite standardized unexpected earnings (EPS-YoY + revenue-YoY, rank-averaged).",
         valid_clocks=("announcement_date", "exchange_first_seen"), coverage=1.0,
-        notes="Frozen live recipe, study_version=pead_v2.1_2026_07. 43,082 rows 2020→2026-09-11.",
+        notes=("Frozen live recipe, study_version=pead_v2.1_2026_07. 43,082 rows 2020→2026-09-11. "
+               "Its announced_at clock trails first dissemination: median 0.20h via bse_xbrl, "
+               "6.15h via nse_xbrl (measured 2026-09-12)."),
     ),
     _f(
         name="sue_eps", version="2.1", source_table="earnings_surprises",

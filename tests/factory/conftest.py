@@ -82,8 +82,8 @@ def make_ctx(**overrides: Any) -> CompileContext:
         "dataset_version": "DS-20260912-01",
         "snapshot_age_hours": 2.0,
         "source_max_dates": {"price_points": date(2026, 9, 11)},
-        # The +5.5h finding is live, so tests carry it by default.
-        "integrity_flags": frozenset({"ts_ist_as_utc"}),
+        # The measured clock lag is real, so tests carry its flag by default.
+        "integrity_flags": frozenset({"clock_lags_dissemination"}),
         "integrity_failures": frozenset(),
         "sealed_from": date(2025, 9, 12),
         "embargoes": (),

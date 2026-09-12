@@ -46,12 +46,24 @@ Tags used throughout, per CLAUDE.md "claims must match reality":
 | `paper_signal_marks` | 2026-08-13 → (27,246) | t0/5/15/30/60-min absorption marks | F |
 | `universe_membership` | **0 rows** | Only 25 of 3,923 symbols ever stop pricing → survivorship bias | — |
 
-**Timestamp integrity [VERIFIED].** `earnings_surprises.announced_at` was compared with the
-earliest RESULT `news_items.timestamp_utc` for the same symbol over 45 days (503 matched rows).
-Most gaps sit at 0–0.5h, but there is a **sharp spike at +5.5h (99 rows)**. That pattern is IST
-wall-clock time stored as UTC on a subset of rows. A mislabelled timestamp is *later* than the
-truth, so it biases next-session entries late (conservative). It makes intraday entry rules
-wrong.
+**Clock integrity [VERIFIED 2026-09-12, corrected].** `earnings_surprises.announced_at` was
+compared with the earliest independent RESULT sighting in `news_items` over 45 days (502 matched
+pairs): **median lag 0.91h, p25 0.09h, p75 5.81h, p90 7.83h, 3.4% negative**. Split by upstream
+source the bimodality is explained: **bse_xbrl median 0.20h, nse_xbrl median 6.15h**.
+
+An earlier reading of coarse half-hour buckets looked like a "+5.5h spike" and was written up as
+IST-stored-as-UTC. **That was wrong.** At 0.1h resolution the 5–6h band is a broad hump peaking at
+5.6–5.9h, and the decisive test settles it: of 502 pairs, **zero** have the stored UTC time-of-day
+equal to the true IST wall-clock time-of-day, which a constant +5.5h offset would produce in bulk
+(3 pairs land within 2 minutes of exactly 5.5h, against 1 at the 5.0h control — noise).
+`announced_at` is a source-provided timestamp (NSE broadcast/filing date, BSE index time) that
+**trails dissemination**, not a mislabelled one.
+
+The consequence for the factory is unchanged and the guard stands: this clock cannot time an
+intraday entry, so the compiler refuses intraday rules on it (E003) and tags next-session entries
+`ts_late` (late, never early — conservative). The gate that measures it is `check_clock_lag`, and a
+separate `check_constant_offset` still watches for a genuine timezone mislabel, requiring the
+offset bin to dominate its neighbours so a publication lag cannot masquerade as one.
 
 **Calendar [VERIFIED].** `analysis/market_hours.py` only covers 2026 (`_CALENDAR_YEARS={2026}`).
 Historical backtests therefore take their trading calendar from the dates present in
@@ -359,7 +371,7 @@ written by the author.
 |---|---|
 | E001 | Feature or version not in registry |
 | E002 | Feature not point-in-time for the chosen clock (`inputs_max_ts ≥ clock`) |
-| E003 | Blocked clock/rule pair: `announcement_date` with any intraday entry; `announced_at` timestamp use at all while `integrity.ts_ist_as_utc` is open |
+| E003 | Blocked clock/rule pair: `announcement_date` with any intraday entry or minute-level delay — the clock trails dissemination (median 0.9h; 6.2h via nse_xbrl), so it cannot time one |
 | E004 | Entry rule could execute before the information exists (e.g. `next_session_close` on the same date for evening filings) |
 | E005 | Horizon/data mismatch (intraday needs marks → F tier; medium horizon needs ≥ holding window of history) |
 | E006 | Insufficient pre-holdout events or cohorts (min_events/min_cohorts; Tier F: ≥100 events for SIMULATED) |
@@ -703,7 +715,7 @@ experiment ID, dataset_version, code commit, feature versions, strategy version 
 | Agent | Test set | Pass bar |
 |---|---|---|
 | Scientist | (a) *rediscovery*: memory truncated to date D, does it propose findings recorded after D; (b) *dead-end avoidance*: re-proposal rate of FAIL records without new mechanism; (c) duplicate rate vs ledger; (d) falsifiability rubric (custom judge) | dead-end re-proposal ≤ 5%; duplicates ≤ 10%; rubric ≥ 3.5/5 |
-| Adversary | ***flaw zoo***: 40 planted-defect experiments + 20 clean controls. Defect classes: look-ahead via revised fundamentals; +5.5h clock; same-day pre-filing close entry; survivor-only universe; cost omission; single-name concentration; one-regime dependence (2020 only); overlapping-window t inflation; post-hoc arm selection; stop-rule selection bias; unadjusted split; placebo-level effect | recall ≥ 90% on critical classes; false alarms on clean controls ≤ 10% |
+| Adversary | ***flaw zoo***: 40 planted-defect experiments + 20 clean controls. Defect classes: look-ahead via revised fundamentals; a constant clock offset (synthetic); entry on a clock that trails dissemination; same-day pre-filing close entry; survivor-only universe; cost omission; single-name concentration; one-regime dependence (2020 only); overlapping-window t inflation; post-hoc arm selection; stop-rule selection bias; unadjusted split; placebo-level effect | recall ≥ 90% on critical classes; false alarms on clean controls ≤ 10% |
 | Chief Scientist | retrospective allocation replay against ex-post information gain; policy compliance | 100% compliance; beats uniform allocation on replay |
 | Reporter | zero-activity fixture; seeded-contradiction fixture; claim reconciliation | 0 unreconciled claims shipped; "activity low" stated 100% |
 
@@ -831,7 +843,7 @@ Probability: H / M / L. Impact: Crit / High / Med / Low.
 | # | Failure | P | Impact | Detection | Mitigation | Component |
 |---|---|:--:|:--:|---|---|---|
 | 1 | Data leakage (future info in a feature) | M | Crit | compiler E002; per-feature-version PIT audit (`inputs_max_ts` < clock); placebo; null-world FDR | PIT materialization in snapshots; QUARANTINE + dependents | compiler, snapshotter, battery |
-| 2 | Timestamp mismatch (IST stored as UTC, +5.5h) — **live** | H | High | nightly gap test vs `exchange_first_seen` | E003 blocks intraday rules on `announced_at`; conservative date clock; upstream fix is a human task | snapshotter integrity gates |
+| 2 | Event clock trails dissemination (median 0.9h; 6.2h via nse_xbrl) — **measured** | H | High | `check_clock_lag` per snapshot; `check_constant_offset` for a true timezone mislabel | E003 refuses intraday rules on `announcement_date`; entries tagged `ts_late` (conservative) | snapshotter integrity gates |
 | 3 | Hallucinated feature definition | M | High | E001; E0 contract | features only from registry; new features only by PR | compiler, registry |
 | 4 | Duplicate experiments | H | Med | `spec_hash` unique; D_dup embedding similarity | return existing ID; duplication penalty | ledger, frontier |
 | 5 | Runaway compute | M | Med | per-run `cpu_seconds` budget; host CPU credit metric | cgroup CPU cap; cancel; off-market heavy jobs | backtest-worker |
@@ -984,7 +996,7 @@ Source of truth: pydantic models in `factory/contracts.py`. CI exports JSON Sche
    - `pead_signals` writes an `earnings_surprises` row: decile 10, `sue_composite` 2.9.
 2. **Structured event.**
    - 01:30 IST `snapshot_nightly` materializes an `EventRecord`: `{event_id: "ev:ABCLTD:2026Q2:result", source: "earnings_surprises", event_type_v2: "results", exchange_first_seen: "2026-10-20T13:12:00Z", announcement_date: "2026-10-20", pit_ok: true, integrity_flags: []}`.
-   - The integrity gate records `ts_ist_as_utc: open (99/503)` → `DS-20261021-01`.
+   - The integrity gate records `clock_lags_dissemination: median 0.9h (n=502)` → `DS-20261021-01`.
 3. **Hypothesis.**
    - `frontier_daily` gives slot S-88 (family `pead_liquidity`, RQ-000007 "does liquidity tier condition drift?").
    - Scientist retrieves FAIL-00012 ("EPS-only SUE nets ≈ 0 after costs") and submits H-000031
@@ -1107,7 +1119,7 @@ Source of truth: pydantic models in `factory/contracts.py`. CI exports JSON Sche
 | CloudWatch alarm period alignment for daily dead-man | drill | Day 3 |
 | Live FLOW 1 matches `POWER_AUTOMATE_SPEC.md` (Response after Send) | test POST to founder inbox | Day 3 |
 | us-east-1 quota pool independence | controlled ≤3-call test off-market (approval) | Nice to have |
-| `announced_at` +5.5h root cause (which writer) | code trace; founder decides fix | out of factory scope; tracked |
+| Whether the `nse_xbrl` 6.15h median lag is inherent to the NSE feed or our sync cadence | compare `announced_at` against exchange dissemination timestamps per filing | out of factory scope; tracked |
 
 ## 28. Decision rules (v1 §35)
 
