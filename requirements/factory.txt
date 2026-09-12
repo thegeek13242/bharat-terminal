@@ -1,0 +1,21 @@
+# Research factory: durable workflows + deterministic backtest/stats core.
+# The LLM agents do NOT run here — they run in AgentCore Runtime from their own
+# images (bharat_terminal/factory/agents/*), so this file stays free of agent
+# frameworks.
+pydantic>=2.6,<3
+asyncpg>=0.29,<1
+sqlalchemy>=2.0,<3
+# Durable workflow engine on the Postgres we already run (no new server).
+dbos>=1.0,<2
+# Snapshot + backtest: parquet in, vectorized event study out.
+pandas>=2.0,<3
+numpy>=1.26,<3
+pyarrow>=16,<19
+duckdb>=1.0,<2
+# AgentCore invocation, CloudWatch metrics, SNS (control plane only).
+boto3>=1.34,<2
+# Tracing: one trace per research cycle, joined with AgentCore spans.
+opentelemetry-sdk>=1.25,<2
+opentelemetry-exporter-otlp-proto-http>=1.25,<2
+httpx>=0.27,<1
+PyYAML>=6,<7
