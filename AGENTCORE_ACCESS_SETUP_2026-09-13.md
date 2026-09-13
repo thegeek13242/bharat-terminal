@@ -1,6 +1,8 @@
 # AgentCore Access & Setup — what to grant, in what order
 
-**Date:** 2026-09-13 · **Status:** nothing below has been created. AWS work is on hold.
+**Date:** 2026-09-13 · **Status:** ⚠ **PARTLY SUPERSEDED — read the correction block below first.**
+Four IAM action names in this document do not exist, and the work is no longer on hold: Steps 1-3
+and 6 were executed on 2026-09-13 and verified working.
 **Audience:** founder (account owner). Everything here is an action *you* take, or approve me to
 take, in account `480749289185`, region **ap-south-1** unless stated.
 
@@ -8,6 +10,72 @@ Why this doc: the factory's deterministic half runs today with zero AWS permissi
 want LLM agents, we need six things that only an account owner can grant. This lists them in
 dependency order, with the exact IAM actions, what each unlocks, what it costs, and how to verify
 it worked before moving on.
+
+---
+
+> ## ⚠ CORRECTION 2026-09-13 — four IAM actions below do not exist
+>
+> **What happened.** I wrote the action names in this document from documentation rather than from
+> the live API. Checked against `aws bedrock-agentcore-control help` and `aws bedrock-agentcore
+> help` in this account, four of them do not exist. A role built from this file would have carried
+> two phantom permissions and been missing the one the tool path actually needs.
+>
+> | This document says | The live API |
+> |---|---|
+> | `bedrock-agentcore:InvokeGateway` (Step 3) | **No such action, in either plane.** Gateways are called over MCP with a workload-identity token: `GetWorkloadAccessToken`, `GetWorkloadAccessTokenForJWT`, `GetResourceOauth2Token` |
+> | `CreatePolicy \| UpdatePolicy \| ListPolicies` (Step 5) | Incomplete — a policy attaches to an **engine**, so `CreatePolicyEngine` must exist first |
+> | `StartEvaluation`, `ListEvaluations` (Step 6) | **Neither exists.** Real: `CreateEvaluator`, `CreateOnlineEvaluationConfig`, `ListEvaluators`, data-plane `Evaluate` |
+> | *(never mentioned)* | `CreateWorkloadIdentity` is required for the gateway auth path |
+>
+> **Three more errors found by running it:**
+> - **Step 4's `sg-factory-lambda` is an illegal security-group *name*** — AWS reserves the `sg-`
+>   prefix for group IDs (`InvalidParameterValue`). Renamed `bharat-factory-lambda`.
+> - **Step 1's verification cannot be run as written.** This account's CloudShell is the **root
+>   account**, and root may never assume a role. Verification runs on the EC2 box instead — which
+>   exercises the production path (`bharat-terminal-ec2` -> orchestrator), so it is the better test.
+> - **§0's "Opus 4.6 = 5 RPM / 2.59M TPD" is wrong.** There is no tokens-per-day quota for Opus 4.6
+>   in this account at all — only 5 RPM and 3M tokens-per-*minute*. A TPD-based budget guard would
+>   guard nothing. (Opus 4.5 does have a real TPD: 13.5M.)
+>
+> **Superseded by `AGENTCORE_CLOUDSHELL_RUNBOOK_2026-09-13.md`** — corrected, copy-pasteable, every
+> identifier pre-filled. Use that for the commands; this file remains the *why*.
+>
+> ### What is actually built, and what I could not check
+>
+> **Verified by behaviour on the EC2 box, 12/12 passing** — the orchestrator role assumes via the
+> EC2 path and carries working model, AgentCore-control, gateway, policy-engine and observability
+> permissions. The two tests that matter both pass: **Sonnet 4.6 and Haiku 4.5 are DENIED** to the
+> factory, and **`PutMetricData` outside the `Factory/` namespace is DENIED**. Production capacity
+> is unreachable by IAM, not by convention.
+>
+> **Trust policy CONFIRMED CLEAN, 2026-09-13.** `aws iam get-role --role-name
+> bharat-factory-orchestrator --query 'Role.AssumeRolePolicyDocument.Statement[].Principal'` returns
+> exactly one principal — `arn:aws:iam::480749289185:role/bharat-terminal-ec2` — with no `:root`
+> entry. This was the last gap in the boundary, and it mattered: every behavioural test above passes
+> either way, because the EC2 role is named explicitly, so only a direct read could settle it. The
+> factory/production separation is now an IAM property end to end.
+>
+> **Still NOT verified — this box has no IAM or EC2 read permission:** the four agent execution
+> roles, the security-group ingress rule, and the SNS topic and subscription. None of these sits on
+> the production-boundary path; they gate Steps 3, 4 and 7 respectively, and each fails loudly rather
+> than silently when missing.
+>
+> ### Two unknowns from §"What I still cannot verify" have been tested
+>
+> - **Real Bedrock per-token price — still NOT settled, and not settleable from here.**
+>   `ce:GetCostAndUsage` is attached and returns successfully, but reports $0 for July,
+>   $0.00000004 for August and $0.03 for September — on an account running a t3.xlarge
+>   continuously and calling Bedrock daily. That is not low spend; it is **no billing data in this
+>   account**, most likely consolidated at a payer account (`organizations:DescribeOrganization` is
+>   denied, so the mechanism is unconfirmed). A working permission returning empty data is a worse
+>   failure than a clean denial, because "$0.03" reads like a fact.
+> - **Prompt caching on Opus 4.5/4.6 — measured, and it does NOT engage.**
+>   `cache_read_input_tokens: 0` on a repeated 2,656-token cached prefix, on both passes. Both Opus
+>   models also reject on-demand invocation outright, so the global inference profile is the only
+>   available route and the cause cannot be isolated here. This matches the `cached_tokens=0`
+>   already seen on production hot paths. **Budget the $1,000 model line with no caching discount.**
+>
+> Everything below is left exactly as written, so the errors and their cause stay legible.
 
 ---
 
