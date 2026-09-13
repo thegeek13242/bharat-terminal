@@ -6,6 +6,57 @@ denominator, winsor cap, cohort deciling and return window fixed.
 **Sample:** 27,347 events, 18 quarterly cohorts (2021→2026), 20-trading-day
 abnormal return vs NIFTYBEES, entered D+1 (announcement gap excluded).
 
+---
+
+> ## ⚠ CORRECTION 2026-09-13 — the verdict below is WITHDRAWN
+>
+> **This study was computed against a broken benchmark.** `price_points` had no
+> NIFTYBEES bars between **2025-05-09 and 2026-06-03** — 264 trading sessions —
+> and `pead_expectations_ab.py` has no missing-bar guard; it simply subtracts the
+> benchmark. **13,002 events had 20-day windows inside that hole.**
+>
+> Root cause: `sync_prices` (`kb/sync/pipeline.py:826`) filters each bhavcopy
+> against symbols present in `companies`. The benchmark ETFs only entered
+> `companies` on 2026-07-03, so daily sync never carried them; their history came
+> entirely from bulk backfills, and this stretch was never backfilled.
+>
+> The gap was repaired on 2026-09-13 (1,056 rows, four ETFs, verified continuous
+> at 100%). Re-running this exact script on repaired data **reverses the headline
+> result**:
+>
+> | arm | as published (holed) | re-run 2026-09-13 (repaired) |
+> |---|---|---|
+> | composite (naive) — incumbent | 2.84%, t=5.69 | 2.78%, t=5.77 |
+> | **composite (GBM) — challenger** | **2.48%, t=4.36** | **2.88%, t=5.72**, 16/18 |
+> | eps only (naive) | 3.29%, t=3.38 | 3.44%, t=3.57 |
+> | eps only (GBM) | 2.47%, t=3.33 | 2.76%, t=3.72 |
+> | revenue only (naive) | 1.24%, t=1.70 | 1.01%, t=1.47 |
+> | revenue only (GBM) | 2.36%, t=4.59 | 2.30%, t=4.92 |
+> | hybrid | 3.28%, t=4.89 | 3.22%, t=4.99 |
+>
+> Sample moved 27,347 → 29,076 events. Attribution is clean: only **24** events
+> are new since 2026-08-27, so the change is the repair, not data drift.
+>
+> **The GBM expectation now scores BETTER than the incumbent, not worse. "Do not
+> swap the expectation" no longer follows from this evidence — the swap is a live
+> candidate again and must be decided before the 2026-10-09 pre-registration.**
+>
+> **What survives unchanged:** the reframe in "Why — the reframe that matters"
+> below rests on EPS and revenue moving in *opposite* directions, and that pattern
+> holds on repaired data (naive EPS still beats GBM EPS; GBM revenue still beats
+> naive revenue). Scoring Stage 5 on reaction prediction rather than forecast MAE
+> still stands. The hybrid caution still stands — it remains a post-hoc pick
+> across seven arms.
+>
+> Numbers below are left exactly as published so the error and its cause stay
+> legible. Reproduce the re-run with:
+> `docker compose run --rm --no-deps --entrypoint python research-runner -m bharat_terminal.research.pead_expectations_ab`
+>
+> Note: this script pins no data snapshot — it reads whatever the database holds.
+> If these figures enter a pre-registration, pin a snapshot first.
+
+---
+
 ## Result
 
 | arm | D10−D1 | t-stat | cohorts>0 |
@@ -19,6 +70,10 @@ abnormal return vs NIFTYBEES, entered D+1 (announcement gap excluded).
 | hybrid (naive-eps + GBM-rev) | 3.28% | 4.89 | 15/18 |
 
 ## Verdict: do NOT swap the expectation. The Stage 3 recommendation is withdrawn.
+
+> **SUPERSEDED 2026-09-13 — see the correction block at the top of this file.**
+> This verdict was produced against a benchmark missing 264 sessions. On repaired
+> data the GBM arm beats the incumbent (2.88% vs 2.78%), so the swap is open again.
 
 Stage 3 recommended rebuilding composite-SUE on GBM expectations because
 the GBM forecasts better (+12.8% to +20.7% skill). **Tested, and it is
