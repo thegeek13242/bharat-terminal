@@ -150,7 +150,12 @@ def run_event_study(
         cost_bps = (statutory + 2.0 * slip) * cfg.cost_multiplier
         costs.append(cost_bps)
 
-        gross_abn = gross - bench
+        # The benchmark carries the POSITION's sign. A short's market-adjusted
+        # return is -(stock - benchmark); subtracting the benchmark from an
+        # already-negated return would double-count it, making every short look
+        # worse by twice the market move.
+        sign = 1.0 if cfg.direction == "long" else -1.0
+        gross_abn = gross - sign * bench
         net_abn = gross_abn - cost_bps / 10_000.0
 
         results.append(EventResult(

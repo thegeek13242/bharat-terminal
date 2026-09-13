@@ -24,6 +24,7 @@ from bharat_terminal.factory.snapshot.integrity import (
     check_constant_offset,
     check_null_share,
     check_row_delta,
+    check_series_continuity,
     check_snapshot_age,
     check_source_freshness,
     check_universe_survivorship,
@@ -217,6 +218,49 @@ def test_constant_offset_needs_concentration_not_just_volume():
 def test_no_overlapping_sightings_warns_rather_than_passing_silently():
     assert check_clock_lag([]).status == WARN
     assert check_constant_offset([]).status == WARN
+
+
+# ── series continuity: the benchmark hole ────────────────────────────────
+
+def market_sessions(n: int = 300, start: date = date(2024, 1, 1)) -> list:
+    out, d = [], start
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def test_continuous_series_passes():
+    sessions = market_sessions()
+    assert check_series_continuity("NIFTYBEES", sessions, sessions).status == PASS
+
+
+def test_holed_benchmark_fails():
+    """The real case: NIFTYBEES stops 2025-05-08 and resumes 2026-06-04."""
+    sessions = market_sessions()
+    holed = sessions[:100] + sessions[200:]          # 100 sessions missing
+    r = check_series_continuity("NIFTYBEES", holed, sessions)
+    assert r.status == FAIL
+    assert r.flag == "benchmark_gap"
+    assert "largest gap 100" in r.detail
+
+
+def test_short_gap_is_tolerated():
+    sessions = market_sessions()
+    minor = [d for i, d in enumerate(sessions) if i not in (50, 51)]
+    assert check_series_continuity("NIFTYBEES", minor, sessions).status == PASS
+
+
+def test_young_series_is_judged_only_over_its_own_life():
+    """MID150BEES starts 2022-05; that is not a gap."""
+    sessions = market_sessions()
+    young = sessions[200:]
+    assert check_series_continuity("MID150BEES", young, sessions).status == PASS
+
+
+def test_empty_series_fails():
+    assert check_series_continuity("GONE", [], market_sessions()).status == FAIL
 
 
 # ── survivorship ─────────────────────────────────────────────────────────

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from datetime import date, time, timedelta
 
+import pytest
+
 from bharat_terminal.factory.backtest.calendar import TradingCalendar
 from bharat_terminal.factory.backtest.engine import (
     EventInput,
@@ -260,6 +262,54 @@ def test_cohorts_group_by_entry_week():
     assert keys == sorted(keys)
     # Every cohort key is a Monday.
     assert all(date.fromisoformat(k).weekday() == 0 for k in keys)
+
+
+def rising_series(symbol: str, event_date: date, rise: float, days: int) -> PriceSeries:
+    """Same shape as drifting_series — used as a MOVING benchmark."""
+    return drifting_series(symbol, event_date, drift=rise, days=days)
+
+
+def test_short_that_tracks_the_market_has_no_abnormal_return():
+    """Regression: the benchmark must carry the position's sign.
+
+    A stock that moves exactly with a +2% market, shorted, is flat in abnormal
+    terms. The earlier code computed (-raw) - bench = -4%.
+    """
+    event_date = SESSIONS[10]
+    sym = "SYM0"
+    prices = {sym: drifting_series(sym, event_date, drift=0.02, days=5)}
+    bench = rising_series("NIFTYBEES", event_date, rise=0.02, days=5)
+    events = [EventInput(symbol=sym, event_date=event_date, median_traded_value_cr=60.0)]
+
+    out = run_event_study(events, prices, bench, CAL,
+                          StudyConfig(holding_days=5, direction="short"))
+    assert out.events_used == 1
+    assert abs(out.results[0].gross_abnormal) < 1e-9
+
+
+def test_long_that_tracks_the_market_has_no_abnormal_return():
+    event_date = SESSIONS[10]
+    sym = "SYM0"
+    prices = {sym: drifting_series(sym, event_date, drift=0.02, days=5)}
+    bench = rising_series("NIFTYBEES", event_date, rise=0.02, days=5)
+    events = [EventInput(symbol=sym, event_date=event_date, median_traded_value_cr=60.0)]
+
+    out = run_event_study(events, prices, bench, CAL,
+                          StudyConfig(holding_days=5, direction="long"))
+    assert abs(out.results[0].gross_abnormal) < 1e-9
+
+
+def test_short_beats_a_rising_market_when_the_stock_falls():
+    event_date = SESSIONS[10]
+    sym = "SYM0"
+    prices = {sym: drifting_series(sym, event_date, drift=-0.03, days=5)}
+    bench = rising_series("NIFTYBEES", event_date, rise=0.01, days=5)
+    events = [EventInput(symbol=sym, event_date=event_date, median_traded_value_cr=60.0)]
+
+    out = run_event_study(events, prices, bench, CAL,
+                          StudyConfig(holding_days=5, direction="short"))
+    # -(-3% - 1%) = +4%
+    assert out.results[0].gross_abnormal == pytest.approx(0.04, abs=1e-9)
 
 
 def test_short_direction_on_a_falling_stock_is_profitable_gross():

@@ -279,6 +279,57 @@ def check_constant_offset(
     )
 
 
+def check_series_continuity(
+    symbol: str,
+    series_dates: Sequence[date],
+    market_dates: Sequence[date],
+    max_gap_sessions: int = 5,
+    min_coverage: float = 0.98,
+) -> IntegrityResult:
+    """Does a series actually trade on every session it should?
+
+    Found the hard way on 2026-09-12: NIFTYBEES, JUNIORBEES and BANKBEES each
+    stop at 2025-05-08 and resume 2026-06-04 — a 392-day hole in `price_points`.
+    A benchmark with a hole does not fail loudly; it silently prices a 20-day
+    window against quotes a year apart, and if it is also used as the trading
+    calendar it pushes entry dates forward by months.
+
+    Coverage is measured against the market's own session set, so a genuinely
+    young series (a recent listing) is judged only over its own lifetime.
+    """
+    check = f"series_continuity:{symbol}"
+    have = sorted(set(series_dates))
+    if not have:
+        return IntegrityResult(check, FAIL, f"{symbol} has no bars", 0, min_coverage,
+                               flag="benchmark_gap")
+
+    lo, hi = have[0], have[-1]
+    expected = [d for d in sorted(set(market_dates)) if lo <= d <= hi]
+    coverage = len(have) / len(expected) if expected else 1.0
+
+    worst_gap = 0
+    worst_at: Optional[date] = None
+    present = set(have)
+    run = 0
+    for d in expected:
+        if d in present:
+            run = 0
+        else:
+            run += 1
+            if run > worst_gap:
+                worst_gap, worst_at = run, d
+
+    detail = (f"{symbol}: {len(have)}/{len(expected)} sessions ({coverage:.1%}) "
+              f"between {lo.isoformat()} and {hi.isoformat()}; "
+              f"largest gap {worst_gap} session(s)"
+              + (f" around {worst_at.isoformat()}" if worst_at else ""))
+
+    if coverage < min_coverage or worst_gap > max_gap_sessions:
+        return IntegrityResult(check, FAIL, detail, round(coverage, 4), min_coverage,
+                               flag="benchmark_gap")
+    return IntegrityResult(check, PASS, detail, round(coverage, 4), min_coverage)
+
+
 def check_universe_survivorship(
     delisted_symbols: int, total_symbols: int, min_expected_share: float = 0.02
 ) -> IntegrityResult:
@@ -308,6 +359,7 @@ def run_integrity_suite(
     null_shares: Sequence[Tuple[str, str, float]] = (),
     timestamp_gaps_hours: Optional[Sequence[float]] = None,
     survivorship: Optional[Tuple[int, int]] = None,
+    series_continuity: Sequence[Tuple[str, Sequence[date], Sequence[date]]] = (),
 ) -> IntegritySuite:
     """Run every gate over one snapshot and collect the verdicts."""
     suite = IntegritySuite()
@@ -321,6 +373,8 @@ def run_integrity_suite(
     if timestamp_gaps_hours is not None:
         suite.add(check_clock_lag(timestamp_gaps_hours))
         suite.add(check_constant_offset(timestamp_gaps_hours))
+    for symbol, series_dates, market_dates in series_continuity:
+        suite.add(check_series_continuity(symbol, series_dates, market_dates))
     if survivorship is not None:
         suite.add(check_universe_survivorship(*survivorship))
     return suite
