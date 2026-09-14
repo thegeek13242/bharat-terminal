@@ -1,4 +1,4 @@
-"""Write tools. Currently one: `submit_hypotheses`.
+"""Write tools: `submit_hypotheses` and `report_data_gap`.
 
 Every write tool obeys the same four rules:
 
@@ -42,7 +42,7 @@ from bharat_terminal.factory.dsl.compiler import (
     compile_spec,
 )
 from bharat_terminal.factory.dsl.models import HypothesisSpec
-from bharat_terminal.factory.tools_api.envelope import envelope
+from bharat_terminal.factory.tools_api.envelope import MAX_TEXT_CHARS, envelope
 from bharat_terminal.factory.tools_api.reads import Executor
 
 # The Scientist proposes in small batches so a bad frontier slot cannot flood
@@ -253,3 +253,139 @@ def _json(value: Any) -> str:
     """
     import json
     return json.dumps(value, default=str)
+
+
+# ── report_data_gap ──────────────────────────────────────────────────────
+#
+# The safe form of "let agents build their own tools". An agent that cannot
+# see what it needs DECLARES the gap; a human turns it into a tool or a
+# feature PR. No code is generated and nothing is executed.
+#
+# The queue is the evidence: if reports cluster around one theme, that is a
+# better trigger for building a tool than an agent's in-the-moment judgement.
+# Which is exactly why this dedupes -- ten identical rows from one retrying
+# agent is noise that would drown the signal it exists to produce.
+
+GAP_SOURCE = "agent_gap"          # 9 chars; research_questions.source is String(16)
+GAP_STATUS_OPEN = "open"
+MIN_NEED_CHARS = 20               # a crude but honest proxy for "concrete"
+MAX_ID_ALLOCATION_RETRIES = 3
+
+
+async def report_data_gap(
+    ex: Executor,
+    need: str,
+    *,
+    agent_version_id: str,
+    family_id: Optional[str] = None,
+    blocked_tool: Optional[str] = None,
+    suggested_source: Optional[str] = None,
+    evidence_refs: Sequence[Any] = (),
+    agent_run_id: Optional[int] = None,
+    trace_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Record that an agent could not see something it needed.
+
+    Returns `{question_id, created}`. `created=False` means an identical open
+    gap already existed and this call added nothing -- which is the correct
+    outcome for a retry, not a failure.
+    """
+    text = (need or "").strip()
+    if len(text) < MIN_NEED_CHARS:
+        return envelope("report_data_gap", None, note=(
+            f"a gap report must name a concrete need of at least "
+            f"{MIN_NEED_CHARS} characters; got {len(text)}"))
+    if len(text) > MAX_TEXT_CHARS:
+        text = text[:MAX_TEXT_CHARS]
+
+    # research_questions.family_id is a FOREIGN KEY to research_families.
+    # Checking it here turns an FK violation -- which would surface as an
+    # exception through the Gateway -- into a repairable message.
+    if family_id:
+        known = await ex(
+            "SELECT family_id FROM factory.research_families WHERE family_id = :fid",
+            {"fid": family_id})
+        if not known:
+            return envelope("report_data_gap", None, note=(
+                f"unknown family_id '{family_id}'. Omit it, or use one from "
+                f"get_family_state."))
+
+    fingerprint = _normalise(text)
+    existing = await ex(
+        """SELECT question_id FROM factory.research_questions
+            WHERE source = :source AND status = :status
+              AND lower(regexp_replace(text, '\\s+', ' ', 'g')) = :fp
+            LIMIT 1""",
+        {"source": GAP_SOURCE, "status": GAP_STATUS_OPEN, "fp": fingerprint})
+    if existing:
+        return envelope("report_data_gap", {
+            "question_id": existing[0]["question_id"],
+            "created": False,
+        }, note="an identical open gap already exists; nothing was added")
+
+    refs = {
+        "reported_by": agent_version_id,
+        "blocked_tool": blocked_tool,
+        "blocked_tool_known": _is_known_tool(blocked_tool),
+        "suggested_source": suggested_source,
+        "agent_run_id": agent_run_id,
+        "trace_id": trace_id,
+        "refs": list(evidence_refs),
+    }
+
+    # Two concurrent reports can compute the same next id; ON CONFLICT makes
+    # the loser insert nothing, so it recomputes rather than raising.
+    for _ in range(MAX_ID_ALLOCATION_RETRIES):
+        qid = await _next_question_id(ex)
+        rows = await ex(
+            """INSERT INTO factory.research_questions
+                 (question_id, family_id, text, source, status, evidence_refs)
+               VALUES (:qid, :fid, :text, :source, :status, :refs)
+               ON CONFLICT (question_id) DO NOTHING
+               RETURNING question_id""",
+            {"qid": qid, "fid": family_id, "text": text,
+             "source": GAP_SOURCE, "status": GAP_STATUS_OPEN,
+             "refs": _json(refs)})
+        if rows:
+            return envelope("report_data_gap",
+                            {"question_id": qid, "created": True},
+                            note="a human decides whether this becomes a tool "
+                                 "or a feature PR")
+    return envelope("report_data_gap", None,
+                    note="could not allocate a question id; try again")
+
+
+def _normalise(text: str) -> str:
+    """Fold whitespace and case so trivial rewordings still dedupe."""
+    import re
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+async def _next_question_id(ex: Executor) -> str:
+    """Allocate the next RQ-nnnnnn.
+
+    research_questions.question_id has no default and no sequence, so the id
+    is derived from the current maximum. The regex guard keeps a
+    differently-shaped id (an import, say) from breaking the cast.
+    """
+    rows = await ex(
+        """SELECT COALESCE(MAX((substring(question_id from '^RQ-([0-9]+)$'))::int), 0) + 1
+                  AS next_n
+             FROM factory.research_questions
+            WHERE question_id ~ '^RQ-[0-9]+$'""",
+        {})
+    n = (rows[0]["next_n"] if rows and rows[0].get("next_n") else 1)
+    return f"RQ-{int(n):06d}"
+
+
+def _is_known_tool(name: Optional[str]) -> Optional[bool]:
+    """Is `blocked_tool` a tool that actually exists?
+
+    Recorded rather than enforced. An agent naming a tool that does not exist
+    is itself informative -- it may be describing the tool it wishes it had.
+    """
+    if not name:
+        return None
+    from bharat_terminal.factory.tools_api import reads
+    known = {n for n in dir(reads) if n.startswith(("get_", "search_", "list_"))}
+    return name in known or f"get_{name}" in known

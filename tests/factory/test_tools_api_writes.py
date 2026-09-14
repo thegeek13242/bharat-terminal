@@ -244,3 +244,144 @@ async def test_no_statement_touches_a_forbidden_table():
     for forbidden in ("gate_decisions", "hypothesis_status", "public.",
                       "alpha_wealth_ledger", "holdout_access_log"):
         assert forbidden not in all_sql, forbidden
+
+
+# ══ report_data_gap ══════════════════════════════════════════════════════
+
+class GapExecutor:
+    """Routes by SQL content: family lookup, dedup probe, id allocation, insert."""
+
+    def __init__(self, *, family_exists: bool = True,
+                 duplicate_of: str | None = None,
+                 max_n: int = 0, insert_conflicts: bool = False):
+        self.family_exists = family_exists
+        self.duplicate_of = duplicate_of
+        self.max_n = max_n
+        self.insert_conflicts = insert_conflicts
+        self.calls: list[dict] = []
+
+    async def __call__(self, sql: str, params: dict):
+        self.calls.append({"sql": sql, "params": params})
+        if "research_families" in sql:
+            return [{"family_id": params["fid"]}] if self.family_exists else []
+        if "next_n" in sql:
+            return [{"next_n": self.max_n + 1}]
+        if "SELECT question_id" in sql:
+            return [{"question_id": self.duplicate_of}] if self.duplicate_of else []
+        if "INSERT INTO factory.research_questions" in sql:
+            return [] if self.insert_conflicts else [{"question_id": params["qid"]}]
+        return []
+
+    def sql_for(self, fragment: str):
+        return [c for c in self.calls if fragment in c["sql"]]
+
+
+GOOD_NEED = "I cannot see realized slippage per paper trade; get_paper_feedback "\
+            "returns only aggregates."
+
+
+@pytest.mark.asyncio
+async def test_a_concrete_gap_is_recorded_and_allocated_an_id():
+    ex = GapExecutor(max_n=6)
+    out = await writes.report_data_gap(ex, GOOD_NEED, agent_version_id="sci@v1")
+    assert out["data"]["created"] is True
+    assert out["data"]["question_id"] == "RQ-000007"
+
+
+@pytest.mark.asyncio
+async def test_a_vague_need_is_refused_and_writes_nothing():
+    ex = GapExecutor()
+    out = await writes.report_data_gap(ex, "need data", agent_version_id="a@v1")
+    assert out["data"] is None
+    assert "concrete need" in out["note"]
+    assert ex.calls == []
+
+
+@pytest.mark.asyncio
+async def test_empty_need_is_refused():
+    out = await writes.report_data_gap(GapExecutor(), "   ", agent_version_id="a@v1")
+    assert out["data"] is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_family_is_a_repairable_message_not_an_fk_explosion():
+    """family_id is a FOREIGN KEY; an unchecked bad value raises through the Gateway."""
+    ex = GapExecutor(family_exists=False)
+    out = await writes.report_data_gap(ex, GOOD_NEED, agent_version_id="a@v1",
+                                       family_id="no_such_family")
+    assert out["data"] is None
+    assert "unknown family_id" in out["note"]
+    assert not ex.sql_for("INSERT INTO factory.research_questions")
+
+
+@pytest.mark.asyncio
+async def test_an_identical_open_gap_is_not_duplicated():
+    """A retrying agent must not turn the signal queue into spam."""
+    ex = GapExecutor(duplicate_of="RQ-000003")
+    out = await writes.report_data_gap(ex, GOOD_NEED, agent_version_id="a@v1")
+    assert out["data"] == {"question_id": "RQ-000003", "created": False}
+    assert not ex.sql_for("INSERT INTO factory.research_questions")
+
+
+@pytest.mark.asyncio
+async def test_dedup_ignores_whitespace_and_case():
+    ex = GapExecutor(duplicate_of="RQ-000003")
+    noisy = "  " + GOOD_NEED.upper().replace(" ", "   ") + "\n"
+    await writes.report_data_gap(ex, noisy, agent_version_id="a@v1")
+    fp = ex.sql_for("SELECT question_id")[0]["params"]["fp"]
+    assert fp == GOOD_NEED.lower().replace("  ", " ")
+
+
+@pytest.mark.asyncio
+async def test_source_is_agent_gap_and_fits_the_column():
+    ex = GapExecutor()
+    await writes.report_data_gap(ex, GOOD_NEED, agent_version_id="a@v1")
+    p = ex.sql_for("INSERT INTO factory.research_questions")[0]["params"]
+    assert p["source"] == "agent_gap"
+    assert len(p["source"]) <= 16, "research_questions.source is String(16)"
+    assert p["status"] == "open"
+
+
+@pytest.mark.asyncio
+async def test_evidence_refs_are_serialised_json_not_a_dict():
+    ex = GapExecutor()
+    await writes.report_data_gap(ex, GOOD_NEED, agent_version_id="sci@v1",
+                                 blocked_tool="get_paper_feedback",
+                                 evidence_refs=["FAIL-1", "EXP-2"])
+    p = ex.sql_for("INSERT INTO factory.research_questions")[0]["params"]
+    assert isinstance(p["refs"], str)
+    import json
+    refs = json.loads(p["refs"])
+    assert refs["reported_by"] == "sci@v1"
+    assert refs["refs"] == ["FAIL-1", "EXP-2"]
+    assert refs["blocked_tool_known"] is True
+
+
+@pytest.mark.asyncio
+async def test_an_invented_blocked_tool_is_flagged_not_rejected():
+    """Naming a tool that does not exist is itself signal."""
+    ex = GapExecutor()
+    out = await writes.report_data_gap(ex, GOOD_NEED, agent_version_id="a@v1",
+                                       blocked_tool="get_tomorrows_prices")
+    assert out["data"]["created"] is True
+    import json
+    refs = json.loads(ex.sql_for("INSERT INTO")[0]["params"]["refs"])
+    assert refs["blocked_tool_known"] is False
+
+
+@pytest.mark.asyncio
+async def test_id_allocation_retries_on_conflict_then_gives_up_cleanly():
+    ex = GapExecutor(insert_conflicts=True)
+    out = await writes.report_data_gap(ex, GOOD_NEED, agent_version_id="a@v1")
+    assert out["data"] is None
+    assert len(ex.sql_for("INSERT INTO")) == writes.MAX_ID_ALLOCATION_RETRIES
+
+
+@pytest.mark.asyncio
+async def test_gap_report_touches_no_forbidden_table():
+    ex = GapExecutor()
+    await writes.report_data_gap(ex, GOOD_NEED, agent_version_id="a@v1")
+    all_sql = " ".join(c["sql"] for c in ex.calls).lower()
+    for forbidden in ("gate_decisions", "hypothesis_status", "public.",
+                      "alpha_wealth_ledger", "holdout_access_log"):
+        assert forbidden not in all_sql, forbidden
