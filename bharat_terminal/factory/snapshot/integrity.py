@@ -29,7 +29,7 @@ a publication lag, not a mislabel, and the gate says so.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 
 IST_UTC_OFFSET_HOURS = 5.5

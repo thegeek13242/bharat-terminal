@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from datetime import date
 
-import pytest
 
 from bharat_terminal.factory.report.deliver import (
     DeliveryPayload,
@@ -18,10 +17,7 @@ from bharat_terminal.factory.report.deliver import (
 )
 from bharat_terminal.factory.report.facts import (
     LOW_ACTIVITY_THRESHOLD,
-    ReportFacts,
-    Scorecard,
     build_facts,
-    compute_action_required,
 )
 from bharat_terminal.factory.report.reconcile import (
     reconcile_narrative,

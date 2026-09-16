@@ -8,4 +8,4 @@ from bharat_terminal.factory.registry.features import (
     parse_ref,
 )
 
-__all__ = ["FeatureSpec", "REGISTRY", "get_feature", "parse_ref"]
+__all__ = ["REGISTRY", "FeatureSpec", "get_feature", "parse_ref"]

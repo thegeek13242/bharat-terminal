@@ -11,7 +11,6 @@ offset must still be caught.
 from __future__ import annotations
 
 import json
-import os
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -22,7 +21,6 @@ from bharat_terminal.factory.snapshot.integrity import (
     WARN,
     check_clock_lag,
     check_constant_offset,
-    check_null_share,
     check_row_delta,
     check_series_continuity,
     check_snapshot_age,

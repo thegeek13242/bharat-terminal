@@ -12,7 +12,7 @@ import json
 import os
 from dataclasses import dataclass, field, asdict
 from datetime import date, datetime, timezone
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional
 
 CHUNK = 1024 * 1024
 

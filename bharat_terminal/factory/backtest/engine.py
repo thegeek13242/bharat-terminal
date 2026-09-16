@@ -13,7 +13,6 @@ from typing import Dict, List, Mapping, Optional, Sequence
 from bharat_terminal.factory.backtest.calendar import TradingCalendar
 from bharat_terminal.factory.backtest.returns import (
     PriceSeries,
-    TradeWindow,
     benchmark_return,
     gross_return,
     has_corporate_action,

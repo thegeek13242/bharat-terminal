@@ -14,20 +14,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from bharat_terminal.factory.dsl.hashing import spec_hash
 from bharat_terminal.factory.dsl.models import (
     Benchmark,
-    CohortUnit,
     Direction,
     EntryRule,
     EventClock,
     HoldoutPolicy,
     Horizon,
     HypothesisSpec,
-    SlippageModel,
-    StopKind,
 )
 from bharat_terminal.factory.registry.features import (
     CONTROL_COVERAGE_FLOOR,

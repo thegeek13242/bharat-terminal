@@ -10,7 +10,6 @@ import gzip
 import os
 from datetime import date
 
-import pytest
 
 from bharat_terminal.factory.snapshot.exporter import (
     SPECS_V1,
