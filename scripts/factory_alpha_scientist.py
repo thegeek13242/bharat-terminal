@@ -53,6 +53,45 @@ from bharat_terminal.factory.dsl.models import HypothesisSpec
 from bharat_terminal.factory.tools_api import reads, writes
 from bharat_terminal.factory.tools_api.pools import PoolSpec, make_executor, open_pool
 
+# The exact spec that compiled and ran as EXP-000001, lifted from that script
+# so the example cannot drift from something that genuinely worked.
+EXAMPLE_SPEC = {   'dsl_version': 1,
+    'id': 'H-000001',
+    'version': 1,
+    'parents': [],
+    'family': 'pead_composite_sue',
+    'question': None,
+    'horizon': 'swing',
+    'claim': {   'description': 'Top-decile composite-SUE surprises drift upward over '
+                                '20 trading days.',
+                 'mechanism': 'Investors anchor on the naive headline and under-react '
+                              'to the surprise.',
+                 'falsified_if': 'Net abnormal return <= 0, or the D10-D1 cohort '
+                                 't-stat falls below 2.'},
+    'universe': {   'base': 'listed_equity_nse_bse',
+                    'min_median_traded_value_cr': 1.0,
+                    'exclude': ['fund_scheme', 'suspended'],
+                    'max_participation_pct_adv': 2.0},
+    'event': {   'source': 'earnings_surprises',
+                 'clock': 'announcement_date',
+                 'filters': [   {   'feature': 'sue_composite@2.1',
+                                    'op': 'decile_ge',
+                                    'value': 10,
+                                    'reference': 'trailing_365d'}]},
+    'signal': {'feature': 'sue_composite@2.1', 'direction': 'long'},
+    'entry': {'rule': 'next_session_open', 'delay_minutes': 0},
+    'exit': {'holding_days': [5, 10, 20], 'stop': 'none', 'squareoff_intraday': False},
+    'benchmark': 'niftybees',
+    'costs': {'model': 'india_cash_v1', 'slippage': 'adv_bucket_v1', 'multiplier': 1.0},
+    'controls': ['liquidity_tier'],
+    'statistics': {   'unit': 'calendar_week',
+                      'primary_metric': 'net_abnormal_return',
+                      'primary_holding_days': 20,
+                      'min_events': 300,
+                      'min_cohorts': 12},
+    'validation': {'holdout': 'sealed_h_v1', 'battery': 'default_v1'},
+    'sweep': {}}
+
 AGENT = "scientist"
 MODEL = "claude-opus-4-5-20251101"   # -> global.anthropic.claude-opus-4-5-20251101-v1:0
 MAX_TURNS = 8                         # spec 4.1
@@ -66,8 +105,11 @@ question you are given, and submit them with submit_hypotheses.
 How this works:
 - You do NOT run experiments, score results, or promote anything. A deterministic compiler and
   gate engine decide what is valid. You compose; they judge.
-- Every hypothesis is a typed spec over REGISTERED features. Call list_features first and use
-  only refs that exist, spelled exactly. Inventing a feature fails the compile.
+- FIRST call get_hypothesis_schema. It returns the exact JSON schema for a spec and a worked
+  example that compiled. Copy the example's shape and change the mechanics. Do NOT guess the
+  field names: an earlier run burned every turn rediscovering them one rejection at a time.
+- Every hypothesis is a typed spec over REGISTERED features. Call list_features and use only
+  refs that exist, spelled exactly. Inventing a feature fails the compile.
 - A feature whose coverage is null is UNMEASURED and CANNOT be used as a control.
 - If submit_hypotheses rejects a spec, the errors are repair instructions carrying a code, a path
   and a message. Fix exactly what they name and resubmit once.
@@ -88,6 +130,10 @@ def tool_schemas() -> List[Dict[str, Any]]:
          "input_schema": {"type": "object",
                           "properties": {"question_id": {"type": "string"}},
                           "required": ["question_id"]}},
+        {"name": "get_hypothesis_schema",
+         "description": "The JSON schema for a HypothesisSpec, plus a worked example that "
+                        "actually compiled. CALL THIS FIRST. Do not guess the shape.",
+         "input_schema": {"type": "object", "properties": {}}},
         {"name": "list_features",
          "description": "The registered feature catalogue. Use ONLY these refs, exactly as "
                         "spelled. coverage=null means UNMEASURED and cannot be a control.",
@@ -182,6 +228,14 @@ async def dispatch(name: str, args: Dict[str, Any], ex, ctx, avid: str,
     """Map a tool call to the real tool. An unknown name is refused, not guessed."""
     if name == "get_research_question":
         return await reads.get_research_question(ex, args.get("question_id", ""))
+    if name == "get_hypothesis_schema":
+        from bharat_terminal.factory.dsl.models import HypothesisSpec
+        return {"tool": "get_hypothesis_schema", "data": {
+            "json_schema": HypothesisSpec.model_json_schema(),
+            "worked_example": EXAMPLE_SPEC,
+            "note": ("worked_example is the incumbent PEAD recipe exactly as it compiled "
+                     "and ran as EXP-000001. Copy its shape; change the mechanics."),
+        }}
     if name == "list_features":
         return reads.list_features()
     if name == "get_family_state":
