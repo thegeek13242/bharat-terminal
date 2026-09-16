@@ -18,8 +18,8 @@ import asyncio
 import json
 import os
 import sys
-from datetime import date
-from typing import Any, Dict, List
+
+from typing import Any, Dict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))

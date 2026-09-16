@@ -32,6 +32,15 @@ makes a replayed identical submission a no-op. That covers a Gateway retry of
 the same payload. It does NOT cover an agent that regenerates ids on retry --
 that needs an idempotency table and a migration.
 
+The dangerous half of that gap IS now closed. Reusing an id for DIFFERENT
+mechanics used to vanish into ON CONFLICT: the insert did nothing, the tool
+reported success, and the agent's summary described a hypothesis the ledger did
+not contain. That is now E016, checked on spec_hash (mechanics only, so a
+reworded claim over identical mechanics is still a replay). Observed live on
+2026-09-16 before the guard existed -- run 3 described H-000002 as a 10-day hold
+while the ledger held run 2's 20-day spec, and the run still reported
+"succeeded".
+
 **Cross-submit deduplication is incomplete.** `ctx.known_spec_hashes` maps
 spec_hash -> experiment_id, and an experiment only exists once a cycle runs. A
 hypothesis row carries no spec_hash column, so two agents can submit identical
@@ -41,6 +50,7 @@ batch this module DOES dedupe, because that case is free.
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from bharat_terminal.factory.dsl.compiler import (
@@ -48,6 +58,7 @@ from bharat_terminal.factory.dsl.compiler import (
     CompileResult,
     compile_spec,
 )
+from bharat_terminal.factory.dsl.hashing import spec_hash
 from bharat_terminal.factory.dsl.models import HypothesisSpec
 from bharat_terminal.factory.tools_api.envelope import MAX_TEXT_CHARS, envelope
 from bharat_terminal.factory.tools_api.reads import Executor
@@ -107,6 +118,11 @@ async def submit_hypotheses(
                 [{"code": e.code, "path": e.path, "message": e.message}
                  for e in result.errors],
                 duplicate_of=result.duplicate_of))
+            continue
+
+        clash = await _id_clash(ex, spec, result.plan.spec_hash)
+        if clash:
+            rejected.append(_rejection(idx, spec.id, [clash]))
             continue
 
         # Reserve the hash for the rest of THIS batch. The compiler cannot see
@@ -202,6 +218,44 @@ def _rejection(idx: int, hypothesis_id: Optional[str],
     if duplicate_of:
         out["duplicate_of"] = duplicate_of
     return out
+
+
+async def _id_clash(ex: Executor, spec: HypothesisSpec,
+                    new_hash: str) -> Optional[Dict[str, Any]]:
+    """Refuse to reuse an id for different work.
+
+    ON CONFLICT DO NOTHING is correct for a REPLAYED identical payload and
+    actively wrong for a different payload under the same id: the insert
+    silently vanishes, the tool reports success, and the agent's own summary
+    then describes a hypothesis the ledger does not contain. That happened on
+    2026-09-16 -- run 3 described H-000002 as a 10-day hold while the ledger
+    held the 20-day spec from run 2, and the run still reported "succeeded".
+
+    The comparison is on spec_hash, which covers mechanics only, so a reworded
+    claim over identical mechanics is still a replay, while different mechanics
+    under a reused id is a collision.
+    """
+    rows = await ex(
+        """SELECT spec_json FROM factory.hypotheses
+            WHERE hypothesis_id = :hid AND version = :ver""",
+        {"hid": spec.id, "ver": spec.version})
+    if not rows:
+        return None
+    raw = rows[0].get("spec_json")
+    stored = json.loads(raw) if isinstance(raw, str) else raw
+    try:
+        stored_hash = spec_hash(HypothesisSpec.model_validate(stored))
+    except Exception:
+        return {"code": "E016", "path": "id",
+                "message": (f"{spec.id} v{spec.version} already exists and its stored "
+                            f"spec could not be re-read. Choose an unused id.")}
+    if stored_hash == new_hash:
+        return None                      # genuine idempotent replay
+    return {"code": "E016", "path": "id",
+            "message": (f"{spec.id} v{spec.version} already exists with DIFFERENT "
+                        f"mechanics (stored {stored_hash[:12]}, proposed "
+                        f"{new_hash[:12]}). A hypothesis id is immutable. Choose an "
+                        f"id that is not in use, or submit as a new version.")}
 
 
 async def _insert(ex: Executor, spec: HypothesisSpec, item: Dict[str, Any],

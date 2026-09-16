@@ -728,3 +728,69 @@ async def test_report_write_touches_no_forbidden_table():
     for forbidden in ("gate_decisions", "hypothesis_status", "public.",
                       "alpha_wealth_ledger"):
         assert forbidden not in inserts, forbidden
+
+
+# ══ E016: an id may not be reused for different work ═════════════════════
+#
+# Found live on 2026-09-16. ON CONFLICT DO NOTHING is right for a replayed
+# identical payload and actively wrong for a different payload under the same
+# id: the write vanished, the tool said "accepted", and the agent's own summary
+# then described a hypothesis the ledger did not hold.
+
+class ClashExecutor(FakeExecutor):
+    """A ledger that already contains one hypothesis."""
+
+    def __init__(self, stored_spec):
+        super().__init__()
+        self.stored_spec = stored_spec
+
+    async def __call__(self, sql: str, params: dict):
+        self.calls.append({"sql": sql, "params": params})
+        if "SELECT spec_json FROM factory.hypotheses" in sql:
+            import json as _j
+            return [{"spec_json": _j.dumps(self.stored_spec)}]
+        if "RETURNING" in sql:
+            return [{"hypothesis_id": params.get("hid")}]
+        return []
+
+
+@pytest.mark.asyncio
+async def test_reusing_an_id_for_different_mechanics_is_refused():
+    stored = dict(BASE_SPEC)
+    stored["statistics"] = {**BASE_SPEC["statistics"], "primary_holding_days": 20}
+    proposed = item()
+    proposed["spec"] = dict(BASE_SPEC)
+    proposed["spec"]["statistics"] = {**BASE_SPEC["statistics"],
+                                      "primary_holding_days": 10}
+    ex = ClashExecutor(stored)
+    out = await submit_hypotheses(ex, [proposed], ctx=ctx_with_counts(),
+                                  agent_version_id="a@v1")
+    assert out["data"]["accepted"] == []
+    err = out["data"]["rejected"][0]["errors"][0]
+    assert err["code"] == "E016"
+    assert "DIFFERENT" in err["message"]
+    assert not ex.sql_for("INSERT INTO factory.hypotheses")
+
+
+@pytest.mark.asyncio
+async def test_replaying_identical_mechanics_is_still_a_no_op_not_an_error():
+    """A Gateway retry must stay idempotent, not become a failure."""
+    ex = ClashExecutor(dict(BASE_SPEC))
+    out = await submit_hypotheses(ex, [item()], ctx=ctx_with_counts(),
+                                  agent_version_id="a@v1")
+    assert out["data"]["rejected"] == []
+    assert len(out["data"]["accepted"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_reworded_claim_over_identical_mechanics_is_a_replay():
+    """spec_hash covers mechanics only, so prose changes must not collide."""
+    stored = dict(BASE_SPEC)
+    proposed = item()
+    proposed["spec"] = dict(BASE_SPEC)
+    proposed["spec"]["claim"] = {**BASE_SPEC["claim"],
+                                 "description": "Completely different wording here."}
+    ex = ClashExecutor(stored)
+    out = await submit_hypotheses(ex, [proposed], ctx=ctx_with_counts(),
+                                  agent_version_id="a@v1")
+    assert out["data"]["rejected"] == [], "prose is not mechanics"

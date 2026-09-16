@@ -50,6 +50,12 @@ from bharat_terminal.factory.dsl.compiler import (
     compile_spec,
 )
 from bharat_terminal.factory.dsl.models import HypothesisSpec
+from bharat_terminal.factory.gates.budget import (
+    BudgetExhausted,
+    check_cap,
+    guard,
+    record_spend,
+)
 from bharat_terminal.factory.tools_api import reads, writes
 from bharat_terminal.factory.tools_api.pools import PoolSpec, make_executor, open_pool
 
@@ -333,8 +339,21 @@ async def main() -> int:
     status, err = "succeeded", None
 
     try:
+        cap0 = await guard(ex)          # refuse to start if the cap is already hit
+        print(f"budget        : ${cap0.spent_usd:,.2f} of ${cap0.cap_usd:,.0f} "
+              f"over {cap0.window_days}d"
+              + (f"  WARNING {cap0.fraction:.0%}" if cap0.warning else "") + "\n")
         for turn in range(1, args.max_turns + 1):
             turns = turn
+            # This run's own spend is not in the ledger until it finishes, so
+            # count it here -- otherwise a long loop could blow the cap inside
+            # a single invocation and only discover it afterwards.
+            live = (in_tok / 1e6) * 5.0 + (out_tok / 1e6) * 25.0
+            st = await check_cap(ex)
+            if st.spent_usd + live >= st.cap_usd:
+                raise BudgetExhausted(
+                    f"ledger ${st.spent_usd:,.2f} + this run ${live:,.2f} "
+                    f"reaches the ${st.cap_usd:,.2f} cap")
             resp = await asyncio.to_thread(complete, model=MODEL, messages=messages,
                                            max_tokens=MAX_TOKENS, system=SYSTEM, tools=tools)
             in_tok += getattr(resp.usage, "input_tokens", 0) or 0
@@ -359,8 +378,12 @@ async def main() -> int:
                     print(f"    -> accepted={len(d.get('accepted') or [])} "
                           f"rejected={len(d.get('rejected') or [])}")
                     for a in (d.get("accepted") or []):
-                        print(f"       OK       {a.get('hypothesis_id')} "
-                              f"tier={a.get('data_tier')} hash={str(a.get('spec_hash'))[:12]}")
+                        # "OK" without this distinction is how run 3 reported
+                        # success while writing nothing.
+                        mark = "WRITTEN " if a.get("inserted") else "no-op   "
+                        print(f"       {mark} {a.get('hypothesis_id')} "
+                              f"tier={a.get('data_tier')} hash={str(a.get('spec_hash'))[:12]}"
+                              + ("" if a.get("inserted") else "  (already present, unchanged)"))
                     for r in (d.get("rejected") or []):
                         print(f"       REJECTED {r.get('hypothesis_id')}: "
                               f"{[e.get('code') for e in r.get('errors', [])]}")
@@ -370,11 +393,21 @@ async def main() -> int:
                 results.append({"type": "tool_result", "tool_use_id": c.id,
                                 "content": json.dumps(out, default=str)[:20000]})
             messages.append({"role": "user", "content": results})
+    except BudgetExhausted as e:
+        status, err = "budget_exhausted", str(e)
+        print(f"\n!! HALTED: {err}")
     except Exception as e:
         status, err = "error", f"{type(e).__name__}: {e}"
         print(f"\n!! {err}")
 
     usd = (in_tok / 1e6) * 5.0 + (out_tok / 1e6) * 25.0
+    if args.apply and usd > 0:
+        # Recorded even on failure: an errored run still spent the tokens, and
+        # a cap that only counts successes is not a cap.
+        await record_spend(ex, "llm", usd, family_id="pead_composite_sue",
+                           source="alpha_run",
+                           ref={"agent_version_id": avid, "trace_id": trace_id,
+                                "turns": turns, "status": status})
     if args.apply:
         await ex("""INSERT INTO factory.agent_runs
                       (agent_version_id, task, result, input_tokens, output_tokens,
