@@ -1,4 +1,11 @@
-"""Write tools: `submit_hypotheses` and `report_data_gap`.
+"""Write tools: the five an agent may call.
+
+  submit_hypotheses       Scientist
+  submit_attack_plan      Adversary
+  submit_allocation       Chief Scientist
+  submit_report_narrative Reporter
+  report_data_gap         all four
+
 
 Every write tool obeys the same four rules:
 
@@ -389,3 +396,312 @@ def _is_known_tool(name: Optional[str]) -> Optional[bool]:
     from bharat_terminal.factory.tools_api import reads
     known = {n for n in dir(reads) if n.startswith(("get_", "search_", "list_"))}
     return name in known or f"get_{name}" in known
+
+
+# ── column ceilings ──────────────────────────────────────────────────────
+#
+# Verified against the live schema 2026-09-14. These are narrow enough to
+# reject realistic values, and a silent truncation in an audit ledger is worse
+# than a loud refusal -- so they are named here rather than discovered in
+# production.
+MAX_EXPERIMENT_ID = 16       # robustness_tests.experiment_id
+MAX_REQUESTED_BY = 16        # robustness_tests.requested_by
+MAX_VERDICT = 16             # robustness_tests.verdict
+VERDICT_REQUESTED = "requested"
+
+MAX_ATTACKS_PER_PLAN = 8
+MAX_MEMO_CHARS = 4_000
+
+
+async def submit_attack_plan(
+    ex: Executor,
+    experiment_id: str,
+    attacks: Sequence[Dict[str, Any]],
+    kill_memo: str,
+    *,
+    agent_version_id: str,
+    agent_run_id: Optional[int] = None,
+    trace_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """The Adversary's only write: request catalogue attacks and file a memo.
+
+    An attack not in the catalogue is refused -- an agent may compose the
+    battery, never invent it. The memo must cite at least one real run_id; an
+    uncited memo is rejected rather than stored, because a kill argument that
+    references nothing is rhetoric.
+
+    The memo is ADVISORY. A veto is upheld only when a critical test actually
+    fails, and that check is deterministic in `gates.engine`. Nothing here can
+    change a verdict: rows are written with verdict='requested'.
+
+    SCHEMA GAP, named rather than worked around: there is no `attack_plans`
+    table among the 25, and `gate_decisions.llm_recommendation` -- where a memo
+    belongs -- is writable only by `factory_gate`. So the memo is carried in
+    `robustness_tests.details` on each row of the plan, keyed by a shared
+    plan_id. A dedicated table would need a migration.
+    """
+    from bharat_terminal.factory.tools_api.catalogue import BY_ID, is_known
+
+    if len(experiment_id or "") > MAX_EXPERIMENT_ID:
+        return envelope("submit_attack_plan", None, note=(
+            f"experiment_id exceeds {MAX_EXPERIMENT_ID} characters"))
+
+    memo = (kill_memo or "").strip()[:MAX_MEMO_CHARS]
+    if not memo:
+        return envelope("submit_attack_plan", None,
+                        note="a kill memo is required")
+
+    runs = await ex(
+        """SELECT run_id FROM factory.experiment_runs
+            WHERE experiment_id = :eid ORDER BY run_id""",
+        {"eid": experiment_id})
+    real_run_ids = {str(r["run_id"]) for r in runs}
+    if not real_run_ids:
+        return envelope("submit_attack_plan", None, note=(
+            f"no runs exist for {experiment_id}; there is nothing to attack"))
+
+    # Word-boundary match, NOT substring. `rid in memo` would let "we ran 15
+    # tests" cite run 1 and run 5 -- defeating the whole point of the guard for
+    # exactly the small ids a fresh ledger produces. The check exists to stop a
+    # memo that references nothing being accepted as evidence.
+    import re
+    mentioned = set(re.findall(r"\b\d+\b", memo))
+    cited = sorted(real_run_ids & mentioned, key=int)
+    if not cited:
+        return envelope("submit_attack_plan", None, note=(
+            "the memo cites no real run_id for this experiment; "
+            f"known runs are {sorted(real_run_ids)[:8]}"))
+
+    # A STABLE digest, not Python's hash(): the builtin string hash is
+    # randomized per process (PYTHONHASHSEED), so the same memo would produce a
+    # different plan_id in every worker and the id linking a plan's rows would
+    # be meaningless in an audit ledger.
+    import hashlib
+    digest = hashlib.sha256(f"{experiment_id}|{memo}".encode()).hexdigest()[:8]
+    plan_id = f"AP-{experiment_id}-{digest}"
+    accepted: List[Dict[str, Any]] = []
+    refused: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    for idx, attack in enumerate(list(attacks)[:MAX_ATTACKS_PER_PLAN]):
+        test_id = (attack or {}).get("test_id") if isinstance(attack, dict) else None
+        if not test_id or not is_known(test_id):
+            refused.append({"index": idx, "test_id": test_id,
+                            "reason": "not in the battery catalogue"})
+            continue
+        if test_id in seen:
+            refused.append({"index": idx, "test_id": test_id,
+                            "reason": "already requested in this plan"})
+            continue
+        seen.add(test_id)
+
+        spec = BY_ID[test_id]
+        await ex(
+            """INSERT INTO factory.robustness_tests
+                 (experiment_id, battery_test, critical, requested_by, verdict, details)
+               VALUES (:eid, :test, :critical, :by, :verdict, :details)""",
+            {
+                "eid": experiment_id,
+                "test": test_id,
+                "critical": spec.critical,
+                # requested_by is varchar(16); the full id is kept in details so
+                # the audit trail survives the truncation rather than losing it.
+                "by": agent_version_id[:MAX_REQUESTED_BY],
+                "verdict": VERDICT_REQUESTED[:MAX_VERDICT],
+                "details": _json({
+                    "plan_id": plan_id,
+                    "params": (attack.get("params") or {}),
+                    "cites": cited,
+                    "memo": memo,
+                    "requested_by_full": agent_version_id,
+                    "agent_run_id": agent_run_id,
+                    "trace_id": trace_id,
+                }),
+            })
+        accepted.append({"index": idx, "test_id": test_id,
+                         "critical": spec.critical,
+                         "kill_condition": spec.kill_condition})
+
+    return envelope("submit_attack_plan", {
+        "plan_id": plan_id,
+        "experiment_id": experiment_id,
+        "cited_run_ids": cited,
+        "accepted": accepted,
+        "refused": refused,
+        "note_on_authority": ("advisory only; a veto is upheld only when a "
+                              "critical test fails, checked deterministically"),
+    })
+
+
+async def submit_allocation(
+    ex: Executor,
+    *,
+    agent_version_id: str,
+    allocations: Sequence[Dict[str, Any]] = (),
+    kills: Sequence[Dict[str, Any]] = (),
+    revisits: Sequence[Dict[str, Any]] = (),
+    global_cap_usd: Optional[float] = None,
+    agent_run_id: Optional[int] = None,
+    trace_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """The Chief Scientist's only write: a frontier snapshot.
+
+    IMPORTANT, and a deliberate property rather than a limitation: this tool
+    RECORDS an allocation, it does not APPLY one. `factory_writer` holds
+    INSERT and SELECT and no UPDATE anywhere, so nothing here can set
+    `research_families.status` to paused or killed. A kill is a recommendation
+    in the snapshot; applying it needs `factory_gate`. An agent therefore
+    cannot halt a line of research by itself, which is the intended boundary.
+
+    A revisit is checked with `gates.engine.family_pause_check` -- the same
+    deterministic rule the gate uses, not a second implementation of it. Prose
+    alone never reopens a family.
+    """
+    from bharat_terminal.factory.gates.engine import family_pause_check
+
+    applied: List[Dict[str, Any]] = []
+    refused: List[Dict[str, Any]] = []
+
+    families = await ex(
+        "SELECT family_id, status, budget_cap_usd FROM factory.research_families", {})
+    known = {f["family_id"]: f for f in families}
+
+    total = 0.0
+    for idx, a in enumerate(allocations):
+        fid = (a or {}).get("family_id")
+        usd = float((a or {}).get("budget_usd") or 0)
+        if fid not in known:
+            refused.append({"index": idx, "item": "allocation", "family_id": fid,
+                            "reason": "unknown family_id"})
+            continue
+        if usd < 0:
+            refused.append({"index": idx, "item": "allocation", "family_id": fid,
+                            "reason": "budget must not be negative"})
+            continue
+        total += usd
+        applied.append({"item": "allocation", "family_id": fid, "budget_usd": usd})
+
+    if global_cap_usd is not None and total > float(global_cap_usd):
+        return envelope("submit_allocation", None, note=(
+            f"allocations total ${total:,.2f}, over the ${float(global_cap_usd):,.2f} "
+            f"global cap; nothing was recorded"))
+
+    for idx, k in enumerate(kills):
+        fid = (k or {}).get("family_id")
+        reason = ((k or {}).get("reason") or "").strip()
+        if fid not in known:
+            refused.append({"index": idx, "item": "kill", "family_id": fid,
+                            "reason": "unknown family_id"})
+        elif not reason:
+            refused.append({"index": idx, "item": "kill", "family_id": fid,
+                            "reason": "a kill must state a reason"})
+        else:
+            applied.append({"item": "kill", "family_id": fid, "reason": reason,
+                            "status": "recommended_not_applied"})
+
+    for idx, r in enumerate(revisits):
+        fid = (r or {}).get("family_id")
+        refs = list((r or {}).get("evidence_refs") or [])
+        fails = int((r or {}).get("consecutive_failures") or 0)
+        if fid not in known:
+            refused.append({"index": idx, "item": "revisit", "family_id": fid,
+                            "reason": "unknown family_id"})
+            continue
+        should_pause, why = family_pause_check(fails, refs)
+        if should_pause:
+            refused.append({"index": idx, "item": "revisit", "family_id": fid,
+                            "reason": why})
+        else:
+            applied.append({"item": "revisit", "family_id": fid,
+                            "evidence_refs": refs, "rationale": why})
+
+    rows = await ex(
+        """INSERT INTO factory.frontier_snapshots (ranking, allocation)
+           VALUES (:ranking, :allocation)
+           RETURNING snapshot_id""",
+        {
+            "ranking": _json([a for a in applied if a["item"] == "allocation"]),
+            "allocation": _json({
+                "applied": applied,
+                "refused": refused,
+                "total_usd": total,
+                "global_cap_usd": global_cap_usd,
+                "submitted_by": agent_version_id,
+                "agent_run_id": agent_run_id,
+                "trace_id": trace_id,
+            }),
+        })
+
+    return envelope("submit_allocation", {
+        "snapshot_id": rows[0]["snapshot_id"] if rows else None,
+        "applied": applied,
+        "refused": refused,
+        "total_usd": total,
+        "note_on_authority": ("recorded, not applied; status changes require "
+                              "factory_gate"),
+    })
+
+
+async def submit_report_narrative(
+    ex: Executor,
+    report_date: Any,
+    sections: Dict[str, str],
+    *,
+    agent_version_id: str,
+    trace_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """The Reporter's only write.
+
+    FACTS ARE RE-DERIVED HERE, NEVER ACCEPTED FROM THE AGENT. If the Reporter
+    supplied its own facts payload it could pass fabricated numbers and its
+    narrative would reconcile cleanly against them, defeating the entire
+    guarantee. So the facts come from the ledger and the narrative is checked
+    against those.
+
+    Sentences with unbacked numbers, unknown IDs or overclaims are DROPPED, not
+    rejected -- a partly-reconciled report still ships, because a silent
+    missing report is worse than a shorter one.
+
+    `daily_research_reports` has PK report_date and no UPDATE grant, so the row
+    is written once. A second call for the same date is a no-op; a narrative
+    cannot be revised, which is worth knowing before relying on it.
+    """
+    from bharat_terminal.factory.report.reconcile import reconcile_narrative
+    from bharat_terminal.factory.tools_api.reads import get_report_facts
+
+    facts_env = await get_report_facts(ex, report_date)
+    facts = facts_env.get("data") or {}
+    numbers = facts.get("numbers") or []
+    identifiers = facts.get("identifiers") or []
+
+    kept_sections: Dict[str, str] = {}
+    dropped: List[Dict[str, Any]] = []
+    for name, text in (sections or {}).items():
+        result = reconcile_narrative(str(text or ""), numbers, identifiers)
+        kept_sections[name] = result.text
+        for sentence, reason in result.dropped:
+            dropped.append({"section": name, "sentence": sentence, "reason": reason})
+
+    claim_check = {
+        "dropped": dropped,
+        "kept_sections": {k: len(v) for k, v in kept_sections.items()},
+        "author": agent_version_id,
+    }
+    body = "\n\n".join(f"{k}\n{v}" for k, v in kept_sections.items() if v)
+
+    rows = await ex(
+        """INSERT INTO factory.daily_research_reports
+             (report_date, status, facts, text, claim_check, trace_id)
+           VALUES (:d, 'draft', :facts, :text, :claim_check, :trace)
+           ON CONFLICT (report_date) DO NOTHING
+           RETURNING report_date""",
+        {"d": report_date, "facts": _json(facts), "text": body,
+         "claim_check": _json(claim_check), "trace": trace_id})
+
+    return envelope("submit_report_narrative", {
+        "report_date": report_date,
+        "written": bool(rows),
+        "kept": sum(1 for v in kept_sections.values() if v),
+        "dropped": dropped,
+        "dropped_count": len(dropped),
+    }, note=None if rows else "a report for this date already exists; not overwritten")

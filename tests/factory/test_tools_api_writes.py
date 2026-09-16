@@ -6,6 +6,7 @@ identical specs in one payload, and cannot turn a retry into a duplicate row.
 """
 from __future__ import annotations
 
+from datetime import date
 from typing import Any, Dict, List
 
 import pytest
@@ -385,3 +386,345 @@ async def test_gap_report_touches_no_forbidden_table():
     for forbidden in ("gate_decisions", "hypothesis_status", "public.",
                       "alpha_wealth_ledger", "holdout_access_log"):
         assert forbidden not in all_sql, forbidden
+
+
+# ══ submit_attack_plan ═══════════════════════════════════════════════════
+
+class AttackExecutor:
+    def __init__(self, run_ids=(7, 8)):
+        self.run_ids = list(run_ids)
+        self.calls: list[dict] = []
+
+    async def __call__(self, sql: str, params: dict):
+        self.calls.append({"sql": sql, "params": params})
+        if "experiment_runs" in sql:
+            return [{"run_id": r} for r in self.run_ids]
+        return []
+
+    def inserts(self):
+        return [c for c in self.calls if "INSERT INTO factory.robustness_tests" in c["sql"]]
+
+
+MEMO = "Run 7 shows the effect concentrated in two names; drop_top5 should kill it."
+
+
+@pytest.mark.asyncio
+async def test_attack_plan_writes_requested_rows_with_catalogue_criticality():
+    ex = AttackExecutor()
+    out = await writes.submit_attack_plan(
+        ex, "EXP-000001",
+        [{"test_id": "drop_top5"}, {"test_id": "season_split"}],
+        MEMO, agent_version_id="adversary@v1")
+    d = out["data"]
+    assert [a["test_id"] for a in d["accepted"]] == ["drop_top5", "season_split"]
+    crit = {a["test_id"]: a["critical"] for a in d["accepted"]}
+    assert crit["drop_top5"] is True and crit["season_split"] is False
+    assert all(c["params"]["verdict"] == "requested" for c in ex.inserts())
+
+
+@pytest.mark.asyncio
+async def test_an_attack_outside_the_catalogue_is_refused():
+    ex = AttackExecutor()
+    out = await writes.submit_attack_plan(
+        ex, "EXP-000001", [{"test_id": "delete_the_ledger"}], MEMO,
+        agent_version_id="adversary@v1")
+    assert out["data"]["accepted"] == []
+    assert out["data"]["refused"][0]["reason"] == "not in the battery catalogue"
+    assert ex.inserts() == []
+
+
+@pytest.mark.asyncio
+async def test_a_memo_citing_no_real_run_is_rejected_not_stored():
+    """A kill argument that references nothing is rhetoric."""
+    ex = AttackExecutor(run_ids=[7])
+    out = await writes.submit_attack_plan(
+        ex, "EXP-000001", [{"test_id": "cost_x2"}],
+        "This result is obviously spurious.", agent_version_id="adversary@v1")
+    assert out["data"] is None
+    assert "cites no real run_id" in out["note"]
+    assert ex.inserts() == []
+
+
+@pytest.mark.asyncio
+async def test_a_number_that_merely_contains_a_run_id_does_not_cite_it():
+    """Substring matching would let 'we ran 15 tests' cite runs 1 and 5.
+
+    The citation guard exists to refuse a memo that references nothing, and
+    small run ids are exactly where a naive `rid in memo` check collapses.
+    """
+    ex = AttackExecutor(run_ids=[1, 5])
+    out = await writes.submit_attack_plan(
+        ex, "EXP-000001", [{"test_id": "cost_x2"}],
+        "We ran 15 tests and the result looks fragile to me.",
+        agent_version_id="adversary@v1")
+    assert out["data"] is None
+    assert "cites no real run_id" in out["note"]
+    assert ex.inserts() == []
+
+
+@pytest.mark.asyncio
+async def test_a_memo_citing_a_run_by_number_is_accepted():
+    ex = AttackExecutor(run_ids=[1, 5])
+    out = await writes.submit_attack_plan(
+        ex, "EXP-000001", [{"test_id": "cost_x2"}],
+        "Run 5 concentrates the whole effect in two names.",
+        agent_version_id="adversary@v1")
+    assert out["data"]["cited_run_ids"] == ["5"]
+
+
+@pytest.mark.asyncio
+async def test_cited_runs_are_sorted_numerically_not_lexically():
+    ex = AttackExecutor(run_ids=[2, 10])
+    out = await writes.submit_attack_plan(
+        ex, "EXP-000001", [{"test_id": "cost_x2"}],
+        "Runs 10 and 2 both show the effect vanishing under cost.",
+        agent_version_id="adversary@v1")
+    assert out["data"]["cited_run_ids"] == ["2", "10"]
+
+
+@pytest.mark.asyncio
+async def test_no_runs_means_nothing_to_attack():
+    ex = AttackExecutor(run_ids=[])
+    out = await writes.submit_attack_plan(
+        ex, "EXP-000001", [{"test_id": "cost_x2"}], MEMO,
+        agent_version_id="adversary@v1")
+    assert out["data"] is None and "nothing to attack" in out["note"]
+
+
+@pytest.mark.asyncio
+async def test_empty_memo_is_rejected():
+    out = await writes.submit_attack_plan(
+        AttackExecutor(), "EXP-000001", [{"test_id": "cost_x2"}], "   ",
+        agent_version_id="a@v1")
+    assert out["data"] is None and "kill memo is required" in out["note"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_attack_in_one_plan_is_refused_once():
+    ex = AttackExecutor()
+    out = await writes.submit_attack_plan(
+        ex, "EXP-000001",
+        [{"test_id": "cost_x2"}, {"test_id": "cost_x2"}], MEMO,
+        agent_version_id="a@v1")
+    assert len(out["data"]["accepted"]) == 1
+    assert out["data"]["refused"][0]["reason"] == "already requested in this plan"
+
+
+@pytest.mark.asyncio
+async def test_attack_plan_is_capped():
+    ex = AttackExecutor()
+    many = [{"test_id": t.test_id} for t in __import__(
+        "bharat_terminal.factory.tools_api.catalogue",
+        fromlist=["BATTERY"]).BATTERY]
+    out = await writes.submit_attack_plan(ex, "EXP-000001", many, MEMO,
+                                          agent_version_id="a@v1")
+    considered = len(out["data"]["accepted"]) + len(out["data"]["refused"])
+    assert considered == writes.MAX_ATTACKS_PER_PLAN
+
+
+@pytest.mark.asyncio
+async def test_requested_by_is_truncated_but_the_full_id_survives_in_details():
+    """robustness_tests.requested_by is varchar(16); truncation must not lose the id."""
+    long_id = "adversary@2026-09-14"          # 20 chars
+    ex = AttackExecutor()
+    await writes.submit_attack_plan(ex, "EXP-000001", [{"test_id": "cost_x2"}],
+                                    MEMO, agent_version_id=long_id)
+    p = ex.inserts()[0]["params"]
+    assert len(p["by"]) <= 16
+    import json
+    assert json.loads(p["details"])["requested_by_full"] == long_id
+
+
+@pytest.mark.asyncio
+async def test_plan_id_is_stable_across_processes():
+    """Python's hash() is randomized per process; an audit id must not be."""
+    ex1, ex2 = AttackExecutor(), AttackExecutor()
+    a = await writes.submit_attack_plan(ex1, "EXP-000001", [{"test_id": "cost_x2"}],
+                                        MEMO, agent_version_id="a@v1")
+    b = await writes.submit_attack_plan(ex2, "EXP-000001", [{"test_id": "cost_x2"}],
+                                        MEMO, agent_version_id="a@v1")
+    assert a["data"]["plan_id"] == b["data"]["plan_id"]
+    assert "hash" not in a["data"]["plan_id"]
+
+
+@pytest.mark.asyncio
+async def test_attack_plan_cannot_set_a_verdict():
+    """The Adversary requests tests; it never decides them."""
+    ex = AttackExecutor()
+    await writes.submit_attack_plan(ex, "EXP-000001", [{"test_id": "year_loo"}],
+                                    MEMO, agent_version_id="a@v1")
+    verdicts = {c["params"]["verdict"] for c in ex.inserts()}
+    assert verdicts == {"requested"}
+    all_sql = " ".join(c["sql"] for c in ex.calls).lower()
+    assert "gate_decisions" not in all_sql and "update" not in all_sql
+
+
+# ══ submit_allocation ════════════════════════════════════════════════════
+
+class AllocExecutor:
+    def __init__(self, families=("pead", "guidance")):
+        self.families = list(families)
+        self.calls: list[dict] = []
+
+    async def __call__(self, sql: str, params: dict):
+        self.calls.append({"sql": sql, "params": params})
+        if "research_families" in sql:
+            return [{"family_id": f, "status": "active", "budget_cap_usd": 100}
+                    for f in self.families]
+        if "frontier_snapshots" in sql:
+            return [{"snapshot_id": 11}]
+        return []
+
+
+@pytest.mark.asyncio
+async def test_allocation_records_a_snapshot():
+    ex = AllocExecutor()
+    out = await writes.submit_allocation(
+        ex, agent_version_id="chief@v1",
+        allocations=[{"family_id": "pead", "budget_usd": 40}])
+    assert out["data"]["snapshot_id"] == 11
+    assert out["data"]["total_usd"] == 40
+
+
+@pytest.mark.asyncio
+async def test_a_kill_is_recommended_never_applied():
+    """factory_writer has no UPDATE; a kill cannot change family status here."""
+    ex = AllocExecutor()
+    out = await writes.submit_allocation(
+        ex, agent_version_id="chief@v1",
+        kills=[{"family_id": "pead", "reason": "four failures, no mechanism"}])
+    applied = [a for a in out["data"]["applied"] if a["item"] == "kill"]
+    assert applied[0]["status"] == "recommended_not_applied"
+    all_sql = " ".join(c["sql"] for c in ex.calls).upper()
+    assert "UPDATE" not in all_sql
+
+
+@pytest.mark.asyncio
+async def test_a_kill_without_a_reason_is_refused():
+    out = await writes.submit_allocation(
+        AllocExecutor(), agent_version_id="c@v1",
+        kills=[{"family_id": "pead", "reason": "  "}])
+    assert out["data"]["refused"][0]["reason"] == "a kill must state a reason"
+
+
+@pytest.mark.asyncio
+async def test_exceeding_the_global_cap_records_nothing():
+    ex = AllocExecutor()
+    out = await writes.submit_allocation(
+        ex, agent_version_id="c@v1", global_cap_usd=50,
+        allocations=[{"family_id": "pead", "budget_usd": 40},
+                     {"family_id": "guidance", "budget_usd": 30}])
+    assert out["data"] is None and "global cap" in out["note"]
+    assert not [c for c in ex.calls if "INSERT" in c["sql"]]
+
+
+@pytest.mark.asyncio
+async def test_unknown_family_and_negative_budget_are_refused():
+    out = await writes.submit_allocation(
+        AllocExecutor(), agent_version_id="c@v1",
+        allocations=[{"family_id": "nope", "budget_usd": 10},
+                     {"family_id": "pead", "budget_usd": -5}])
+    reasons = {r["reason"] for r in out["data"]["refused"]}
+    assert "unknown family_id" in reasons
+    assert "budget must not be negative" in reasons
+
+
+@pytest.mark.asyncio
+async def test_prose_alone_cannot_reopen_a_paused_family():
+    """Uses gates.engine.family_pause_check -- not a second implementation."""
+    out = await writes.submit_allocation(
+        AllocExecutor(), agent_version_id="c@v1",
+        revisits=[{"family_id": "pead", "consecutive_failures": 99,
+                   "evidence_refs": []}])
+    assert out["data"]["applied"] == []
+    assert "no new feature version" in out["data"]["refused"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_a_revisit_citing_new_evidence_is_allowed():
+    out = await writes.submit_allocation(
+        AllocExecutor(), agent_version_id="c@v1",
+        revisits=[{"family_id": "pead", "consecutive_failures": 99,
+                   "evidence_refs": ["sue_composite@2.2"]}])
+    applied = [a for a in out["data"]["applied"] if a["item"] == "revisit"]
+    assert applied and applied[0]["evidence_refs"] == ["sue_composite@2.2"]
+
+
+# ══ submit_report_narrative ══════════════════════════════════════════════
+
+class ReportExecutor:
+    def __init__(self, conflict: bool = False):
+        self.conflict = conflict
+        self.calls: list[dict] = []
+
+    async def __call__(self, sql: str, params: dict):
+        self.calls.append({"sql": sql, "params": params})
+        if "gate_decisions" in sql:
+            return [{"hypothesis_id": "H-000001", "version": 1,
+                     "to_status": "ROBUST", "promoted": True}]
+        if "factory.failures" in sql:
+            return []
+        if "dataset_versions" in sql:
+            return [{"dataset_version": "DS-20260913-02", "integrity": {}}]
+        if "budget_ledger" in sql:
+            return [{"category": "llm", "usd": 3.0}]
+        if "daily_research_reports" in sql:
+            return [] if self.conflict else [{"report_date": params["d"]}]
+        return []
+
+    def insert(self):
+        return [c for c in self.calls
+                if "INSERT INTO factory.daily_research_reports" in c["sql"]]
+
+
+@pytest.mark.asyncio
+async def test_facts_are_rederived_not_taken_from_the_agent():
+    """An agent supplying its own facts could reconcile against fabrications."""
+    ex = ReportExecutor()
+    await writes.submit_report_narrative(
+        ex, date(2026, 9, 14), {"summary": "One experiment completed."},
+        agent_version_id="reporter@v1")
+    assert any("gate_decisions" in c["sql"] for c in ex.calls), \
+        "facts must be read from the ledger"
+
+
+@pytest.mark.asyncio
+async def test_an_unbacked_number_is_dropped_and_the_report_still_ships():
+    ex = ReportExecutor()
+    out = await writes.submit_report_narrative(
+        ex, date(2026, 9, 14),
+        {"summary": "The edge was 7.3% net and is risk-free."},
+        agent_version_id="reporter@v1")
+    assert out["data"]["dropped_count"] >= 1
+    assert out["data"]["written"] is True, "a partial report still ships"
+
+
+@pytest.mark.asyncio
+async def test_a_second_report_for_the_same_date_is_a_noop():
+    ex = ReportExecutor(conflict=True)
+    out = await writes.submit_report_narrative(
+        ex, date(2026, 9, 14), {"summary": "Anything."},
+        agent_version_id="reporter@v1")
+    assert out["data"]["written"] is False
+    assert "already exists" in out["note"]
+
+
+@pytest.mark.asyncio
+async def test_claim_check_and_facts_are_serialised_json():
+    ex = ReportExecutor()
+    await writes.submit_report_narrative(
+        ex, date(2026, 9, 14), {"summary": "One experiment completed."},
+        agent_version_id="reporter@v1")
+    p = ex.insert()[0]["params"]
+    assert isinstance(p["facts"], str) and isinstance(p["claim_check"], str)
+
+
+@pytest.mark.asyncio
+async def test_report_write_touches_no_forbidden_table():
+    ex = ReportExecutor()
+    await writes.submit_report_narrative(
+        ex, date(2026, 9, 14), {"summary": "x"}, agent_version_id="r@v1")
+    inserts = " ".join(c["sql"] for c in ex.calls if "INSERT" in c["sql"]).lower()
+    for forbidden in ("gate_decisions", "hypothesis_status", "public.",
+                      "alpha_wealth_ledger"):
+        assert forbidden not in inserts, forbidden
