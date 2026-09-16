@@ -220,6 +220,24 @@ def _rejection(idx: int, hypothesis_id: Optional[str],
     return out
 
 
+async def _suggest_free_id(ex: Executor) -> str:
+    """A concrete id the caller can retry with.
+
+    "Choose an unused id" is not actionable by something that cannot enumerate
+    the used ones, so the error names one. Advisory: two concurrent submitters
+    can be handed the same id, and the second still gets E016 -- which is the
+    correct outcome, just one round-trip later.
+    """
+    try:
+        rows = await ex(
+            """SELECT COALESCE(MAX(CAST(SUBSTRING(hypothesis_id FROM 3) AS INTEGER)), 0) AS mx
+                 FROM factory.hypotheses
+                WHERE hypothesis_id ~ '^H-[0-9]+$'""", {})
+        return f"H-{int(rows[0]['mx']) + 1:06d}"
+    except Exception:
+        return "an id above the highest currently in the ledger"
+
+
 async def _id_clash(ex: Executor, spec: HypothesisSpec,
                     new_hash: str) -> Optional[Dict[str, Any]]:
     """Refuse to reuse an id for different work.
@@ -248,14 +266,16 @@ async def _id_clash(ex: Executor, spec: HypothesisSpec,
     except Exception:
         return {"code": "E016", "path": "id",
                 "message": (f"{spec.id} v{spec.version} already exists and its stored "
-                            f"spec could not be re-read. Choose an unused id.")}
+                            f"spec could not be re-read. Resubmit as "
+                            f"{await _suggest_free_id(ex)}.")}
     if stored_hash == new_hash:
         return None                      # genuine idempotent replay
     return {"code": "E016", "path": "id",
             "message": (f"{spec.id} v{spec.version} already exists with DIFFERENT "
                         f"mechanics (stored {stored_hash[:12]}, proposed "
-                        f"{new_hash[:12]}). A hypothesis id is immutable. Choose an "
-                        f"id that is not in use, or submit as a new version.")}
+                        f"{new_hash[:12]}). A hypothesis id is immutable. Resubmit "
+                        f"this spec as {await _suggest_free_id(ex)} without changing "
+                        f"its mechanics, or submit as a new version of {spec.id}.")}
 
 
 async def _insert(ex: Executor, spec: HypothesisSpec, item: Dict[str, Any],

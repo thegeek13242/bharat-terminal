@@ -772,6 +772,61 @@ async def test_reusing_an_id_for_different_mechanics_is_refused():
     assert not ex.sql_for("INSERT INTO factory.hypotheses")
 
 
+class ClashExecutorWithLedger(ClashExecutor):
+    """A clashing ledger that can also answer "what is the highest id?".
+
+    ClashExecutor returns [] for that query, which sends _suggest_free_id down
+    its fallback branch -- so without this subclass the useful half of the
+    error message is never exercised.
+    """
+
+    async def __call__(self, sql: str, params: dict):
+        if "MAX(CAST(SUBSTRING(hypothesis_id" in sql:
+            self.calls.append({"sql": sql, "params": params})
+            return [{"mx": 7}]
+        return await super().__call__(sql, params)
+
+
+@pytest.mark.asyncio
+async def test_e016_names_a_concrete_id_to_retry_with():
+    """"Choose an unused id" is not actionable by a caller that cannot list them.
+
+    The Scientist cannot see the id space, so on 2026-09-17 it guessed
+    H-000002/4/5 -- all taken -- and burned 3 of 6 proposals on E016. The error
+    now names the id to use, so the one permitted repair can actually succeed.
+    """
+    stored = dict(BASE_SPEC)
+    stored["statistics"] = {**BASE_SPEC["statistics"], "primary_holding_days": 20}
+    proposed = item()
+    proposed["spec"] = dict(BASE_SPEC)
+    proposed["spec"]["statistics"] = {**BASE_SPEC["statistics"],
+                                      "primary_holding_days": 10}
+    ex = ClashExecutorWithLedger(stored)
+    out = await submit_hypotheses(ex, [proposed], ctx=ctx_with_counts(),
+                                  agent_version_id="a@v1")
+    err = out["data"]["rejected"][0]["errors"][0]
+    assert err["code"] == "E016"
+    assert "H-000008" in err["message"], err["message"]
+    assert not ex.sql_for("INSERT INTO factory.hypotheses")
+
+
+@pytest.mark.asyncio
+async def test_e016_still_refuses_when_the_next_id_cannot_be_computed():
+    """A broken suggestion query must not turn a refusal into an acceptance."""
+    stored = dict(BASE_SPEC)
+    stored["statistics"] = {**BASE_SPEC["statistics"], "primary_holding_days": 20}
+    proposed = item()
+    proposed["spec"] = dict(BASE_SPEC)
+    proposed["spec"]["statistics"] = {**BASE_SPEC["statistics"],
+                                      "primary_holding_days": 10}
+    ex = ClashExecutor(stored)          # returns [] for the MAX query
+    out = await submit_hypotheses(ex, [proposed], ctx=ctx_with_counts(),
+                                  agent_version_id="a@v1")
+    assert out["data"]["accepted"] == []
+    assert out["data"]["rejected"][0]["errors"][0]["code"] == "E016"
+    assert not ex.sql_for("INSERT INTO factory.hypotheses")
+
+
 @pytest.mark.asyncio
 async def test_replaying_identical_mechanics_is_still_a_no_op_not_an_error():
     """A Gateway retry must stay idempotent, not become a failure."""

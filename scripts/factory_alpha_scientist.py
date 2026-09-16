@@ -114,6 +114,10 @@ How this works:
 - FIRST call get_hypothesis_schema. It returns the exact JSON schema for a spec and a worked
   example that compiled. Copy the example's shape and change the mechanics. Do NOT guess the
   field names: an earlier run burned every turn rediscovering them one rejection at a time.
+- A hypothesis id is a PRIMARY KEY, and you cannot see what is already in the ledger, so you
+  cannot invent one. get_hypothesis_schema returns available_ids: use those exact strings, in
+  order, and nothing else. The worked example's own id is ALREADY TAKEN, as is every id you see
+  in a parent link or a search result. Reusing one is rejected as E016 and wastes the run.
 - Every hypothesis is a typed spec over REGISTERED features. Call list_features and use only
   refs that exist, spelled exactly. Inventing a feature fails the compile.
 - A feature whose coverage is null is UNMEASURED and CANNOT be used as a control.
@@ -137,8 +141,9 @@ def tool_schemas() -> List[Dict[str, Any]]:
                           "properties": {"question_id": {"type": "string"}},
                           "required": ["question_id"]}},
         {"name": "get_hypothesis_schema",
-         "description": "The JSON schema for a HypothesisSpec, plus a worked example that "
-                        "actually compiled. CALL THIS FIRST. Do not guess the shape.",
+         "description": "The JSON schema for a HypothesisSpec, a worked example that actually "
+                        "compiled, and available_ids - the only ids you may use. CALL "
+                        "THIS FIRST. Do not guess the shape and never invent an id.",
          "input_schema": {"type": "object", "properties": {}}},
         {"name": "list_features",
          "description": "The registered feature catalogue. Use ONLY these refs, exactly as "
@@ -173,6 +178,26 @@ def tool_schemas() -> List[Dict[str, Any]]:
                                          "family_id": {"type": "string"}},
                           "required": ["need"]}},
     ]
+
+
+async def next_free_ids(ex, n: int = 2) -> List[str]:
+    """Hypothesis ids the agent may safely use.
+
+    The agent has no read tool over the id space, so asking it to supply a
+    primary key was asking it to guess -- and on 2026-09-17 it guessed
+    H-000002/4/5, all taken, burning 3 of 6 proposals on E016. Allocation is
+    the orchestrator's job.
+
+    Strictly above the current max, never filling gaps: H-000001 is cited as a
+    parent without owning a row, so a gap-filler would hand out an id that
+    other specs already point at.
+    """
+    rows = await ex(
+        """SELECT COALESCE(MAX(CAST(SUBSTRING(hypothesis_id FROM 3) AS INTEGER)), 0) AS mx
+             FROM factory.hypotheses
+            WHERE hypothesis_id ~ '^H-[0-9]+$'""", {})
+    start = int(rows[0]["mx"]) + 1
+    return [f"H-{start + i:06d}" for i in range(n)]
 
 
 async def build_ctx(ex) -> CompileContext:
@@ -236,11 +261,16 @@ async def dispatch(name: str, args: Dict[str, Any], ex, ctx, avid: str,
         return await reads.get_research_question(ex, args.get("question_id", ""))
     if name == "get_hypothesis_schema":
         from bharat_terminal.factory.dsl.models import HypothesisSpec
+        free = await next_free_ids(ex, 2)
         return {"tool": "get_hypothesis_schema", "data": {
             "json_schema": HypothesisSpec.model_json_schema(),
             "worked_example": EXAMPLE_SPEC,
+            "available_ids": free,
             "note": ("worked_example is the incumbent PEAD recipe exactly as it compiled "
-                     "and ran as EXP-000001. Copy its shape; change the mechanics."),
+                     "and ran as EXP-000001. Copy its shape; change the mechanics. "
+                     f"Its id {EXAMPLE_SPEC.get('id')!r} is TAKEN. Use available_ids "
+                     f"verbatim: {free[0]} for your first hypothesis"
+                     + (f", {free[1]} for your second." if len(free) > 1 else ".")),
         }}
     if name == "list_features":
         return reads.list_features()
