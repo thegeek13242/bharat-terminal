@@ -25,6 +25,7 @@ cd "$(dirname "$0")/.."
 exec docker compose run --rm --no-deps \
   -v "$PWD/bharat_terminal:/app/bharat_terminal:ro" \
   -v "$PWD/tests:/app/tests:ro" \
+  -v "$PWD/infra:/app/infra:ro" \
   -v "$PWD/requirements/test.txt:/app/requirements-test.txt:ro" \
   -v "$PWD/pyproject.toml:/app/pyproject.toml:ro" \
   -e DATABASE_URL="postgresql://tests-must-not-touch-db:1/invalid" \
