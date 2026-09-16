@@ -52,14 +52,32 @@ _token: str | None = None
 
 
 def _bearer() -> str:
-    """Fetch once per container. boto3 is only imported here so the module is
-    importable (and testable) without an AWS session."""
-    global _token
-    if _token is None:
-        import boto3
+    """Resolve the tools token. Env var wins; Secrets Manager is the fallback.
 
-        sm = boto3.client("secretsmanager")
-        _token = sm.get_secret_value(SecretId=SECRET_ID)["SecretString"]
+    WHY THE ENV PATH EXISTS: a Lambda in a VPC with no NAT gateway and no
+    interface endpoint has NO route to any AWS public API, Secrets Manager
+    included. The first deploy of this function hung for the full 35s timeout
+    on exactly that call -- the design note said "the Lambda only talks to a
+    private IP" while the code reached for a public AWS endpoint.
+
+    Reading TOOLS_TOKEN first keeps the function working in that topology. The
+    Secrets Manager path stays for deployments that do have an endpoint, and
+    its client carries a short timeout so an unreachable endpoint fails in
+    seconds with a clear message instead of consuming the whole invocation.
+    """
+    global _token
+    if _token is not None:
+        return _token
+    env_token = os.environ.get("TOOLS_TOKEN")
+    if env_token:
+        _token = env_token
+        return _token
+    import boto3
+    from botocore.config import Config
+
+    sm = boto3.client("secretsmanager", config=Config(
+        connect_timeout=3, read_timeout=3, retries={"max_attempts": 1}))
+    _token = sm.get_secret_value(SecretId=SECRET_ID)["SecretString"]
     return _token
 
 
