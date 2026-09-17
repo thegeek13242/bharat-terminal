@@ -86,3 +86,28 @@ async def test_one_unreadable_spec_does_not_take_down_the_cycle():
     km = await known_mechanics(ex)
     assert km[spec_hash(make_spec(id="H-000007"))] == "H-000007"
     assert "H-000099" not in km.values()
+
+
+# ══ self-collision: the regression the first dedup fix caused ═════════════
+#
+# Adding hypotheses to the index fixed cross-cycle duplicates and broke
+# re-evaluation in the same move. Observed live 2026-09-17: every stored
+# hypothesis failed E010 as a duplicate of itself, killing the evaluate stage.
+
+def test_a_hypothesis_does_not_collide_with_its_own_ledger_row():
+    from bharat_terminal.factory.dsl.dedup import without_self
+    known = {"aaa": "H-000026", "bbb": "H-000004"}
+    assert without_self(known, "H-000026") == {"bbb": "H-000004"}
+
+
+def test_a_genuine_duplicate_is_still_refused_after_excluding_self():
+    """Only the self-reference goes. Another id's claim on the hash stays."""
+    from bharat_terminal.factory.dsl.dedup import without_self
+    known = {"aaa": "H-000007"}          # H-000009's mechanics, owned by H-000007
+    assert without_self(known, "H-000009") == {"aaa": "H-000007"}
+
+
+def test_excluding_self_removes_every_row_that_id_owns():
+    from bharat_terminal.factory.dsl.dedup import without_self
+    known = {"aaa": "H-000001", "bbb": "H-000001", "ccc": "EXP-000001"}
+    assert without_self(known, "H-000001") == {"ccc": "EXP-000001"}

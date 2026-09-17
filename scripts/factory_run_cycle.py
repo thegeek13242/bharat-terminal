@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import os
 import sys
@@ -44,8 +45,10 @@ import factory_exp_000001 as exp
 from bharat_terminal.factory import FACTORY_SEED
 from bharat_terminal.factory.backtest.calendar import TradingCalendar
 from bharat_terminal.factory.backtest.engine import EventInput, StudyConfig, run_event_study
+from bharat_terminal.factory.backtest.signals import (
+    UnbacktestableSpec, check_signal_supported)
 from bharat_terminal.factory.costs.india_cash import CASH_DELIVERY_V1
-from bharat_terminal.factory.dsl.dedup import known_mechanics
+from bharat_terminal.factory.dsl.dedup import known_mechanics, without_self
 from bharat_terminal.factory.dsl.compiler import CompileContext, EventCounts, compile_spec
 from bharat_terminal.factory.dsl.hashing import result_hash
 from bharat_terminal.factory.dsl.models import HypothesisSpec
@@ -83,8 +86,22 @@ async def next_experiment_id(ex) -> str:
 
 
 def backtest(spec: HypothesisSpec, data) -> Optional[Dict[str, Any]]:
-    """Run the study the spec describes. None when it yields no cohorts."""
+    """Run the study the spec describes. None when it yields no cohorts.
+
+    REFUSES rather than substitutes. Until 2026-09-17 this function read
+    spec.signal.direction and never spec.signal.feature, then filtered on the
+    snapshot's `decile` column -- which is composite SUE. A hypothesis signalled
+    on expectation_surprise_gbm therefore ran a SUE study and reported real
+    looking numbers for it: H-000026 and H-000027 came back byte-identical
+    (1,751 events, t=1.00) despite carrying different signals.
+
+    Silent substitution that reports success is the failure mode this
+    repository keeps an audit trail about, so the mismatch is now fatal. The
+    cost of refusing is a hypothesis that stays un-evaluated, which is true.
+    The cost of substituting is a fabricated result that looks like evidence.
+    """
     events, prices, bench, calendar, cas = data
+    check_signal_supported(spec.signal.feature)
     decile = int(spec.event.filters[0].value)
     hold = int(spec.statistics.primary_holding_days)
     inputs = [EventInput(symbol=e["symbol"], event_date=e["event_date"],
@@ -159,14 +176,21 @@ async def main() -> int:
             json.loads(raw) if isinstance(raw, str) else raw)
         print(f"--- {spec.id} v{spec.version}")
 
-        compiled = compile_spec(spec, ctx)
+        # A stored hypothesis must not be refused as a duplicate of itself.
+        own_ctx = dataclasses.replace(
+            ctx, known_spec_hashes=without_self(ctx.known_spec_hashes, spec.id))
+        compiled = compile_spec(spec, own_ctx)
         if not compiled.ok or compiled.plan is None:
             print(f"    COMPILE FAILED: {[e.code for e in compiled.errors]}")
             for e in compiled.errors[:3]:
                 print(f"      {e.code} at {e.path}: {e.message[:120]}")
             continue
 
-        res = backtest(spec, data)
+        try:
+            res = backtest(spec, data)
+        except UnbacktestableSpec as exc:
+            print(f"    CANNOT EVALUATE: {exc}")
+            continue
         if res is None:
             print("    no cohorts; nothing to judge")
             continue

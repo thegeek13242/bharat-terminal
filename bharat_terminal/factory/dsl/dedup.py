@@ -59,3 +59,20 @@ async def known_mechanics(ex: Executor) -> Dict[str, str]:
         out[e["spec_hash"]] = e["experiment_id"]
 
     return out
+
+
+def without_self(known: Dict[str, str], hypothesis_id: str) -> Dict[str, str]:
+    """The dedup index as one already-stored hypothesis should see it.
+
+    Adding hypotheses to the index fixed cross-cycle duplicates and instantly
+    broke re-evaluation: the cycle runner compiles each STORED hypothesis, and
+    every one of them found its own ledger row and failed E010 as a duplicate
+    of itself. Observed live on 2026-09-17 -- "identical mechanics already
+    recorded as H-000026" while compiling H-000026 -- which killed the entire
+    evaluate stage.
+
+    Only the self-reference is dropped. If these mechanics are owned by a
+    DIFFERENT id the entry stays and the duplicate is still refused, which is
+    the whole point of the index.
+    """
+    return {h: owner for h, owner in known.items() if owner != hypothesis_id}
