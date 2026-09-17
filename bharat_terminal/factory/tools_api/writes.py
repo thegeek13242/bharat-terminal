@@ -640,6 +640,16 @@ async def submit_allocation(
         "SELECT family_id, status, budget_cap_usd FROM factory.research_families", {})
     known = {f["family_id"]: f for f in families}
 
+    # A family with no OPEN question has nothing a Scientist can be sent at, so
+    # budget allocated to it cannot be spent. Observed 2026-09-17: the Chief
+    # Scientist funded promoter_flow_medium and sector_neutral_pead hours after
+    # both questions were blocked. questions_open was right there in the facts
+    # and the memo simply did not weight it -- which is exactly why this is a
+    # deterministic refusal rather than another line of prompt.
+    workable = {r["family_id"] for r in await ex(
+        """SELECT DISTINCT family_id FROM factory.research_questions
+            WHERE status = 'open' AND family_id IS NOT NULL""", {})}
+
     total = 0.0
     for idx, a in enumerate(allocations):
         fid = (a or {}).get("family_id")
@@ -651,6 +661,11 @@ async def submit_allocation(
         if usd < 0:
             refused.append({"index": idx, "item": "allocation", "family_id": fid,
                             "reason": "budget must not be negative"})
+            continue
+        if usd > 0 and fid not in workable:
+            refused.append({"index": idx, "item": "allocation", "family_id": fid,
+                            "reason": "no open research question; budget here "
+                                      "cannot be spent"})
             continue
         total += usd
         applied.append({"item": "allocation", "family_id": fid, "budget_usd": usd})

@@ -7,6 +7,14 @@
 #              generates, not a simulation of it.
 #   evaluate : DRY. The cycle runner reports the verdict it WOULD reach but
 #              charges no alpha wealth and writes no gate_decision.
+#   frontier : REAL, every CHIEF_EVERY cycles. The Chief Scientist reads the
+#              deterministic family facts and records ONE allocation snapshot.
+#              It runs with --apply for two reasons: submit_allocation can only
+#              RECORD a recommendation (factory_writer holds no UPDATE, so
+#              nothing it writes can pause or kill a family), and the spend is
+#              only charged against the budget cap under --apply. A dry run
+#              would still spend the tokens and simply not count them, which is
+#              the worse failure.
 #
 # Why evaluation stays dry: alpha wealth is ONE shared budget across the whole
 # hypothesis stream, not per family. Charging ~24 PEAD variants overnight would
@@ -22,6 +30,7 @@ PILOT=/home/ec2-user/factory_pilot
 LOG="$PILOT/observe.log"
 COUNT="$PILOT/cycle_count"
 MAX_CYCLES=24                       # 24h at hourly cadence, then it stops itself
+CHIEF_EVERY=6                       # frontier review cadence; 0 disables it
 
 cd "$ROOT" || exit 1
 mkdir -p "$PILOT"
@@ -56,11 +65,22 @@ n=$((n + 1)); echo "$n" > "$COUNT"
     --entrypoint python papertrade scripts/factory_run_cycle.py 2>&1 \
     | grep -v "^time=" | grep -v "notice.*pip"
 
+  if [ "$CHIEF_EVERY" -gt 0 ] && [ $((n % CHIEF_EVERY)) -eq 0 ]; then
+    echo "──── FRONTIER (Chief Scientist: records an allocation, cannot apply one)"
+    docker compose run --rm --no-deps \
+      -v "$ROOT/bharat_terminal:/app/bharat_terminal:ro" \
+      -v "$ROOT/scripts:/app/scripts:ro" \
+      -e BEDROCK_RPM_LIMIT=4 \
+      --entrypoint python papertrade scripts/factory_chief_scientist.py --apply 2>&1 \
+      | grep -v "^time=" | grep -v "notice.*pip"
+  fi
+
   echo "──── LEDGER"
   docker exec bharat-postgres psql -U bharat -d bharat_terminal -tAc \
     "SELECT '  hypotheses='||(SELECT count(*) FROM factory.hypotheses)
          ||' spend=\$'||COALESCE((SELECT round(sum(amount_usd),4) FROM factory.budget_ledger),0)
          ||' alpha_entries='||(SELECT count(*) FROM factory.alpha_wealth_ledger)
+         ||' frontier_snapshots='||(SELECT count(*) FROM factory.frontier_snapshots)
          ||'  (alpha must stay flat during an observational pilot)';" 2>&1
   echo "════════ cycle $n end $(date -Is) ════════"
 } >> "$LOG" 2>&1

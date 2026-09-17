@@ -562,8 +562,13 @@ async def test_attack_plan_cannot_set_a_verdict():
 # ══ submit_allocation ════════════════════════════════════════════════════
 
 class AllocExecutor:
-    def __init__(self, families=("pead", "guidance")):
+    """`open_for` defaults to every family: a family with no OPEN question is
+    refused an allocation, so tests that do not care about that case must say
+    which families are workable."""
+
+    def __init__(self, families=("pead", "guidance"), open_for=None):
         self.families = list(families)
+        self.open_for = self.families if open_for is None else list(open_for)
         self.calls: list[dict] = []
 
     async def __call__(self, sql: str, params: dict):
@@ -571,6 +576,8 @@ class AllocExecutor:
         if "research_families" in sql:
             return [{"family_id": f, "status": "active", "budget_cap_usd": 100}
                     for f in self.families]
+        if "research_questions" in sql:
+            return [{"family_id": f} for f in self.open_for]
         if "frontier_snapshots" in sql:
             return [{"snapshot_id": 11}]
         return []
@@ -849,3 +856,31 @@ async def test_a_reworded_claim_over_identical_mechanics_is_a_replay():
     out = await submit_hypotheses(ex, [proposed], ctx=ctx_with_counts(),
                                   agent_version_id="a@v1")
     assert out["data"]["rejected"] == [], "prose is not mechanics"
+
+
+@pytest.mark.asyncio
+async def test_budget_for_a_family_with_no_open_question_is_refused():
+    """Observed 2026-09-17: the Chief Scientist funded two families hours after
+    both their questions were blocked. questions_open was in the facts it read
+    and the memo did not weight it, so the rule is enforced here instead."""
+    ex = AllocExecutor(families=("pead", "guidance"), open_for=("pead",))
+    out = await writes.submit_allocation(
+        ex, agent_version_id="chief@v1",
+        allocations=[{"family_id": "pead", "budget_usd": 40},
+                     {"family_id": "guidance", "budget_usd": 25}])
+    funded = [a for a in out["data"]["applied"] if a["item"] == "allocation"]
+    assert [a["family_id"] for a in funded] == ["pead"]
+    assert out["data"]["total_usd"] == 40
+    refused = out["data"]["refused"]
+    assert refused[0]["family_id"] == "guidance"
+    assert "no open research question" in refused[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_a_zero_allocation_to_an_unworkable_family_is_not_refused():
+    """Explicitly declining to fund something is a valid thing for a memo to say."""
+    ex = AllocExecutor(families=("pead", "guidance"), open_for=("pead",))
+    out = await writes.submit_allocation(
+        ex, agent_version_id="chief@v1",
+        allocations=[{"family_id": "guidance", "budget_usd": 0}])
+    assert out["data"]["refused"] == []

@@ -50,6 +50,9 @@ class FamilyFacts:
     usd_per_distinct_mechanic: Optional[float] = None
     usd_per_promotion: Optional[float] = None
     stalled: bool = False
+    # No open question means there is nothing for a Scientist to work on,
+    # so budget sent here cannot be spent. Enforced in submit_allocation.
+    workable: bool = True
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -127,5 +130,6 @@ async def family_facts(ex: Executor) -> List[Dict[str, Any]]:
             usd_per_distinct_mechanic=round(sp / distinct, 4) if distinct else None,
             usd_per_promotion=round(sp / promo, 4) if promo else None,
             stalled=(n >= STALL_AFTER_HYPOTHESES and promo == 0),
+            workable=(f["status"] == "active" and qopen.get(fid, 0) > 0),
         ).as_dict())
     return out
