@@ -44,6 +44,7 @@ from typing import Any, Dict, List
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from bharat_terminal.factory.dsl.dedup import known_mechanics
 from bharat_terminal.factory.dsl.compiler import (
     CompileContext,
     EventCounts,
@@ -120,6 +121,9 @@ How this works:
   in a parent link or a search result. Reusing one is rejected as E016 and wastes the run.
 - Every hypothesis is a typed spec over REGISTERED features. Call list_features and use only
   refs that exist, spelled exactly. Inventing a feature fails the compile.
+- get_hypothesis_schema also returns "constraints". Those rules are enforced but do NOT appear
+  in the JSON schema, so the schema alone will let you write a spec that is rejected. Check
+  allowed_holding_days before choosing a holding period.
 - A feature whose coverage is null is UNMEASURED and CANNOT be used as a control.
 - If submit_hypotheses rejects a spec, the errors are repair instructions carrying a code, a path
   and a message. Fix exactly what they name and resubmit once.
@@ -180,6 +184,50 @@ def tool_schemas() -> List[Dict[str, Any]]:
     ]
 
 
+async def family_for_question(ex, question_id: str) -> str:
+    """Which family this run's spend belongs to.
+
+    This was the literal string "pead_composite_sue" until 2026-09-17, which
+    was harmless while one family existed and silently wrong the moment five
+    did: every dollar would land on the incumbent, and the Chief Scientist
+    reads budget_ledger.family_id to decide what to fund. A misattributed cost
+    is worse than a missing one, because it looks like evidence.
+    """
+    rows = await ex(
+        "SELECT family_id FROM factory.research_questions WHERE question_id = :q",
+        {"q": question_id})
+    if rows and rows[0]["family_id"]:
+        return rows[0]["family_id"]
+    return "unattributed"
+
+
+async def pick_question(ex) -> str:
+    """The open question with the least work done on it.
+
+    Until 2026-09-17 the question was a constant default, so 11 pilot cycles
+    all went at RQ-000001 and the ledger filled with variants of one idea.
+
+    "Fewest hypotheses" rather than round-robin: it self-corrects. If one
+    question proves fertile and another sterile, effort still spreads instead
+    of pinning to whichever id sorts first.
+
+    status='open' only. RQ-000006 is deliberately 'blocked' pending intraday
+    bars, and an agent sent at it would burn a whole run composing a spec the
+    compiler is required to refuse.
+    """
+    rows = await ex(
+        """SELECT q.question_id, count(h.hypothesis_id) AS n
+             FROM factory.research_questions q
+             LEFT JOIN factory.hypotheses h ON h.question_id = q.question_id
+            WHERE q.status = 'open'
+         GROUP BY q.question_id
+         ORDER BY n ASC, q.question_id ASC
+            LIMIT 1""", {})
+    if not rows:
+        raise SystemExit("no open research questions - nothing to work on")
+    return rows[0]["question_id"]
+
+
 async def next_free_ids(ex, n: int = 2) -> List[str]:
     """Hypothesis ids the agent may safely use.
 
@@ -209,14 +257,13 @@ async def build_ctx(ex) -> CompileContext:
     if not ds:
         raise SystemExit("no dataset_version in the ledger; nothing is safe to compile against")
     row = ds[0]
-    hashes = await ex("SELECT spec_hash, experiment_id FROM factory.experiments", {})
     return CompileContext(
         dataset_version=row["dataset_version"],
         snapshot_age_hours=float(row["age_h"] or 0.0),
         source_max_dates={"price_points": date(2026, 9, 13)},
         integrity_flags=frozenset({"clock_lags_dissemination"}),
         sealed_from=row["sealed_from"],
-        known_spec_hashes={h["spec_hash"]: h["experiment_id"] for h in hashes},
+        known_spec_hashes=await known_mechanics(ex),
         event_counter=lambda _s: EventCounts(events=900, cohorts=40, symbols=250),
     )
 
@@ -260,12 +307,27 @@ async def dispatch(name: str, args: Dict[str, Any], ex, ctx, avid: str,
     if name == "get_research_question":
         return await reads.get_research_question(ex, args.get("question_id", ""))
     if name == "get_hypothesis_schema":
-        from bharat_terminal.factory.dsl.models import HypothesisSpec
+        from bharat_terminal.factory.dsl.models import (
+            ALLOWED_HOLDING_DAYS, DSL_VERSION, MAX_SWEEP_POINTS, HypothesisSpec)
         free = await next_free_ids(ex, 2)
         return {"tool": "get_hypothesis_schema", "data": {
             "json_schema": HypothesisSpec.model_json_schema(),
             "worked_example": EXAMPLE_SPEC,
             "available_ids": free,
+            # Pydantic field_validators do NOT reach model_json_schema(), so every
+            # rule below is invisible to the agent unless stated here. On 2026-09-17
+            # the Scientist proposed holding_days=30 -- a perfectly sensible guess
+            # against the schema it was shown -- and got E000 twice for it.
+            "constraints": {
+                "allowed_holding_days": list(ALLOWED_HOLDING_DAYS),
+                "primary_holding_days_must_be_in": "exit.holding_days",
+                "max_sweep_points": MAX_SWEEP_POINTS,
+                "dsl_version": DSL_VERSION,
+                "id_format": "H-000123",
+                "before_time_format": "HH:MM (IST), 24-hour",
+                "controls_must_be_unique": True,
+                "holding_days_must_be_unique": True,
+            },
             "note": ("worked_example is the incumbent PEAD recipe exactly as it compiled "
                      "and ran as EXP-000001. Copy its shape; change the mechanics. "
                      f"Its id {EXAMPLE_SPEC.get('id')!r} is TAKEN. Use available_ids "
@@ -317,7 +379,9 @@ def _to_block(b) -> Dict[str, Any]:
 
 async def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--question-id", default="RQ-000001")
+    ap.add_argument("--question-id", default="auto",
+                    help="a question id, or 'auto' for the open question with "
+                         "the least work done on it")
     ap.add_argument("--max-turns", type=int, default=MAX_TURNS)
     ap.add_argument("--apply", action="store_true",
                     help="persist accepted hypotheses and the agent_run "
@@ -348,7 +412,11 @@ async def main() -> int:
     print(f"agent_version : {avid}")
     print(f"model         : {MODEL}")
     print(f"dataset       : {ctx.dataset_version}  sealed_from={ctx.sealed_from}")
-    print(f"question      : {args.question_id}")
+    if args.question_id == "auto":
+        args.question_id = await pick_question(ex)
+        print(f"question      : {args.question_id}  (auto-selected: least worked)")
+    else:
+        print(f"question      : {args.question_id}")
     print(f"trace_id      : {trace_id}\n")
 
     if args.apply:
@@ -434,7 +502,8 @@ async def main() -> int:
     if args.apply and usd > 0:
         # Recorded even on failure: an errored run still spent the tokens, and
         # a cap that only counts successes is not a cap.
-        await record_spend(ex, "llm", usd, family_id="pead_composite_sue",
+        await record_spend(ex, "llm", usd,
+                           family_id=await family_for_question(ex, args.question_id),
                            source="alpha_run",
                            ref={"agent_version_id": avid, "trace_id": trace_id,
                                 "turns": turns, "status": status})

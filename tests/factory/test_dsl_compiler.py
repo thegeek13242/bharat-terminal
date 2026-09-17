@@ -139,10 +139,33 @@ def test_e007_low_coverage_control_refused(ctx):
     assert "E007" in codes(result)
 
 
-def test_e007_unmeasured_coverage_control_refused(ctx):
+def test_e007_unmeasured_coverage_control_refused(ctx, monkeypatch):
+    """The rule, not the registry's current contents.
+
+    This used to point at sector_bse because it happened to be unmeasured. On
+    2026-09-17 it was measured at 85.0% and started passing, so the test went
+    green while testing nothing. An unmeasured control is now synthesised, so
+    the rule stays covered no matter what the registry says.
+    """
+    import dataclasses
+    from bharat_terminal.factory.registry import features as reg
+
+    unmeasured = dataclasses.replace(reg.REGISTRY["sector_bse@1.0"], coverage=None)
+    monkeypatch.setitem(reg.REGISTRY, "sector_bse@1.0", unmeasured)
+
     result = compile_spec(make_spec(controls=["sector_bse"]), ctx)
     assert "E007" in codes(result)
     assert any("UNMEASURED" in e.message for e in result.errors)
+
+
+def test_sector_bse_is_now_an_accepted_control(ctx):
+    """Measured at 85.0% on 2026-09-17, so it clears the 80% floor.
+
+    sector_nse (18.8%) remains refused, which is the whole reason this one was
+    worth measuring: it is the only sector control the compiler will accept.
+    """
+    result = compile_spec(make_spec(controls=["sector_bse"]), ctx)
+    assert "E007" not in codes(result)
 
 
 def test_e007_non_control_feature_refused(ctx):

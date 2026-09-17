@@ -198,12 +198,30 @@ async def test_get_hypothesis_returns_lineage():
 
 # ── code-backed tools ────────────────────────────────────────────────────
 
-def test_list_features_labels_unmeasured_coverage():
+def test_list_features_labels_unmeasured_coverage(monkeypatch):
+    """Rendering of UNMEASURED, independent of whether any entry is unmeasured.
+
+    Every registry entry was measured on 2026-09-17, so asserting that some
+    feature is unmeasured now asserts a fact about the world rather than about
+    the code. One is synthesised instead.
+    """
+    import dataclasses
+    from bharat_terminal.factory.registry import features as reg
+
+    unmeasured = dataclasses.replace(reg.REGISTRY["sector_bse@1.0"], coverage=None)
+    monkeypatch.setitem(reg.REGISTRY, "sector_bse@1.0", unmeasured)
+
     out = reads.list_features()
-    unmeasured = [f for f in out["data"]["features"] if f["coverage"] is None]
-    assert unmeasured, "registry should contain unmeasured features"
-    assert all("UNMEASURED" in f["coverage_note"] for f in unmeasured)
-    assert out["data"]["n_unmeasured"] == len(unmeasured)
+    rows = [f for f in out["data"]["features"] if f["coverage"] is None]
+    assert rows, "the synthesised unmeasured feature should surface"
+    assert all("UNMEASURED" in f["coverage_note"] for f in rows)
+    assert out["data"]["n_unmeasured"] == len(rows)
+
+
+def test_registry_has_no_unmeasured_features_left():
+    """Measuring all 13 on 2026-09-17 was the point; regressions should shout."""
+    out = reads.list_features()
+    assert out["data"]["n_unmeasured"] == 0
 
 
 def test_list_features_flags_a_control_below_the_floor():

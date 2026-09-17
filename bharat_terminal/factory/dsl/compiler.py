@@ -109,7 +109,9 @@ class CompileContext:
     integrity_failures: frozenset = frozenset()
     sealed_from: date = SEALED_FROM
     embargoes: Tuple[Embargo, ...] = ()
-    known_spec_hashes: Dict[str, str] = field(default_factory=dict)  # hash -> experiment_id
+    # hash -> the id already carrying those mechanics: an EXP-* that ran, or
+    # an H-* merely proposed. Both are duplicates; see factory.dsl.dedup.
+    known_spec_hashes: Dict[str, str] = field(default_factory=dict)
     family_trials_remaining: int = 10_000
     event_counter: Optional[Callable[[HypothesisSpec], EventCounts]] = None
 
@@ -414,7 +416,7 @@ def compile_spec(spec: HypothesisSpec, ctx: CompileContext) -> CompileResult:
     duplicate_of = ctx.known_spec_hashes.get(shash)
     if duplicate_of is not None:
         errors.append(CompileError(
-            "E010", "spec", f"identical mechanics already run as {duplicate_of}",
+            "E010", "spec", f"identical mechanics already recorded as {duplicate_of}",
         ))
 
     if errors:

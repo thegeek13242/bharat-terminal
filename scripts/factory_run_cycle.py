@@ -45,6 +45,7 @@ from bharat_terminal.factory import FACTORY_SEED
 from bharat_terminal.factory.backtest.calendar import TradingCalendar
 from bharat_terminal.factory.backtest.engine import EventInput, StudyConfig, run_event_study
 from bharat_terminal.factory.costs.india_cash import CASH_DELIVERY_V1
+from bharat_terminal.factory.dsl.dedup import known_mechanics
 from bharat_terminal.factory.dsl.compiler import CompileContext, EventCounts, compile_spec
 from bharat_terminal.factory.dsl.hashing import result_hash
 from bharat_terminal.factory.dsl.models import HypothesisSpec
@@ -65,13 +66,12 @@ async def build_ctx(ex, snapshot_dir: str) -> CompileContext:
                             EXTRACT(EPOCH FROM (now()-created_at))/3600.0 AS age_h
                        FROM factory.dataset_versions ORDER BY created_at DESC LIMIT 1""", {})
     row = ds[0]
-    hashes = await ex("SELECT spec_hash, experiment_id FROM factory.experiments", {})
     return CompileContext(
         dataset_version=row["dataset_version"],
         snapshot_age_hours=float(row["age_h"] or 0),
         integrity_flags=frozenset({"clock_lags_dissemination"}),
         sealed_from=row["sealed_from"],
-        known_spec_hashes={h["spec_hash"]: h["experiment_id"] for h in hashes},
+        known_spec_hashes=await known_mechanics(ex),
         event_counter=lambda _s: EventCounts(events=900, cohorts=40, symbols=250),
     )
 
