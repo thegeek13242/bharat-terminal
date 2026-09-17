@@ -135,7 +135,9 @@ def backtest(spec: HypothesisSpec, data) -> Optional[Dict[str, Any]]:
 
 async def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--snapshot", default="/snapshots/DS-20260916-01")
+    ap.add_argument("--snapshot", default="auto",
+                    help="snapshot directory, or 'auto' to use the dataset "
+                         "version the ledger says is current")
     ap.add_argument("--apply", action="store_true",
                     help="write experiments, runs, alpha wealth and verdicts "
                          "(default: dry run)")
@@ -153,8 +155,22 @@ async def main() -> int:
     mode = "APPLY (writes verdicts)" if args.apply else "DRY RUN (writes nothing)"
     print(f"mode     : {mode}")
     ctx = await build_ctx(w, args.snapshot)
+
+    # build_ctx takes the dataset version from the LEDGER and ignores the path,
+    # so a stale --snapshot would stamp every experiment_run with a dataset it
+    # was not computed from and quietly break reproducibility. The two are tied
+    # together here rather than trusted to agree.
+    if args.snapshot == "auto":
+        args.snapshot = f"/snapshots/{ctx.dataset_version}"
+    elif os.path.basename(args.snapshot.rstrip("/")) != ctx.dataset_version:
+        raise SystemExit(
+            f"--snapshot {args.snapshot!r} is not the ledger's current dataset "
+            f"({ctx.dataset_version}). Refusing: results would be recorded "
+            f"against a dataset they were not computed from.")
+
     print(f"dataset  : {ctx.dataset_version}  age={ctx.snapshot_age_hours:.2f}h  "
           f"sealed_from={ctx.sealed_from}")
+    print(f"snapshot : {args.snapshot}")
     aw = await remaining(g)
     print(f"alpha    : wealth {aw['wealth_remaining']:.6f}  "
           f"next test may spend {aw['alpha_for_next']:.6f}  tested={aw['n_tested']}\n")
