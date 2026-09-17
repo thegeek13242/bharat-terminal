@@ -360,3 +360,21 @@ def test_sweep_cannot_exceed_the_point_cap():
 def test_unknown_field_is_refused():
     with pytest.raises(ValueError):
         make_spec(hyperparameters={"lr": 0.1})
+
+
+def test_declared_controls_are_flagged_as_not_applied(ctx):
+    """Controls pass E007 and never reach the engine, so the result is biased.
+
+    Verified 2026-09-17: StudyConfig has no notion of controls, so a spec
+    declaring them gets an uncontrolled study. Refusing would halt every
+    existing line of research including the validated incumbent, so the
+    divergence is recorded on the result rather than hidden.
+    """
+    result = compile_spec(make_spec(controls=["sector_bse"]), ctx)
+    assert result.ok, [e.message for e in result.errors]
+    assert "controls_not_applied" in result.plan.bias_flags
+
+
+def test_a_spec_without_controls_carries_no_such_flag(ctx):
+    result = compile_spec(make_spec(controls=[]), ctx)
+    assert "controls_not_applied" not in result.plan.bias_flags

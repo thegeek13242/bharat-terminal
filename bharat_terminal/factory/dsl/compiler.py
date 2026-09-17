@@ -280,6 +280,15 @@ def compile_spec(spec: HypothesisSpec, ctx: CompileContext) -> CompileResult:
     # Survivorship is unavoidable today: universe_membership is empty and only
     # 25 of 3,923 symbols ever stop pricing (verified).
     bias.append("survivorship")
+    # Controls are validated (E007) and then never reach the engine: StudyConfig
+    # has no notion of them, so a spec declaring controls gets an UNCONTROLLED
+    # study. Verified 2026-09-17. That is the same silent-divergence shape as
+    # the signal substitution fixed in backtest/signals.py, but refusing here
+    # would halt every existing line of research including the validated
+    # incumbent, so it is recorded as a bias on the result instead of a
+    # refusal. Every affected experiment now carries the flag and says so.
+    if spec.controls:
+        bias.append("controls_not_applied")
     # Closes are unadjusted, so corporate-action windows are dropped in v1.
     constraints.append("exclude_ca_windows")
 

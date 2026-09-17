@@ -63,12 +63,56 @@ SPECS_V1: Tuple[TableSpec, ...] = (
     ),
     TableSpec(
         name="earnings_surprises",
-        sql=("SELECT symbol, period_end, announced_at, sue_composite, sue_eps, "
-             "sue_revenue, percentile, decile, liquidity_pass, "
-             "median_traded_value_cr, study_version "
-             "FROM earnings_surprises ORDER BY symbol, period_end"),
+        # Every added column is joined POINT-IN-TIME. An expectation computed
+        # after the announcement, or a shareholding filing not yet public, is
+        # not evidence -- it is the answer leaking backwards. Each LATERAL
+        # below therefore carries an explicit "<= announced_at" bound, and the
+        # coverage cost of those bounds is real: expectation_surprise_gbm is
+        # 100% of the expectations table but only 50.3% of EVENTS, and
+        # guidance_change is 100% of its table but 15.8% of events (measured
+        # 2026-09-17). The event-grain number is the one that decides whether
+        # a study has enough sample.
+        #
+        # Values are exported RAW and ranked downstream by
+        # backtest.ranking.trailing_deciles. Ranking in SQL would mean
+        # NTILE over the whole history, which ranks every event against events
+        # that had not happened yet.
+        sql=("SELECT e.symbol, e.period_end, e.announced_at, e.sue_composite, "
+             "e.sue_eps, e.sue_revenue, e.percentile, e.decile, e.liquidity_pass, "
+             "e.median_traded_value_cr, e.study_version, "
+             "c.macro_sector AS sector_bse, "
+             "CASE WHEN x.expected_value IS NULL OR x.expected_value = 0 THEN NULL "
+             "     ELSE (e.revenue_cr - x.expected_value) / abs(x.expected_value) "
+             "END AS expectation_surprise_gbm, "
+             "g.change_verdict AS guidance_change, "
+             "CASE WHEN s.promoter_pct IS NULL OR sp.promoter_pct IS NULL THEN NULL "
+             "     ELSE s.promoter_pct - sp.promoter_pct END AS shp_promoter_delta "
+             "FROM earnings_surprises e "
+             "LEFT JOIN companies c ON c.symbol = e.symbol "
+             "LEFT JOIN LATERAL ("
+             "  SELECT expected_value FROM expectations x "
+             "   WHERE x.symbol = e.symbol AND x.period_end = e.period_end "
+             "     AND x.metric = 'revenue' AND x.estimator = 'gbm' "
+             "     AND x.inputs_max_ts <= e.announced_at "
+             "   ORDER BY x.inputs_max_ts DESC LIMIT 1) x ON TRUE "
+             "LEFT JOIN LATERAL ("
+             "  SELECT change_verdict FROM transcript_guidance g "
+             "   WHERE g.symbol = e.symbol AND g.announced_at <= e.announced_at "
+             "   ORDER BY g.announced_at DESC LIMIT 1) g ON TRUE "
+             # SEBI allows 21 days to file a shareholding pattern; 45 is margin.
+             "LEFT JOIN LATERAL ("
+             "  SELECT promoter_pct, quarter_end FROM shareholding_patterns s "
+             "   WHERE s.symbol = e.symbol "
+             "     AND s.quarter_end + INTERVAL '45 days' <= e.announced_at "
+             "   ORDER BY s.quarter_end DESC LIMIT 1) s ON TRUE "
+             "LEFT JOIN LATERAL ("
+             "  SELECT promoter_pct FROM shareholding_patterns p "
+             "   WHERE p.symbol = e.symbol AND p.quarter_end < s.quarter_end "
+             "   ORDER BY p.quarter_end DESC LIMIT 1) sp ON TRUE "
+             "ORDER BY e.symbol, e.period_end"),
         clock_column="announced_at",
-        note="announced_at carries the IST-as-UTC offset on a subset of rows",
+        note="announced_at carries the IST-as-UTC offset on a subset of rows; "
+             "added feature columns are PIT-joined and ranked downstream",
     ),
     TableSpec(
         name="corporate_actions",

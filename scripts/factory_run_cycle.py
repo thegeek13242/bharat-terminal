@@ -45,8 +45,9 @@ import factory_exp_000001 as exp
 from bharat_terminal.factory import FACTORY_SEED
 from bharat_terminal.factory.backtest.calendar import TradingCalendar
 from bharat_terminal.factory.backtest.engine import EventInput, StudyConfig, run_event_study
+from bharat_terminal.factory.backtest.events import load_ranked_events
 from bharat_terminal.factory.backtest.signals import (
-    UnbacktestableSpec, check_signal_supported)
+    SNAPSHOT_RANKED_FEATURES, UnbacktestableSpec, check_signal_supported)
 from bharat_terminal.factory.costs.india_cash import CASH_DELIVERY_V1
 from bharat_terminal.factory.dsl.dedup import known_mechanics, without_self
 from bharat_terminal.factory.dsl.compiler import CompileContext, EventCounts, compile_spec
@@ -100,8 +101,12 @@ def backtest(spec: HypothesisSpec, data) -> Optional[Dict[str, Any]]:
     cost of refusing is a hypothesis that stays un-evaluated, which is true.
     The cost of substituting is a fabricated result that looks like evidence.
     """
-    events, prices, bench, calendar, cas = data
+    events_for, prices, bench, calendar, cas = data
     check_signal_supported(spec.signal.feature)
+    # Events ranked on THIS spec's signal. Until 2026-09-17 one SUE-ranked set
+    # was shared by every spec, so a hypothesis signalled on anything else
+    # silently got a SUE study.
+    events = events_for(spec.signal.feature)
     decile = int(spec.event.filters[0].value)
     hold = int(spec.statistics.primary_holding_days)
     inputs = [EventInput(symbol=e["symbol"], event_date=e["event_date"],
@@ -161,14 +166,33 @@ async def main() -> int:
         return 0
 
     print(f"loading snapshot {args.snapshot} ...")
-    events, drops = exp.load_events(os.path.join(args.snapshot, "earnings_surprises.csv.gz"))
-    symbols = {e["symbol"] for e in events} | {exp.BENCHMARK}
+    es_path = os.path.join(args.snapshot, "earnings_surprises.csv.gz")
+
+    # One ranked event set per signal, built once and reused. Ranking is
+    # point-in-time and costs ~0.3s per signal, so caching matters when a cycle
+    # judges dozens of hypotheses.
+    _events: Dict[str, List[Dict[str, Any]]] = {}
+
+    def events_for(feature: str) -> List[Dict[str, Any]]:
+        if feature not in _events:
+            evs, drops = load_ranked_events(es_path, feature, ctx.sealed_from)
+            _events[feature] = evs
+            lost = {k: v for k, v in sorted(drops.items()) if v}
+            print(f"  events[{feature}] = {len(evs)}   dropped={lost}")
+        return _events[feature]
+
+    # Prices must cover every symbol ANY signal can select, not just SUE's.
+    symbols = {exp.BENCHMARK}
+    for feat in sorted(SNAPSHOT_RANKED_FEATURES):
+        symbols |= {e["symbol"] for e in events_for(feat)}
+
     prices, market_dates = exp.load_prices(
         os.path.join(args.snapshot, "price_points.csv.gz"), symbols)
     cas = exp.load_corporate_actions(
         os.path.join(args.snapshot, "corporate_actions.csv.gz"), symbols)
-    data = (events, prices, prices.get(exp.BENCHMARK), TradingCalendar(market_dates), cas)
-    print(f"events {len(events)}  sessions {len(market_dates)}\n")
+    data = (events_for, prices, prices.get(exp.BENCHMARK),
+            TradingCalendar(market_dates), cas)
+    print(f"symbols {len(symbols)}  sessions {len(market_dates)}\n")
 
     for r in rows:
         raw = r["spec_json"]

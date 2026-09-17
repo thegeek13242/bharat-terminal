@@ -17,22 +17,26 @@ from bharat_terminal.factory.backtest.signals import (
 
 def test_an_unrankable_signal_is_refused():
     with pytest.raises(UnbacktestableSpec) as e:
-        check_signal_supported("expectation_surprise_gbm@1.0")
-    assert "expectation_surprise_gbm@1.0" in str(e.value)
+        check_signal_supported("impact_magnitude@1.0")
+    assert "impact_magnitude@1.0" in str(e.value)
     assert "snapshot" in str(e.value).lower()
 
 
 def test_the_message_says_what_to_do_about_it():
     """A refusal a caller cannot act on just becomes a mystery in a log."""
     with pytest.raises(UnbacktestableSpec) as e:
-        check_signal_supported("shp_promoter_delta@1.0")
+        check_signal_supported("guidance_change@1.0")
     assert "snapshotter" in str(e.value)
 
 
-def test_the_supported_signal_passes():
-    check_signal_supported("sue_composite@2.1")
+@pytest.mark.parametrize("feature", sorted(SNAPSHOT_RANKED_FEATURES))
+def test_every_declared_signal_passes_and_has_a_loader_mapping(feature):
+    """The set and the loader must agree, or a 'supported' signal KeyErrors."""
+    from bharat_terminal.factory.backtest.events import RAW_COLUMN
+    check_signal_supported(feature)
+    assert feature in RAW_COLUMN
 
 
-def test_the_supported_set_is_explicit_and_minimal():
-    """Adding a feature here before the snapshotter exports it reopens the hole."""
-    assert SNAPSHOT_RANKED_FEATURES == frozenset({"sue_composite@2.1"})
+def test_guidance_change_is_not_a_ranked_signal():
+    """It is an enum split, not something a decile can be taken of."""
+    assert "guidance_change@1.0" not in SNAPSHOT_RANKED_FEATURES

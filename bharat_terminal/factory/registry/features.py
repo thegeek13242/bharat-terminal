@@ -140,7 +140,15 @@ _FEATURES: List[FeatureSpec] = [
         valid_clocks=("announcement_date",), coverage=0.969,
         notes=(
         "Measured 2026-09-17 (read-only): 96.9% of 15,838 "
-        "shareholding_patterns rows have promoter_pct. "
+        "shareholding_patterns rows have promoter_pct -- but that fill rate "
+        "says nothing about USABLE history. On the event grain only 9,931 "
+        "events carry a PIT-safe quarter-on-quarter delta, 19 of those "
+        "predate the sealed holdout, and 0 of the 19 pass the liquidity "
+        "filter, so the feature yields ZERO in-sample events and is NOT in "
+        "SNAPSHOT_RANKED_FEATURES. 3,639 symbols over 15,838 rows is about "
+        "four quarters each; consecutive quarters before the seal barely "
+        "exist yet. The column is exported and correct; it becomes "
+        "researchable as history accumulates. "
         ),
     ),
     # ── Tier F: the LLM / event-pipeline era. Forward validation only. ───

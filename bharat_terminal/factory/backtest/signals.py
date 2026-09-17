@@ -18,7 +18,27 @@ the hole this module exists to close.
 """
 from __future__ import annotations
 
-SNAPSHOT_RANKED_FEATURES = frozenset({"sue_composite@2.1"})
+# Extended 2026-09-17 when the snapshotter began exporting these PIT-joined
+# and backtest.events began ranking them. Adding a name here without doing both
+# of those things re-opens the silent-substitution hole this module closes.
+SNAPSHOT_RANKED_FEATURES = frozenset({
+    "sue_composite@2.1",              # precomputed decile, production pipeline
+    "expectation_surprise_gbm@1.0",   # raw value, ranked by trailing_deciles
+})
+
+# NOT supported, and the reason is worth keeping next to the set.
+#
+# shp_promoter_delta@1.0 is exported and ranked correctly, and yields exactly
+# ZERO in-sample events. Measured 2026-09-17: 9,931 events carry a PIT-safe
+# delta, 19 of them predate the seal, and 0 of those 19 pass the liquidity
+# filter. shareholding_patterns holds 15,838 rows across 3,639 symbols -- about
+# four quarters each -- so consecutive quarters before the holdout barely
+# exist. The registry's 0.969 is a fill rate over that table and says nothing
+# about usable history.
+#
+# The column stays in the snapshot: it is correct, and the feature becomes
+# researchable on its own as history accumulates. It is the SUPPORTED claim
+# that would be false, not the data.
 
 
 class UnbacktestableSpec(RuntimeError):
