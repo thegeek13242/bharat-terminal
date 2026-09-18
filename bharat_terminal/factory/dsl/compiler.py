@@ -26,6 +26,7 @@ from bharat_terminal.factory.dsl.models import (
     Horizon,
     HypothesisSpec,
 )
+from bharat_terminal.factory.backtest.signals import APPLIED_CONTROLS
 from bharat_terminal.factory.registry.features import (
     CONTROL_COVERAGE_FLOOR,
     FeatureSpec,
@@ -287,7 +288,10 @@ def compile_spec(spec: HypothesisSpec, ctx: CompileContext) -> CompileResult:
     # would halt every existing line of research including the validated
     # incumbent, so it is recorded as a bias on the result instead of a
     # refusal. Every affected experiment now carries the flag and says so.
-    if spec.controls:
+    unapplied = [c for c in spec.controls
+                 if (_latest_by_name(c).ref if "@" not in c and _latest_by_name(c)
+                     else c) not in APPLIED_CONTROLS]
+    if unapplied:
         bias.append("controls_not_applied")
     # Closes are unadjusted, so corporate-action windows are dropped in v1.
     constraints.append("exclude_ca_windows")

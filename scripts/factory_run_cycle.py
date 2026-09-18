@@ -46,6 +46,8 @@ from bharat_terminal.factory import FACTORY_SEED
 from bharat_terminal.factory.backtest.calendar import TradingCalendar
 from bharat_terminal.factory.backtest.engine import EventInput, StudyConfig, run_event_study
 from bharat_terminal.factory.backtest.events import load_ranked_events
+from bharat_terminal.factory.backtest.sector import (
+    build_sector_indices, members_from_rows)
 from bharat_terminal.factory.backtest.signals import (
     SNAPSHOT_RANKED_FEATURES, UnbacktestableSpec, check_signal_supported)
 from bharat_terminal.factory.costs.india_cash import CASH_DELIVERY_V1
@@ -101,8 +103,14 @@ def backtest(spec: HypothesisSpec, data) -> Optional[Dict[str, Any]]:
     cost of refusing is a hypothesis that stays un-evaluated, which is true.
     The cost of substituting is a fabricated result that looks like evidence.
     """
-    events_for, prices, bench, calendar, cas = data
+    events_for, prices, bench, calendar, cas, sector_idx = data
     check_signal_supported(spec.signal.feature)
+
+    # A spec declaring sector_bse is measured against its sector's index rather
+    # than the broad benchmark. Anything else in controls is still unapplied and
+    # still carries the controls_not_applied bias flag from the compiler.
+    wants_sector = any(c.split("@")[0] == "sector_bse" for c in spec.controls)
+    sector_benchmarks = sector_idx if wants_sector else None
     # Events ranked on THIS spec's signal. Until 2026-09-17 one SUE-ranked set
     # was shared by every spec, so a hypothesis signalled on anything else
     # silently got a SUE study.
@@ -110,13 +118,15 @@ def backtest(spec: HypothesisSpec, data) -> Optional[Dict[str, Any]]:
     decile = int(spec.event.filters[0].value)
     hold = int(spec.statistics.primary_holding_days)
     inputs = [EventInput(symbol=e["symbol"], event_date=e["event_date"],
-                         median_traded_value_cr=e["mtv"])
+                         median_traded_value_cr=e["mtv"],
+                         meta={"sector": e.get("sector_bse")})
               for e in events if e["decile"] == decile]
     cfg = StudyConfig(entry_rule=spec.entry.rule.value, holding_days=hold,
                       direction=spec.signal.direction.value, rate_card=CASH_DELIVERY_V1,
                       min_median_traded_value_cr=float(
                           spec.universe.min_median_traded_value_cr or 0))
-    out = run_event_study(inputs, prices, bench, calendar, cfg, corporate_actions=cas)
+    out = run_event_study(inputs, prices, bench, calendar, cfg, corporate_actions=cas,
+                          sector_benchmarks=sector_benchmarks)
     coh = list(out.cohorts)
     if not coh:
         return None
@@ -206,8 +216,19 @@ async def main() -> int:
         os.path.join(args.snapshot, "price_points.csv.gz"), symbols)
     cas = exp.load_corporate_actions(
         os.path.join(args.snapshot, "corporate_actions.csv.gz"), symbols)
+    # Sector indices need prices for every LABELLED symbol, not just the ones
+    # that report -- otherwise the peer group is the event set again and the
+    # "neutralisation" removes the effect it is meant to isolate.
+    members = members_from_rows(exp.rows(os.path.join(args.snapshot, "companies.csv.gz")))
+    sector_syms = {s for syms in members.values() for s in syms}
+    sector_prices, _ = exp.load_prices(
+        os.path.join(args.snapshot, "price_points.csv.gz"), sector_syms)
+    sector_idx = build_sector_indices(members, sector_prices, market_dates)
+    print(f"sector indices: {len(sector_idx)} of {len(members)} sectors "
+          f"({sum(len(v) for v in members.values())} labelled symbols)")
+
     data = (events_for, prices, prices.get(exp.BENCHMARK),
-            TradingCalendar(market_dates), cas)
+            TradingCalendar(market_dates), cas, sector_idx)
     print(f"symbols {len(symbols)}  sessions {len(market_dates)}\n")
 
     for r in rows:

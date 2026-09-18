@@ -52,3 +52,13 @@ def check_signal_supported(feature: str) -> None:
             f"signal {feature!r} has no ranked column in this snapshot "
             f"(it carries only {sorted(SNAPSHOT_RANKED_FEATURES)}). Export the "
             f"feature in the snapshotter and rank on it before researching this.")
+
+
+# Controls the ENGINE can actually apply, as opposed to the ones the compiler
+# will merely validate. Anything eligible but absent here still compiles and
+# still carries the controls_not_applied bias flag, because a study that
+# declares a control it does not apply is an uncontrolled study.
+#
+# sector_bse became real on 2026-09-18: backtest.sector builds an equal-weighted
+# index per sector and run_event_study measures against it.
+APPLIED_CONTROLS = frozenset({"sector_bse@1.0"})

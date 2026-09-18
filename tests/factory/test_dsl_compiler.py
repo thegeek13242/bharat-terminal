@@ -362,15 +362,29 @@ def test_unknown_field_is_refused():
         make_spec(hyperparameters={"lr": 0.1})
 
 
-def test_declared_controls_are_flagged_as_not_applied(ctx):
-    """Controls pass E007 and never reach the engine, so the result is biased.
+def test_a_control_the_engine_ignores_is_flagged_as_not_applied(ctx):
+    """A spec declaring a control the engine never applies is UNCONTROLLED.
 
-    Verified 2026-09-17: StudyConfig has no notion of controls, so a spec
-    declaring them gets an uncontrolled study. Refusing would halt every
-    existing line of research including the validated incumbent, so the
-    divergence is recorded on the result rather than hidden.
+    liquidity_tier passes E007 and still does not reach run_event_study, so the
+    divergence is recorded on the result rather than hidden. Refusing outright
+    would halt every existing line of research including the incumbent.
     """
+    result = compile_spec(make_spec(controls=["liquidity_tier"]), ctx)
+    assert result.ok, [e.message for e in result.errors]
+    assert "controls_not_applied" in result.plan.bias_flags
+
+
+def test_sector_bse_is_no_longer_flagged_because_it_is_applied(ctx):
+    """Built 2026-09-18: backtest.sector neutralises against an equal-weighted
+    sector index, so this control is real and must not carry the bias flag."""
     result = compile_spec(make_spec(controls=["sector_bse"]), ctx)
+    assert result.ok, [e.message for e in result.errors]
+    assert "controls_not_applied" not in result.plan.bias_flags
+
+
+def test_one_unapplied_control_flags_the_whole_spec(ctx):
+    """Mixing an applied control with an ignored one is still uncontrolled."""
+    result = compile_spec(make_spec(controls=["sector_bse", "liquidity_tier"]), ctx)
     assert result.ok, [e.message for e in result.errors]
     assert "controls_not_applied" in result.plan.bias_flags
 

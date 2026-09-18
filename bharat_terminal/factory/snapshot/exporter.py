@@ -123,9 +123,13 @@ SPECS_V1: Tuple[TableSpec, ...] = (
     ),
     TableSpec(
         name="companies",
-        sql=("SELECT symbol, company_name, company_type, is_fund_scheme, sector_nse "
-             "FROM companies ORDER BY symbol"),
-        note="universe exclusions: fund schemes and suspended names",
+        # macro_sector added 2026-09-17 for sector neutralisation: a sector
+        # benchmark needs labels for every PRICED symbol, not only the ones that
+        # report earnings, or the peer group is just the event set again.
+        sql=("SELECT symbol, company_name, company_type, is_fund_scheme, sector_nse, "
+             "macro_sector AS sector_bse FROM companies ORDER BY symbol"),
+        note="universe exclusions: fund schemes and suspended names; sector_bse "
+             "is the migration-040 BSE macro sector (85.0% of events)",
     ),
     TableSpec(
         name="result_first_seen",

@@ -90,7 +90,17 @@ def run_event_study(
     calendar: TradingCalendar,
     config: StudyConfig | None = None,
     corporate_actions: Optional[Mapping[str, Sequence[date]]] = None,
+    sector_benchmarks: Optional[Mapping[str, PriceSeries]] = None,
 ) -> StudyOutput:
+    """Event study. `sector_benchmarks` neutralises against sector rotation.
+
+    When supplied, an event whose meta carries a `sector` with an index is
+    measured against THAT index instead of the broad benchmark. An event whose
+    sector has no index is DROPPED as `no_sector_benchmark` rather than
+    silently falling back to the broad one: a study that neutralises some of
+    its events and not others is measuring two different things and reporting
+    one number.
+    """
     cfg = config or StudyConfig()
     cas = corporate_actions or {}
     results: List[EventResult] = []
@@ -139,7 +149,15 @@ def run_event_study(
             drop("corporate_action_window")
             continue
 
-        bench = benchmark_return(benchmark, window.entry_date, window.exit_date, window.entry_basis)
+        ref = benchmark
+        if sector_benchmarks is not None:
+            sec = ev.meta.get("sector")
+            ref = sector_benchmarks.get(str(sec)) if sec else None
+            if ref is None:
+                drop("no_sector_benchmark")
+                continue
+
+        bench = benchmark_return(ref, window.entry_date, window.exit_date, window.entry_basis)
         if bench is None:
             drop("no_benchmark_price")
             continue
