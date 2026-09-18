@@ -34,6 +34,17 @@ CHIEF_EVERY=6                       # frontier review cadence; 0 disables it
 
 cd "$ROOT" || exit 1
 mkdir -p "$PILOT"
+
+# One cycle at a time. A cycle measured 2m06s on 2026-09-18 against an hourly
+# cadence, so overlap is not expected -- but a hung image pull or a slow
+# evaluate would otherwise start a second cycle that double-counts spend and
+# races the counter. -n means skip rather than queue: a missed hour is a gap in
+# the log, while a queue would run them back to back and blur the cadence.
+exec 9>"$PILOT/.lock"
+if ! flock -n 9; then
+  echo "$(date -Is)  previous cycle still running; skipping this hour" >> "$LOG"
+  exit 0
+fi
 [ -f "$COUNT" ] || echo 0 > "$COUNT"
 n=$(cat "$COUNT")
 
