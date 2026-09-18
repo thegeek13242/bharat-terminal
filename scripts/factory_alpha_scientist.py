@@ -215,11 +215,17 @@ async def pick_question(ex) -> str:
     bars, and an agent sent at it would burn a whole run composing a spec the
     compiler is required to refuse.
     """
+    # The family must be ACTIVE too, not just the question open. Killing
+    # pead_composite_sue on 2026-09-18 required closing RQ-000001 by hand or the
+    # next cycle would have walked straight back into a dead family, because
+    # this selector looked at question status alone. Two conditions now, so a
+    # forgotten question cannot resurrect a killed line of research.
     rows = await ex(
         """SELECT q.question_id, count(h.hypothesis_id) AS n
              FROM factory.research_questions q
+             JOIN factory.research_families f ON f.family_id = q.family_id
              LEFT JOIN factory.hypotheses h ON h.question_id = q.question_id
-            WHERE q.status = 'open'
+            WHERE q.status = 'open' AND f.status = 'active'
          GROUP BY q.question_id
          ORDER BY n ASC, q.question_id ASC
             LIMIT 1""", {})
