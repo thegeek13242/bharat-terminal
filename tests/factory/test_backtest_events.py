@@ -38,11 +38,50 @@ def _row(symbol, day, decile="10", liq="t", **kw):
     return base
 
 
-def test_sealed_holdout_events_are_excluded_and_counted(tmp_path):
+def test_in_sample_window_excludes_holdout_events(tmp_path):
     path = _snapshot(tmp_path, [_row("A", "2024-01-10"), _row("B", "2026-01-10")])
     kept, drops = load_ranked_events(path, "sue_composite@2.1", date(2025, 9, 13))
     assert [k["symbol"] for k in kept] == ["A"]
-    assert drops["sealed_holdout"] == 1
+    assert drops["other_window"] == 1
+
+
+def test_holdout_window_returns_only_sealed_events(tmp_path):
+    path = _snapshot(tmp_path, [_row("A", "2024-01-10"), _row("B", "2026-01-10")])
+    kept, drops = load_ranked_events(path, "sue_composite@2.1", date(2025, 9, 13),
+                                     window="holdout")
+    assert [k["symbol"] for k in kept] == ["B"]
+    assert drops["other_window"] == 1
+
+
+def test_holdout_events_rank_against_in_sample_history(tmp_path):
+    """The order of ranking and windowing is the whole correctness of the OOS test.
+
+    Rank after windowing and a holdout event's reference set is a handful of
+    other holdout events, so its decile means something different from the
+    in-sample deciles it is about to be compared against.
+    """
+    # In-sample events run up to the seal; the holdout event follows shortly
+    # after, so the 365-day lookback genuinely spans the boundary.
+    import datetime as _dt
+    start = _dt.date(2025, 3, 1)
+    rows = [_row(f"S{i}", str(start + _dt.timedelta(days=i)),
+                 expectation_surprise_gbm=str(i / 200.0))
+            for i in range(190)]
+    rows.append(_row("HOLD", "2025-09-20", expectation_surprise_gbm="0.5"))
+    kept, _ = load_ranked_events(path=_snapshot(tmp_path, rows),
+                                 feature="expectation_surprise_gbm@1.0",
+                                 sealed_from=date(2025, 9, 13),
+                                 deciles=tuple(range(1, 11)),
+                                 window="holdout")
+    assert len(kept) == 1
+    # 200 in-sample events are in its reference set, not the 0 other holdout ones.
+    assert kept[0]["reference_n"] >= 190
+
+
+def test_an_invalid_window_is_refused(tmp_path):
+    path = _snapshot(tmp_path, [_row("A", "2024-01-10")])
+    with pytest.raises(ValueError):
+        load_ranked_events(path, "sue_composite@2.1", date(2025, 9, 13), window="both")
 
 
 def test_illiquid_events_are_excluded_and_counted(tmp_path):

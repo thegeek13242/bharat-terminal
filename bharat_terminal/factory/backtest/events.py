@@ -54,18 +54,33 @@ def _ist_date(raw: str) -> Optional[date]:
         tz=timezone.utc).date()
 
 
+IN_SAMPLE = "in_sample"
+HOLDOUT = "holdout"
+
+
 def load_ranked_events(
     path: str,
     feature: str,
     sealed_from: date,
     deciles: Tuple[int, ...] = (1, 10),
+    window: str = IN_SAMPLE,
 ) -> Tuple[List[dict], Dict[str, int]]:
-    """Events in the in-sample window, ranked on `feature`.
+    """Events in one window, ranked on `feature`.
 
     Returns (events, drops). Every exclusion is counted rather than silently
     dropped, because a study that quietly loses half its sample is a study
     whose result means something other than what it claims.
+
+    RANKING HAPPENS BEFORE WINDOWING, AND THAT ORDER IS LOAD-BEARING.
+    A holdout event must rank against ITS OWN PAST -- which includes the whole
+    in-sample period -- not against the handful of other holdout events. Rank
+    after windowing and the holdout's reference set is both tiny and drawn from
+    the wrong distribution, so its deciles would mean something different from
+    the in-sample deciles they are about to be compared against. That would not
+    error; it would quietly produce an out-of-sample test of a different signal.
     """
+    if window not in (IN_SAMPLE, HOLDOUT):
+        raise ValueError(f"window must be {IN_SAMPLE!r} or {HOLDOUT!r}, got {window!r}")
     check_signal_supported(feature)
     raw_col = RAW_COLUMN[feature]
     drops: Dict[str, int] = defaultdict(int)
@@ -76,9 +91,6 @@ def load_ranked_events(
         if ev is None:
             drops["unparseable_announced_at"] += 1
             continue
-        if ev >= sealed_from:
-            drops["sealed_holdout"] += 1
-            continue
         if (r.get("liquidity_pass") or "").lower() not in ("t", "true"):
             drops["liquidity_pass_false"] += 1
             continue
@@ -88,6 +100,7 @@ def load_ranked_events(
             mtv = 0.0
 
         row = {"symbol": r["symbol"], "event_date": ev, "mtv": mtv,
+               "window": HOLDOUT if ev >= sealed_from else IN_SAMPLE,
                "sector_bse": (r.get("sector_bse") or "") or None,
                "guidance_change": (r.get("guidance_change") or "") or None}
 
@@ -122,6 +135,9 @@ def load_ranked_events(
             ranked.append(row)
         staged = ranked
 
-    kept = [r for r in staged if r["decile"] in deciles]
-    drops["decile_not_selected"] = len(staged) - len(kept)
+    in_window = [r for r in staged if r["window"] == window]
+    drops["other_window"] = len(staged) - len(in_window)
+
+    kept = [r for r in in_window if r["decile"] in deciles]
+    drops["decile_not_selected"] = len(in_window) - len(kept)
     return kept, dict(drops)
